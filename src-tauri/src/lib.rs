@@ -165,6 +165,59 @@ fn request_app_restart(app: tauri::AppHandle) {
     app.request_restart();
 }
 
+fn run_event_panic_message(payload: &(dyn std::any::Any + Send)) -> String {
+    if let Some(message) = payload.downcast_ref::<&str>() {
+        (*message).to_string()
+    } else if let Some(message) = payload.downcast_ref::<String>() {
+        message.clone()
+    } else {
+        "unknown panic payload".to_string()
+    }
+}
+
+fn persist_sessions_before_exit(app: &tauri::AppHandle) {
+    // Persist all session cookies on exit so they survive restarts.
+    // Use try_lock to avoid deadlock if another task holds the lock.
+    let kgc = app.state::<KgcState>();
+    match kgc.client.try_lock() {
+        Ok(c) => c.save_session(),
+        Err(_) => log::warn!("Exit: KGC mutex held, session not saved"),
+    };
+    let luna = app.state::<LunaState>();
+    match luna.client.try_lock() {
+        Ok(l) => l.save_session(),
+        Err(_) => log::warn!("Exit: Luna mutex held, session not saved"),
+    };
+    let kwic = app.state::<KwicState>();
+    match kwic.client.try_lock() {
+        Ok(k) => k.save_session(),
+        Err(_) => log::warn!("Exit: KWIC mutex held, session not saved"),
+    };
+    let mail = app.state::<MailState>();
+    match mail.client.try_lock() {
+        Ok(m) => m.save_token(),
+        Err(_) => log::warn!("Exit: Mail mutex held, token not saved"),
+    };
+    let gcal = app.state::<GCalState>();
+    match gcal.client.try_lock() {
+        Ok(g) => g.save_token(),
+        Err(_) => log::warn!("Exit: GCal mutex held, token not saved"),
+    };
+}
+
+fn handle_run_event(app: &tauri::AppHandle, event: tauri::RunEvent) {
+    match event {
+        tauri::RunEvent::ExitRequested { .. } => {
+            stt::stt_shutdown_for_exit(std::time::Duration::from_millis(1500));
+        }
+        tauri::RunEvent::Exit => {
+            stt::stt_shutdown_for_exit(std::time::Duration::from_millis(500));
+            persist_sessions_before_exit(app);
+        }
+        _ => {}
+    }
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     #[allow(unused_mut)]
@@ -501,34 +554,13 @@ pub fn run() {
         .build(tauri::generate_context!())
         .expect("error while building tauri application")
         .run(|app, event| {
-            if let tauri::RunEvent::Exit = event {
-                // Persist all session cookies on exit so they survive restarts.
-                // Use try_lock to avoid deadlock if another task holds the lock.
-                let kgc = app.state::<KgcState>();
-                match kgc.client.try_lock() {
-                    Ok(c) => c.save_session(),
-                    Err(_) => log::warn!("Exit: KGC mutex held, session not saved"),
-                };
-                let luna = app.state::<LunaState>();
-                match luna.client.try_lock() {
-                    Ok(l) => l.save_session(),
-                    Err(_) => log::warn!("Exit: Luna mutex held, session not saved"),
-                };
-                let kwic = app.state::<KwicState>();
-                match kwic.client.try_lock() {
-                    Ok(k) => k.save_session(),
-                    Err(_) => log::warn!("Exit: KWIC mutex held, session not saved"),
-                };
-                let mail = app.state::<MailState>();
-                match mail.client.try_lock() {
-                    Ok(m) => m.save_token(),
-                    Err(_) => log::warn!("Exit: Mail mutex held, token not saved"),
-                };
-                let gcal = app.state::<GCalState>();
-                match gcal.client.try_lock() {
-                    Ok(g) => g.save_token(),
-                    Err(_) => log::warn!("Exit: GCal mutex held, token not saved"),
-                };
+            if let Err(payload) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                handle_run_event(app, event);
+            })) {
+                log::error!(
+                    "run event cleanup panicked: {}",
+                    run_event_panic_message(payload.as_ref())
+                );
             }
         });
 }

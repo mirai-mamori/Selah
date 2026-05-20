@@ -760,6 +760,7 @@ struct ActiveSttSession {
 }
 
 static STT_SESSION: Mutex<Option<ActiveSttSession>> = Mutex::new(None);
+static STT_SHUTDOWN_REQUESTED: AtomicBool = AtomicBool::new(false);
 static STT_RUNTIME_DEBUG: LazyLock<Mutex<SttRuntimeDebugState>> = LazyLock::new(|| {
     Mutex::new(SttRuntimeDebugState {
         execution_backend: None,
@@ -1846,9 +1847,9 @@ fn run_stt_session(
         let mut resampler = Resampler::new(sample_rate, channels);
         let mut agc = Agc::new();
 
-        loop {
+        let should_flush_pending_audio = loop {
             if stop_rx.try_recv().is_ok() {
-                break;
+                break !STT_SHUTDOWN_REQUESTED.load(Ordering::SeqCst);
             }
             match audio_rx.recv_timeout(Duration::from_millis(120)) {
                 Ok(chunk) => {
@@ -1926,47 +1927,51 @@ fn run_stt_session(
                     }
                 }
                 Err(mpsc::RecvTimeoutError::Timeout) => {}
-                Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    break !STT_SHUTDOWN_REQUESTED.load(Ordering::SeqCst);
+                }
             }
-        }
+        };
 
-        vad.flush();
-        while !vad.is_empty() {
-            if let Some(segment) = vad.front() {
-                let samples = segment.samples().to_vec();
+        if should_flush_pending_audio {
+            vad.flush();
+            while !vad.is_empty() {
+                if let Some(segment) = vad.front() {
+                    let samples = segment.samples().to_vec();
+                    let text = if use_directml_helper {
+                        directml_server
+                            .as_mut()
+                            .expect("DirectML helper exists")
+                            .decode(TARGET_SAMPLE_RATE, &samples)?
+                    } else {
+                        decode_samples(
+                            recognizer.as_ref().expect("recognizer exists"),
+                            TARGET_SAMPLE_RATE,
+                            &samples,
+                        )
+                    };
+                    if !text.is_empty() {
+                        emit_final_deduped(&app, text, caller, &mut last_final);
+                    }
+                }
+                vad.pop();
+            }
+            if !current_utterance.is_empty() {
                 let text = if use_directml_helper {
                     directml_server
                         .as_mut()
                         .expect("DirectML helper exists")
-                        .decode(TARGET_SAMPLE_RATE, &samples)?
+                        .decode(TARGET_SAMPLE_RATE, &current_utterance)?
                 } else {
                     decode_samples(
                         recognizer.as_ref().expect("recognizer exists"),
                         TARGET_SAMPLE_RATE,
-                        &samples,
+                        &current_utterance,
                     )
                 };
                 if !text.is_empty() {
                     emit_final_deduped(&app, text, caller, &mut last_final);
                 }
-            }
-            vad.pop();
-        }
-        if !current_utterance.is_empty() {
-            let text = if use_directml_helper {
-                directml_server
-                    .as_mut()
-                    .expect("DirectML helper exists")
-                    .decode(TARGET_SAMPLE_RATE, &current_utterance)?
-            } else {
-                decode_samples(
-                    recognizer.as_ref().expect("recognizer exists"),
-                    TARGET_SAMPLE_RATE,
-                    &current_utterance,
-                )
-            };
-            if !text.is_empty() {
-                emit_final_deduped(&app, text, caller, &mut last_final);
             }
         }
 
@@ -1983,6 +1988,7 @@ fn run_stt_session(
     }
     emit_state(&app, "idle", caller);
     clear_session_if_matches(session_id);
+    STT_SHUTDOWN_REQUESTED.store(false, Ordering::SeqCst);
 }
 
 #[tauri::command]
@@ -2142,6 +2148,7 @@ pub fn stt_start_stream(
     caller: String,
     preempt: Option<bool>,
 ) -> Result<Option<String>, String> {
+    STT_SHUTDOWN_REQUESTED.store(false, Ordering::SeqCst);
     let caller = if caller.is_empty() {
         "unknown".to_string()
     } else {
@@ -2188,4 +2195,33 @@ pub fn stt_stop_stream() -> Result<(), String> {
         let _ = session.stop_tx.send(());
     }
     Ok(())
+}
+
+pub(crate) fn stt_shutdown_for_exit(timeout: Duration) {
+    STT_SHUTDOWN_REQUESTED.store(true, Ordering::SeqCst);
+    let had_session = if let Ok(lock) = STT_SESSION.lock() {
+        if let Some(session) = lock.as_ref() {
+            let _ = session.stop_tx.send(());
+            true
+        } else {
+            false
+        }
+    } else {
+        log::warn!("[stt] shutdown: STT state lock failed");
+        false
+    };
+
+    if !had_session {
+        STT_SHUTDOWN_REQUESTED.store(false, Ordering::SeqCst);
+        return;
+    }
+
+    let start = Instant::now();
+    while start.elapsed() < timeout {
+        if !stt_is_running() {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    log::warn!("[stt] shutdown: timed out waiting for STT session to stop");
 }

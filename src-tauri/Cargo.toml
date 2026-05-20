@@ -125,4 +125,8 @@ opt-level = "s"
 lto = true
 strip = true
 codegen-units = 1
-panic = "abort"
+# `panic = "abort"` is intentionally NOT set. tao/tauri use `catch_unwind` to
+# recover from panics in the event loop, and our `RunEvent::Exit` handler is
+# itself wrapped in `catch_unwind` (it runs inside macOS
+# `applicationWillTerminate`, an extern "C" callback — an escaping panic there
+# aborts the process). Under `panic = "abort"` those guards are no-ops.
