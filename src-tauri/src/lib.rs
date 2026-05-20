@@ -58,7 +58,12 @@ pub fn run_stt_decode_helper_from_args() -> Option<i32> {
 #[cfg(debug_assertions)]
 pub(crate) fn should_dump_debug_html() -> bool {
     std::env::var("SELAH_DUMP_HTML")
-        .map(|value| matches!(value.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
+        .map(|value| {
+            matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
         .unwrap_or(false)
 }
 

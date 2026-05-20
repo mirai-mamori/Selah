@@ -1038,7 +1038,7 @@ export interface AiConfig {
   temperature: number;
   reply_language: string;
   ai_refresh_interval: number; // minutes, 0 = disabled
-  live_summary_interval_minutes: number; // minutes, 5..30
+  live_summary_interval_minutes: number; // minutes, minimum 5
 }
 
 export interface AiChatMessage {

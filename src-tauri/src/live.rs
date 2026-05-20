@@ -1,6 +1,7 @@
 use chrono::{DateTime, Datelike, Duration as ChronoDuration, Local};
 use std::sync::{Arc, Mutex};
 use tauri::{Emitter, Manager};
+use tokio::sync::Notify;
 
 mod ai_output;
 mod cache;
@@ -30,13 +31,18 @@ const MIN_AI_SUMMARIZATION_DURATION_SECS: i64 = 120;
 const MAX_LIVE_TERM_EXPLANATION_CHARS: usize = 220;
 const LIVE_FLUSH_FORCE_WAIT_ATTEMPTS: usize = 1200;
 const LIVE_FLUSH_FORCE_WAIT_MS: u64 = 250;
+// Backend driver wake-up cadence only. The actual generation interval is the
+// user setting measured from `batch_started_at`, not these polling caps.
+const LIVE_FLUSH_DRIVER_MAX_SLEEP_SECS: u64 = 30;
+const LIVE_FLUSH_DRIVER_IDLE_SLEEP_SECS: u64 = 30;
+const LIVE_FLUSH_DRIVER_MIN_SLEEP_SECS: u64 = 1;
 // Whiteboard nodes/edges are intentionally uncapped: the board must accumulate
 // the full course/recording as it grows, so a hard ceiling silently forces the
 // model to compress earlier branches. Per-field length and the relationship
 // guards in `parse_live_whiteboard` are the remaining safety nets.
 const FREE_NOTE_FOLDER_NAME: &str = "自由ノート";
 
-pub struct LiveState(Mutex<Option<LiveSession>>);
+pub struct LiveState(Mutex<Option<LiveSession>>, Arc<Notify>);
 
 #[derive(Debug, Clone)]
 struct LiveSession {
@@ -46,6 +52,8 @@ struct LiveSession {
     transcript_lines: Arc<Vec<LiveTranscriptLine>>,
     pending_lines: Arc<Vec<LiveTranscriptLine>>,
     summaries: Arc<Vec<LiveSummaryChunk>>,
+    /// Timestamp of the last finalized subtitle line covered by a successful
+    /// summary chunk. Initialized to session start for the first chunk.
     batch_started_at: DateTime<Local>,
     flush_in_flight: bool,
     /// True when this session began with no prior cache for today —
@@ -75,7 +83,15 @@ impl LiveSession {
 
 impl LiveState {
     pub fn new() -> Self {
-        Self(Mutex::new(None))
+        Self(Mutex::new(None), Arc::new(Notify::new()))
+    }
+
+    pub fn notify_flush_driver(&self) {
+        self.1.notify_waiters();
+    }
+
+    fn flush_notify(&self) -> Arc<Notify> {
+        Arc::clone(&self.1)
     }
 }
 
@@ -96,6 +112,84 @@ fn format_datetime(dt: DateTime<Local>) -> String {
 
 fn format_time(dt: DateTime<Local>) -> String {
     dt.format("%H:%M").to_string()
+}
+
+fn clock_time_on_session_date(
+    session_started_at: DateTime<Local>,
+    value: &str,
+) -> Option<DateTime<Local>> {
+    let time = chrono::NaiveTime::parse_from_str(value.trim(), "%H:%M:%S")
+        .or_else(|_| chrono::NaiveTime::parse_from_str(value.trim(), "%H:%M"))
+        .ok()?;
+    let mut candidate = session_started_at
+        .date_naive()
+        .and_time(time)
+        .and_local_timezone(Local)
+        .earliest()?;
+    if candidate + ChronoDuration::hours(12) < session_started_at {
+        candidate += ChronoDuration::days(1);
+    }
+    Some(candidate)
+}
+
+fn transcript_line_datetime(
+    session_started_at: DateTime<Local>,
+    line: &LiveTranscriptLine,
+) -> Option<DateTime<Local>> {
+    clock_time_on_session_date(session_started_at, &line.at)
+}
+
+fn summary_range_end_datetime(
+    session_started_at: DateTime<Local>,
+    summary: &LiveSummaryChunk,
+) -> Option<DateTime<Local>> {
+    let (_, end) = summary
+        .range_label
+        .rsplit_once('-')
+        .or_else(|| summary.range_label.rsplit_once('–'))?;
+    clock_time_on_session_date(session_started_at, end)
+}
+
+fn latest_summary_end_datetime(
+    session_started_at: DateTime<Local>,
+    summaries: &[LiveSummaryChunk],
+) -> Option<DateTime<Local>> {
+    summaries
+        .last()
+        .and_then(|summary| summary_range_end_datetime(session_started_at, summary))
+}
+
+fn last_transcript_line_datetime(
+    session_started_at: DateTime<Local>,
+    lines: &[LiveTranscriptLine],
+    fallback: DateTime<Local>,
+) -> DateTime<Local> {
+    lines
+        .last()
+        .and_then(|line| transcript_line_datetime(session_started_at, line))
+        .unwrap_or(fallback)
+}
+
+fn first_transcript_line_datetime(
+    session_started_at: DateTime<Local>,
+    lines: &[LiveTranscriptLine],
+    fallback: DateTime<Local>,
+) -> DateTime<Local> {
+    lines
+        .first()
+        .and_then(|line| transcript_line_datetime(session_started_at, line))
+        .unwrap_or(fallback)
+}
+
+fn effective_batch_started_at(session: &LiveSession) -> DateTime<Local> {
+    if session.summaries.is_empty() {
+        return first_transcript_line_datetime(
+            session.started_at,
+            session.pending_lines.as_ref(),
+            session.batch_started_at,
+        );
+    }
+    session.batch_started_at
 }
 
 fn sanitize_model_output(text: &str) -> String {
@@ -161,7 +255,7 @@ fn live_ai_config() -> Result<crate::ai::AiConfig, String> {
 fn live_summary_interval_minutes() -> i64 {
     crate::ai::load_ai_config()
         .live_summary_interval_minutes
-        .clamp(5, 30) as i64
+        .max(5) as i64
 }
 
 fn should_skip_ai_summarization(started_at: DateTime<Local>, now: DateTime<Local>) -> bool {
@@ -1045,30 +1139,30 @@ async fn flush_session_summary(
                 if should_skip_ai_summarization(session.started_at, now) {
                     return Ok(session.snapshot());
                 }
+                let batch_started_at = effective_batch_started_at(session);
                 if !force
-                    && now
-                        .signed_duration_since(session.batch_started_at)
-                        .num_minutes()
+                    && now.signed_duration_since(batch_started_at).num_minutes()
                         < summary_interval_minutes
                 {
                     return Ok(session.snapshot());
                 }
-                // Skip the scheduled summary when almost nothing has been said this
-                // interval — spending an AI call on 1-2 stray lines wastes power and
-                // yields a useless summary. We leave batch_started_at untouched, so
-                // the next check still considers this content and will fire once more
-                // lines have accumulated (or immediately if forced on stop).
+                // Scheduled summaries follow the original noise guard: wait
+                // until at least a few finalized STT segments accumulated.
+                // Forced flushes on stop still include any remaining content.
                 if !force && session.pending_lines.len() < 3 {
                     return Ok(session.snapshot());
                 }
+                let lines = session.pending_lines.clone();
+                let range_end =
+                    last_transcript_line_datetime(session.started_at, lines.as_ref(), now);
                 session.flush_in_flight = true;
                 Some((
                     session.session_id.clone(),
                     session.course.clone(),
-                    session.pending_lines.clone(),
+                    lines,
                     session.summaries.clone(),
-                    session.batch_started_at,
-                    now,
+                    batch_started_at,
+                    range_end,
                     session.summaries.len() + 1,
                 ))
             }
@@ -1143,6 +1237,136 @@ async fn flush_session_summary(
     Ok(session.snapshot())
 }
 
+fn live_session_matches(state: &LiveState, session_id: &str) -> bool {
+    state
+        .0
+        .lock()
+        .ok()
+        .and_then(|guard| {
+            guard
+                .as_ref()
+                .map(|session| session.session_id == session_id)
+        })
+        .unwrap_or(false)
+}
+
+fn live_next_scheduled_flush_delay(
+    state: &LiveState,
+    session_id: &str,
+) -> Option<std::time::Duration> {
+    let now = Local::now();
+    let summary_interval_minutes = live_summary_interval_minutes();
+    let guard = state.0.lock().ok()?;
+    let session = guard.as_ref()?;
+    if session.session_id != session_id {
+        return None;
+    }
+    if session.pending_lines.is_empty() || session.pending_lines.len() < 3 {
+        return Some(std::time::Duration::from_secs(
+            LIVE_FLUSH_DRIVER_IDLE_SLEEP_SECS,
+        ));
+    }
+    let interval_due_at =
+        effective_batch_started_at(session) + ChronoDuration::minutes(summary_interval_minutes);
+    let min_ai_due_at =
+        session.started_at + ChronoDuration::seconds(MIN_AI_SUMMARIZATION_DURATION_SECS);
+    let due_at = if interval_due_at > min_ai_due_at {
+        interval_due_at
+    } else {
+        min_ai_due_at
+    };
+    let wait_ms = due_at.signed_duration_since(now).num_milliseconds();
+    if wait_ms <= 0 {
+        return Some(std::time::Duration::from_secs(0));
+    }
+    let wait = std::time::Duration::from_millis(wait_ms as u64);
+    let max_wait = std::time::Duration::from_secs(LIVE_FLUSH_DRIVER_MAX_SLEEP_SECS);
+    Some(if wait > max_wait { max_wait } else { wait })
+}
+
+async fn live_flush_summary_with_side_effects(
+    app: &tauri::AppHandle,
+    state: &LiveState,
+    force: bool,
+) -> Result<LiveSessionSnapshot, String> {
+    let summary_count_before = {
+        let guard = state
+            .0
+            .lock()
+            .map_err(|_| "Live state lock failed".to_string())?;
+        guard.as_ref().map(|s| s.summaries.len()).unwrap_or(0)
+    };
+    let snapshot = flush_session_summary(state, force).await?;
+    auto_save_day_cache(state, true);
+
+    // Whenever the AI flush actually produced a new summary chunk, also persist
+    // the formal .md file. Cheap insurance: a crash before stop now leaves a
+    // real markdown on disk, not just the hidden day_cache sidecar.
+    if snapshot.summaries.len() > summary_count_before {
+        let info = {
+            let guard = state
+                .0
+                .lock()
+                .map_err(|_| "Live state lock failed".to_string())?;
+            guard.as_ref().map(|s| {
+                (
+                    s.course.clone(),
+                    s.started_at,
+                    s.transcript_lines.clone(),
+                    s.summaries.clone(),
+                )
+            })
+        };
+        if let Some((course, started_at, transcript_lines, summaries)) = info {
+            write_partial_markdown_file(&course, started_at, &transcript_lines, &summaries);
+        }
+    }
+
+    emit_live_update(app, state);
+    Ok(snapshot)
+}
+
+fn start_live_flush_driver(app: tauri::AppHandle, session_id: String) {
+    tauri::async_runtime::spawn(async move {
+        loop {
+            let state = app.state::<LiveState>();
+            let Some(wait) = live_next_scheduled_flush_delay(state.inner(), &session_id) else {
+                break;
+            };
+            if !wait.is_zero() {
+                let notify = state.inner().flush_notify();
+                tokio::select! {
+                    _ = tokio::time::sleep(wait) => {}
+                    _ = notify.notified() => continue,
+                }
+            } else {
+                tokio::time::sleep(std::time::Duration::from_secs(
+                    LIVE_FLUSH_DRIVER_MIN_SLEEP_SECS,
+                ))
+                .await;
+            }
+            let state = app.state::<LiveState>();
+            if !live_session_matches(state.inner(), &session_id) {
+                break;
+            }
+            match live_flush_summary_with_side_effects(&app, state.inner(), false).await {
+                Ok(snapshot) => {
+                    if !snapshot.active {
+                        break;
+                    }
+                }
+                Err(err) => {
+                    eprintln!("[Live] backend scheduled flush failed: {err}");
+                    tokio::time::sleep(std::time::Duration::from_secs(
+                        LIVE_FLUSH_DRIVER_IDLE_SLEEP_SECS,
+                    ))
+                    .await;
+                }
+            }
+        }
+    });
+}
+
 #[tauri::command]
 pub fn live_get_session(state: tauri::State<'_, LiveState>) -> LiveSessionSnapshot {
     current_snapshot(&state)
@@ -1202,16 +1426,30 @@ pub fn live_start_session(
     let started_at = chrono::NaiveDateTime::parse_from_str(&original_start, "%Y-%m-%d %H:%M:%S")
         .map(|naive| naive.and_local_timezone(Local).unwrap())
         .unwrap_or(now);
+    let batch_started_at = latest_summary_end_datetime(started_at, &prev_summaries)
+        .or_else(|| {
+            if prev_summaries.is_empty() {
+                None
+            } else {
+                Some(last_transcript_line_datetime(
+                    started_at,
+                    &prev_transcript,
+                    now,
+                ))
+            }
+        })
+        .unwrap_or(now);
 
     let persisted_line_count = prev_transcript.len();
+    let session_id = uuid::Uuid::new_v4().to_string();
     let session = LiveSession {
-        session_id: uuid::Uuid::new_v4().to_string(),
+        session_id: session_id.clone(),
         course,
         started_at,
         transcript_lines: Arc::new(prev_transcript),
         pending_lines: Arc::new(Vec::new()),
         summaries: Arc::new(prev_summaries),
-        batch_started_at: now,
+        batch_started_at,
         flush_in_flight: false,
         is_fresh_start,
         persisted_line_count,
@@ -1224,6 +1462,7 @@ pub fn live_start_session(
     *guard = Some(session);
     drop(guard);
     emit_live_update(&app, &state);
+    start_live_flush_driver(app.clone(), session_id);
     Ok(snapshot)
 }
 
@@ -1257,6 +1496,7 @@ pub fn live_append_transcript(
         session.snapshot()
     };
     auto_save_day_cache(&state, false);
+    state.inner().notify_flush_driver();
     // Slim delta event for the subtitle overlay and any cheap subscriber.
     // Emitting the full snapshot per final line grew O(N) in payload size —
     // a 2-hour lecture was serialising hundreds of KB on every append.
@@ -1270,41 +1510,7 @@ pub async fn live_flush_summary(
     state: tauri::State<'_, LiveState>,
     force: bool,
 ) -> Result<LiveSessionSnapshot, String> {
-    let summary_count_before = {
-        let guard = state
-            .0
-            .lock()
-            .map_err(|_| "Live state lock failed".to_string())?;
-        guard.as_ref().map(|s| s.summaries.len()).unwrap_or(0)
-    };
-    let snapshot = flush_session_summary(&state, force).await?;
-    auto_save_day_cache(&state, true);
-
-    // Whenever the AI flush actually produced a new summary chunk, also persist
-    // the formal .md file. Cheap insurance: a crash before stop now leaves a
-    // real markdown on disk, not just the hidden day_cache sidecar.
-    if snapshot.summaries.len() > summary_count_before {
-        let info = {
-            let guard = state
-                .0
-                .lock()
-                .map_err(|_| "Live state lock failed".to_string())?;
-            guard.as_ref().map(|s| {
-                (
-                    s.course.clone(),
-                    s.started_at,
-                    s.transcript_lines.clone(),
-                    s.summaries.clone(),
-                )
-            })
-        };
-        if let Some((course, started_at, transcript_lines, summaries)) = info {
-            write_partial_markdown_file(&course, started_at, &transcript_lines, &summaries);
-        }
-    }
-
-    emit_live_update(&app, &state);
-    Ok(snapshot)
+    live_flush_summary_with_side_effects(&app, state.inner(), force).await
 }
 
 #[tauri::command]
@@ -1349,6 +1555,7 @@ pub fn live_cancel_session(
         }
     }
 
+    state.inner().notify_flush_driver();
     emit_live_update(&app, &state);
     Ok(())
 }
@@ -1419,6 +1626,7 @@ pub async fn live_finish_session(
                 *guard = None;
                 snapshot
             };
+            state.inner().notify_flush_driver();
             let result = LiveSaveResult {
                 saved: false,
                 path: String::new(),
@@ -1470,13 +1678,12 @@ pub async fn live_finish_session(
         &summaries,
         &transcript_lines,
     );
-    let suggested_todos = if should_skip_ai_summarization(started_at, ended_at)
-        || !should_run_finish_ai
-    {
-        Vec::new()
-    } else {
-        extract_todo_suggestions(&app, &course, &summaries, &transcript_lines, ended_at).await
-    };
+    let suggested_todos =
+        if should_skip_ai_summarization(started_at, ended_at) || !should_run_finish_ai {
+            Vec::new()
+        } else {
+            extract_todo_suggestions(&app, &course, &summaries, &transcript_lines, ended_at).await
+        };
 
     let dir = live_storage_dir(&course);
     let path = dir.join(formal_markdown_filename(&course, started_at));
@@ -1510,6 +1717,7 @@ pub async fn live_finish_session(
         *guard = None;
         snapshot
     };
+    state.inner().notify_flush_driver();
 
     let result = LiveSaveResult {
         saved: true,
@@ -1539,6 +1747,201 @@ mod tests {
             now - chrono::Duration::seconds(120),
             now
         ));
+    }
+
+    #[test]
+    fn transcript_line_datetime_uses_session_date() {
+        let started_at = Local
+            .with_ymd_and_hms(2026, 5, 13, 10, 0, 0)
+            .single()
+            .unwrap();
+        let line = LiveTranscriptLine {
+            text: "topic".into(),
+            at: "10:05:30".into(),
+        };
+
+        let parsed = transcript_line_datetime(started_at, &line).unwrap();
+
+        assert_eq!(
+            parsed.format("%Y-%m-%d %H:%M:%S").to_string(),
+            "2026-05-13 10:05:30"
+        );
+    }
+
+    #[test]
+    fn transcript_line_datetime_handles_midnight_rollover() {
+        let started_at = Local
+            .with_ymd_and_hms(2026, 5, 13, 23, 50, 0)
+            .single()
+            .unwrap();
+        let line = LiveTranscriptLine {
+            text: "after midnight".into(),
+            at: "00:05:00".into(),
+        };
+
+        let parsed = transcript_line_datetime(started_at, &line).unwrap();
+
+        assert_eq!(
+            parsed.format("%Y-%m-%d %H:%M:%S").to_string(),
+            "2026-05-14 00:05:00"
+        );
+    }
+
+    #[test]
+    fn effective_batch_start_uses_first_pending_line_for_first_chunk() {
+        let started_at = Local
+            .with_ymd_and_hms(2026, 5, 13, 10, 0, 0)
+            .single()
+            .unwrap();
+        let pending = vec![
+            LiveTranscriptLine {
+                text: "first".into(),
+                at: "10:03:00".into(),
+            },
+            LiveTranscriptLine {
+                text: "second".into(),
+                at: "10:04:00".into(),
+            },
+        ];
+        let session = LiveSession {
+            session_id: "test".into(),
+            course: LiveCourseInfo {
+                course_name: "テスト".into(),
+                course_code: String::new(),
+                room: String::new(),
+                teacher: String::new(),
+                day: 1,
+                period: 1,
+                time_label: String::new(),
+                is_free_note: false,
+            },
+            started_at,
+            transcript_lines: Arc::new(pending.clone()),
+            pending_lines: Arc::new(pending),
+            summaries: Arc::new(Vec::new()),
+            batch_started_at: started_at,
+            flush_in_flight: false,
+            is_fresh_start: true,
+            persisted_line_count: 0,
+        };
+
+        let effective = effective_batch_started_at(&session);
+
+        assert_eq!(
+            effective.format("%Y-%m-%d %H:%M:%S").to_string(),
+            "2026-05-13 10:03:00"
+        );
+    }
+
+    #[test]
+    fn effective_batch_start_uses_latest_summary_end_after_resume() {
+        let started_at = Local
+            .with_ymd_and_hms(2026, 5, 13, 10, 0, 0)
+            .single()
+            .unwrap();
+        let resumed_batch_started_at = latest_summary_end_datetime(
+            started_at,
+            &[LiveSummaryChunk {
+                title: "Chunk 01 | 10:03-10:10".into(),
+                range_label: "10:03-10:10".into(),
+                body: "summary".into(),
+                line_count: 3,
+                terms: Vec::new(),
+                whiteboard: None,
+            }],
+        )
+        .unwrap();
+        let session = LiveSession {
+            session_id: "test".into(),
+            course: LiveCourseInfo {
+                course_name: "テスト".into(),
+                course_code: String::new(),
+                room: String::new(),
+                teacher: String::new(),
+                day: 1,
+                period: 1,
+                time_label: String::new(),
+                is_free_note: false,
+            },
+            started_at,
+            transcript_lines: Arc::new(vec![LiveTranscriptLine {
+                text: "covered".into(),
+                at: "10:09:30".into(),
+            }]),
+            pending_lines: Arc::new(vec![LiveTranscriptLine {
+                text: "new".into(),
+                at: "10:20:00".into(),
+            }]),
+            summaries: Arc::new(vec![LiveSummaryChunk {
+                title: "Chunk 01 | 10:03-10:10".into(),
+                range_label: "10:03-10:10".into(),
+                body: "summary".into(),
+                line_count: 3,
+                terms: Vec::new(),
+                whiteboard: None,
+            }]),
+            batch_started_at: resumed_batch_started_at,
+            flush_in_flight: false,
+            is_fresh_start: false,
+            persisted_line_count: 1,
+        };
+
+        let effective = effective_batch_started_at(&session);
+
+        assert_eq!(
+            effective.format("%Y-%m-%d %H:%M:%S").to_string(),
+            "2026-05-13 10:10:00"
+        );
+    }
+
+    #[test]
+    fn effective_batch_start_keeps_second_precision_after_current_flush() {
+        let started_at = Local
+            .with_ymd_and_hms(2026, 5, 13, 10, 0, 0)
+            .single()
+            .unwrap();
+        let last_subtitle_at = Local
+            .with_ymd_and_hms(2026, 5, 13, 10, 10, 45)
+            .single()
+            .unwrap();
+        let session = LiveSession {
+            session_id: "test".into(),
+            course: LiveCourseInfo {
+                course_name: "テスト".into(),
+                course_code: String::new(),
+                room: String::new(),
+                teacher: String::new(),
+                day: 1,
+                period: 1,
+                time_label: String::new(),
+                is_free_note: false,
+            },
+            started_at,
+            transcript_lines: Arc::new(Vec::new()),
+            pending_lines: Arc::new(vec![LiveTranscriptLine {
+                text: "new".into(),
+                at: "10:20:00".into(),
+            }]),
+            summaries: Arc::new(vec![LiveSummaryChunk {
+                title: "Chunk 01 | 10:03-10:10".into(),
+                range_label: "10:03-10:10".into(),
+                body: "summary".into(),
+                line_count: 3,
+                terms: Vec::new(),
+                whiteboard: None,
+            }]),
+            batch_started_at: last_subtitle_at,
+            flush_in_flight: false,
+            is_fresh_start: true,
+            persisted_line_count: 0,
+        };
+
+        let effective = effective_batch_started_at(&session);
+
+        assert_eq!(
+            effective.format("%Y-%m-%d %H:%M:%S").to_string(),
+            "2026-05-13 10:10:45"
+        );
     }
 
     #[test]

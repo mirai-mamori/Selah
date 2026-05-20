@@ -74,11 +74,8 @@
   let todoDraftSaving = $state(false);
   let summaryViewIndex = $state(-1); // -1 = auto (latest)
   let summaryExpanded = $state(false);
-  let flushTimer: ReturnType<typeof setInterval> | null = null;
-  let flushInFlight = false;
   let noticeTimer: ReturnType<typeof setTimeout> | null = null;
   let scheduleFocusTimer: ReturnType<typeof setInterval> | null = null;
-  let liveSummaryIntervalMinutes = $state(5);
   let aiReplyLanguage = $state("ja");
   let timeTimer: ReturnType<typeof setInterval> | null = null;
   let now = $state(new Date());
@@ -701,7 +698,6 @@
   async function refreshReadiness() {
     const cfg = await getAiConfig();
     aiReplyLanguage = cfg.reply_language || "ja";
-    liveSummaryIntervalMinutes = Math.min(30, Math.max(5, cfg.live_summary_interval_minutes ?? 5));
     const ready = await isAiReady();
     liveReady = ready;
     if (liveReady) {
@@ -803,8 +799,6 @@
         await invoke("stt_start_stream", { caller: "live" });
       }
       autoFollow = true;
-      startFlushTimer();
-      void runScheduledFlush("start");
     } catch (e: any) {
       pendingActivationMode = null;
       cancelSessionOnStartFailure = false;
@@ -815,7 +809,6 @@
         await liveCancelSession();
         snapshot = await liveGetSession();
       } catch {}
-      stopFlushTimer();
       clearLiveAutoLifecycle();
     } finally {
       busy = false;
@@ -846,7 +839,6 @@
       sttListening = false;
       sttPhase = "idle";
       partialText = "";
-      stopFlushTimer();
       markLivePaused();
       if (automated) {
         setNotice("warning", "10分間有効な音声が認識されなかったため、LIVEを一時停止しました。");
@@ -886,8 +878,6 @@
         await invoke("stt_start_stream", { caller: "live" });
       }
       autoFollow = true;
-      startFlushTimer();
-      void runScheduledFlush("resume");
     } catch (e: any) {
       pendingActivationMode = null;
       cancelSessionOnStartFailure = false;
@@ -895,7 +885,6 @@
       markLivePaused();
       clearSttNotice();
       setMessage("error", e?.message || String(e));
-      stopFlushTimer();
     } finally {
       busy = false;
     }
@@ -922,7 +911,6 @@
         const ended = await liveFinishSession();
         lastSaved = ended.saved ? ended : null;
         snapshot = await liveGetSession();
-        stopFlushTimer();
         clearLiveAutoLifecycle();
         saveProgress = "";
         if (!ended.saved) {
@@ -946,7 +934,6 @@
         todoDraftSourcePath = saved.path;
       }
       snapshot = await liveGetSession();
-      stopFlushTimer();
       clearLiveAutoLifecycle();
       saveProgress = "";
       if (saved.saved) {
@@ -1017,7 +1004,6 @@
       snapshot = await liveGetSession();
       partialText = "";
       sttListening = false;
-      stopFlushTimer();
       clearLiveAutoLifecycle();
       setMessage("success", "LIVEセッションを破棄しました");
     } catch (e: any) {
@@ -1057,43 +1043,6 @@
     }
   }
 
-  async function runScheduledFlush(source: string) {
-    if (flushInFlight || !snapshot.active) return;
-    flushInFlight = true;
-    debugLog("[Live] flush check", source);
-    try {
-      snapshot = await liveFlushSummary(false);
-      debugLog("[Live] flush check done, summaries =", snapshot.summaries.length);
-    } catch (e: any) {
-      console.warn("[Live] flush error:", e);
-      setMessage("error", e?.message || String(e));
-    } finally {
-      flushInFlight = false;
-    }
-  }
-
-  function startFlushTimer() {
-    stopFlushTimer();
-    const intervalMs = Math.max(30_000, liveSummaryIntervalMinutes * 60 * 1000);
-    debugLog("[Live] flush timer started, interval =", intervalMs, "ms");
-    flushTimer = setInterval(() => {
-      void runScheduledFlush("timer");
-    }, intervalMs);
-  }
-
-  function stopFlushTimer() {
-    if (flushTimer) {
-      clearInterval(flushTimer);
-      flushTimer = null;
-    }
-  }
-
-  function ensureFlushTimer(checkSource?: string) {
-    if (!snapshot.active || !sttListening) return;
-    if (!flushTimer) startFlushTimer();
-    if (checkSource) void runScheduledFlush(checkSource);
-  }
-
   async function refreshLiveSttState() {
     if (isDemoActive()) {
       sttListening = false;
@@ -1109,7 +1058,6 @@
       sttPhase = sttListening ? "listening" : "idle";
       if (sttListening) {
         markLiveListeningStarted();
-        ensureFlushTimer("stt-refresh");
       } else if (snapshot.active) {
         markLivePaused();
       }
@@ -1146,7 +1094,6 @@
           snapshot = await liveAppendTranscript(event.payload.text || "");
           lastAppliedLen = snapshot.transcript_lines.length;
           markEffectiveSpeech();
-          ensureFlushTimer("line");
         } catch (e: any) {
           setMessage("error", e?.message || String(e));
         }
@@ -1169,11 +1116,9 @@
           }
           pendingActivationMode = null;
           if (!wasListening) markLiveListeningStarted();
-          ensureFlushTimer("stt-listening");
         } else {
           sttPhase = "idle";
           clearSttNotice();
-          stopFlushTimer();
           if (snapshot.active) markLivePaused();
         }
         if (sttListening && !wasListening) autoFollow = true;
@@ -1185,7 +1130,6 @@
         sttPhase = "idle";
         pendingActivationMode = null;
         clearSttNotice();
-        stopFlushTimer();
         if (snapshot.active) markLivePaused();
         setMessage("error", event.payload.message);
         if (wasStarting && cancelSessionOnStartFailure) {
@@ -1218,34 +1162,19 @@
         snapshot = event.payload;
         lastAppliedLen = len;
         if (!snapshot.active) {
-          stopFlushTimer();
-        } else {
-          ensureFlushTimer();
+          // Backend-owned flush driver stops itself when the session changes.
         }
       });
       unlistenSaved = await listen<LiveSaveResult>("live-session-saved", (event) => {
         lastSaved = event.payload;
       });
       unlistenAiConfig = await listen("ai-config-changed", () => {
-        void (async () => {
-          const previousIntervalMinutes = liveSummaryIntervalMinutes;
-          try {
-            await refreshReadiness();
-            if (!snapshot.active || !sttListening) return;
-            if (flushTimer && liveSummaryIntervalMinutes !== previousIntervalMinutes) {
-              startFlushTimer();
-              void runScheduledFlush("config");
-              return;
-            }
-            ensureFlushTimer("config");
-          } catch (e: any) {
-            liveReady = false;
-            setReadinessNotice(e?.message || "LIVEにはAIの準備が必要です。AI設定を確認してください。");
-          }
-        })();
+        refreshReadiness().catch((e: any) => {
+          liveReady = false;
+          setReadinessNotice(e?.message || "LIVEにはAIの準備が必要です。AI設定を確認してください。");
+        });
       });
-      // The flush timer is armed by start/resume/STT/config/session events and
-      // stopped as soon as the Live session leaves active listening.
+      // Automatic Live summary/whiteboard flushing is owned by the backend.
     } catch (e: any) {
       setMessage("error", e?.message || String(e));
     } finally {
@@ -1265,7 +1194,6 @@
   });
 
   onDestroy(() => {
-    stopFlushTimer();
     stopLiveAutoGuardTimer();
     if (timeTimer) clearInterval(timeTimer);
     clearNoticeTimer();

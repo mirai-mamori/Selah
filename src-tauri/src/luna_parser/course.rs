@@ -654,9 +654,7 @@ fn parse_materials(doc: &Html) -> Vec<LunaContentItem> {
                     let row_html = row.html();
                     if let Some(idx) = row_html.find("http") {
                         let tail = &row_html[idx..];
-                        let end = tail
-                            .find(['"', '\'', '<', ' '])
-                            .unwrap_or(tail.len());
+                        let end = tail.find(['"', '\'', '<', ' ']).unwrap_or(tail.len());
                         let candidate = &tail[..end];
                         if candidate.len() > 10 && !candidate.contains("luna.kwansei.ac.jp") {
                             external_url = candidate.to_string();

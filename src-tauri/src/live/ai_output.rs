@@ -17,9 +17,7 @@ use super::{
 //
 // Reading order below follows that flow: latest → reconcile → parse.
 
-pub(super) fn latest_whiteboard(
-    summaries: &[LiveSummaryChunk],
-) -> Option<&LiveWhiteboard> {
+pub(super) fn latest_whiteboard(summaries: &[LiveSummaryChunk]) -> Option<&LiveWhiteboard> {
     summaries
         .iter()
         .rev()
@@ -45,7 +43,11 @@ pub(super) fn format_latest_whiteboard_context(summaries: &[LiveSummaryChunk]) -
 
     let mut out = String::new();
     out.push_str("title: ");
-    out.push_str(if board.title.is_empty() { "—" } else { &board.title });
+    out.push_str(if board.title.is_empty() {
+        "—"
+    } else {
+        &board.title
+    });
     out.push_str(" | layout: ");
     out.push_str(&board.layout);
     out.push('\n');
@@ -72,7 +74,10 @@ pub(super) fn format_latest_whiteboard_context(summaries: &[LiveSummaryChunk]) -
 
     for main in &mains {
         if main.detail.is_empty() {
-            out.push_str(&format!("[main] {}: {} ({})\n", main.id, main.label, main.kind));
+            out.push_str(&format!(
+                "[main] {}: {} ({})\n",
+                main.id, main.label, main.kind
+            ));
         } else {
             out.push_str(&format!(
                 "[main] {}: {} ({}) — {}\n",
@@ -121,11 +126,7 @@ pub(super) fn format_latest_whiteboard_context(summaries: &[LiveSummaryChunk]) -
         // Terms directly under this main.
         if let Some(terms) = terms_by_parent.get(main.id.as_str()) {
             if !terms.is_empty() {
-                out.push_str(&format!(
-                    "  terms({}): {}\n",
-                    terms.len(),
-                    terms.join(", ")
-                ));
+                out.push_str(&format!("  terms({}): {}\n", terms.len(), terms.join(", ")));
             }
         }
     }
@@ -153,11 +154,8 @@ pub(super) fn format_latest_whiteboard_context(summaries: &[LiveSummaryChunk]) -
     }
 
     // Cross-structure edges (parent-child links are implicit from the tree above).
-    let node_by_id: std::collections::HashMap<&str, &LiveWhiteboardNode> = board
-        .nodes
-        .iter()
-        .map(|n| (n.id.as_str(), n))
-        .collect();
+    let node_by_id: std::collections::HashMap<&str, &LiveWhiteboardNode> =
+        board.nodes.iter().map(|n| (n.id.as_str(), n)).collect();
     let cross_edges: Vec<String> = board
         .edges
         .iter()

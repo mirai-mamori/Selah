@@ -172,8 +172,8 @@ pub(super) fn build_markdown(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::super::LiveWhiteboardNode;
+    use super::*;
     use chrono::Local;
 
     fn course() -> LiveCourseInfo {

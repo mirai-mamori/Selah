@@ -823,14 +823,7 @@
     <div class="row">
       <span class="row-label">LIVE 要約の生成間隔</span>
       <div class="row-input">
-        <select bind:value={liveSummaryInterval}>
-          <option value={5}>5分</option>
-          <option value={10}>10分</option>
-          <option value={15}>15分</option>
-          <option value={20}>20分</option>
-          <option value={25}>25分</option>
-          <option value={30}>30分</option>
-        </select>
+        <input type="number" min="5" step="1" bind:value={liveSummaryInterval} />
         <div class="hint">LIVEページで自動的に分割要約を作る間隔です。要約の言語は上の「回答言語」に従います。</div>
       </div>
     </div>

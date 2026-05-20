@@ -37,7 +37,7 @@ fn default_live_summary_interval_minutes() -> u32 {
 }
 
 fn normalize_ai_config(config: &mut AiConfig) {
-    config.live_summary_interval_minutes = config.live_summary_interval_minutes.clamp(5, 30);
+    config.live_summary_interval_minutes = config.live_summary_interval_minutes.max(5);
 }
 
 pub fn reply_language_hint<'a>(
@@ -521,6 +521,9 @@ pub fn save_ai_config(app: tauri::AppHandle, mut config: AiConfig) -> Result<(),
     if result.is_ok() {
         // Notify all windows that AI config changed
         let _ = app.emit("ai-config-changed", ());
+        if let Some(state) = app.try_state::<crate::live::LiveState>() {
+            state.notify_flush_driver();
+        }
     }
     result
 }
