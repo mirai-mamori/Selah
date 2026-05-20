@@ -1060,7 +1060,7 @@
               externalSource = em[1] ? em[1].trim() : '';
               detail = rest.replace(em[0], '').trim();
             } else {
-              var lm = rest.match(/（講義内根拠[:：]\s*([^）]+)）/);
+              var lm = rest.match(/（(?:講義内根拠|録音内根拠)[:：]\s*([^）]+)）/);
               if (lm) {
                 sourceExcerpt = lm[1].trim();
                 detail = rest.replace(lm[0], '').trim();

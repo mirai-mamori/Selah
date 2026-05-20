@@ -5,16 +5,25 @@ use super::{
     LiveWhiteboard, FREE_NOTE_FOLDER_NAME,
 };
 
-fn format_terms_markdown(terms: &[LiveTermExplanation]) -> String {
+fn source_excerpt_label(course: &LiveCourseInfo) -> &'static str {
+    if course.is_free_note {
+        "録音内根拠"
+    } else {
+        "講義内根拠"
+    }
+}
+
+fn format_terms_markdown(course: &LiveCourseInfo, terms: &[LiveTermExplanation]) -> String {
     if terms.is_empty() {
         return String::new();
     }
+    let source_label = source_excerpt_label(course);
     let lines = terms
         .iter()
         .map(|term| {
             let mut detail = String::new();
             if !term.source_excerpt.is_empty() {
-                detail.push_str(&format!("（講義内根拠: {}）", term.source_excerpt));
+                detail.push_str(&format!("（{}: {}）", source_label, term.source_excerpt));
             }
             if !term.external_source.is_empty() {
                 detail.push_str(&format!("（外部出典: {}）", term.external_source));
@@ -26,7 +35,10 @@ fn format_terms_markdown(terms: &[LiveTermExplanation]) -> String {
     format!("\n\n### 用語注釈\n{}", lines)
 }
 
-fn format_whiteboard_markdown(whiteboard: Option<&LiveWhiteboard>) -> String {
+fn format_whiteboard_markdown(
+    course: &LiveCourseInfo,
+    whiteboard: Option<&LiveWhiteboard>,
+) -> String {
     let Some(board) = whiteboard else {
         return String::new();
     };
@@ -39,6 +51,7 @@ fn format_whiteboard_markdown(whiteboard: Option<&LiveWhiteboard>) -> String {
     } else {
         &board.title
     };
+    let source_label = source_excerpt_label(course);
     let nodes = board
         .nodes
         .iter()
@@ -51,7 +64,7 @@ fn format_whiteboard_markdown(whiteboard: Option<&LiveWhiteboard>) -> String {
                 }
                 source.push('）');
             } else if !node.source_excerpt.trim().is_empty() {
-                source.push_str(&format!("（講義内根拠: {}）", node.source_excerpt));
+                source.push_str(&format!("（{}: {}）", source_label, node.source_excerpt));
             }
             if node.detail.trim().is_empty() {
                 format!("- **{}**{}", node.label, source)
@@ -121,12 +134,13 @@ pub(super) fn build_markdown(
                 chunk.title,
                 chunk.range_label,
                 chunk.body,
-                format_terms_markdown(&chunk.terms),
+                format_terms_markdown(course, &chunk.terms),
             )
         })
         .collect::<Vec<_>>()
         .join("\n\n");
     let final_whiteboard_markdown = format_whiteboard_markdown(
+        course,
         summaries
             .iter()
             .rev()
@@ -263,5 +277,35 @@ mod tests {
         assert!(!markdown.contains("Old Board"));
         assert!(markdown.contains("## Chunk 1"));
         assert!(markdown.contains("## Chunk 2"));
+    }
+
+    #[test]
+    fn build_markdown_uses_recording_source_label_for_free_notes() {
+        let mut free_course = course();
+        free_course.is_free_note = true;
+
+        let mut board = board("Free Board", &["Scene"]);
+        board.nodes[0].source_excerpt = "録音で出た根拠".to_string();
+
+        let mut summary = chunk("Chunk", "body", Some(board));
+        summary.terms.push(LiveTermExplanation {
+            term: "用語".to_string(),
+            explanation: "説明".to_string(),
+            source_excerpt: "用語の根拠".to_string(),
+            external_source: String::new(),
+        });
+
+        let markdown = build_markdown(
+            &free_course,
+            Local::now(),
+            Local::now(),
+            "### 全体要約\nsummary",
+            &[summary],
+            &[],
+        );
+
+        assert!(markdown.contains("録音内根拠: 録音で出た根拠"));
+        assert!(markdown.contains("録音内根拠: 用語の根拠"));
+        assert!(!markdown.contains("講義内根拠"));
     }
 }

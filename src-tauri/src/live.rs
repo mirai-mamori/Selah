@@ -495,13 +495,13 @@ fn live_chunk_system_prompt(language_hint: &str, is_free_note: bool) -> String {
 - 具体的な数字・年号・割合・固有名詞・順位・因果関係などの高リスク事実は、文字起こしまたは直近文脈から十分に確認できる場合だけ書いてください。確信が弱い場合は一般化するか削除してください。
 - 外部知識は、用語理解に必要な標準的定義・短い例・一般的背景を補う場合だけ使えます。使った場合は external_source に確認可能な出典名とURL、公式文書名、書籍名などを書いてください。出典を示せない外部知識は使わないでください。
 - 自由ノートは講義とは限りません。会話、会議、メディア音声、自習メモ、アイデアメモでも、録音された内容そのものを整理対象にしてください。非学術的という理由だけで「整理対象外」にしないでください。
-- 明らかな無音・相槌・聞き取り不能な断片は省略してよいですが、会話の展開、人物関係、ゲームや作品内ルール、出来事の流れは整理対象にしてください。
+- 明らかな無音・相槌・聞き取り不能な断片は省略してよいですが、会話の展開、人物関係、固有のルール、出来事の流れは整理対象にしてください。
 - summary_markdown と terms は今回新しく話された内容を中心にし、過去2区間を重複して要約し直さないでください。
 - 内容が少ない区間では無理に情報量を増やさず、確認できた範囲だけを簡潔にまとめてください。
 - 文体は、あとから見返せる録音メモのように簡潔で具体的にしてください。
 
 出力形式（JSONのみ、厳守。Markdownフェンスや説明文を付けない。whiteboard 等のフィールドは出力しない）:
-{"summary_markdown":"- 重点見出し（名詞句または短文）\n- 重点見出し\n\n---\n\n**重点見出し**: 補足説明（具体的に）\n\n**重点見出し**: 補足説明（具体的に）","terms":[{"term":"専門用語または固有概念","explanation":"講義文脈での意味に加え、論点との関係・注意点・短い例のいずれかを補う。","source_excerpt":"講義内の根拠になる短い発話断片","external_source":"外部知識を使った場合の正確な出典名とURL。使っていない場合は空文字"}]}
+{"summary_markdown":"- 重点見出し（名詞句または短文）\n- 重点見出し\n\n---\n\n**重点見出し**: 補足説明（具体的に）\n\n**重点見出し**: 補足説明（具体的に）","terms":[{"term":"専門用語または固有概念","explanation":"録音文脈での意味に加え、論点との関係・注意点・短い例のいずれかを補う。","source_excerpt":"録音内の根拠になる短い発話断片","external_source":"外部知識を使った場合の正確な出典名とURL。使っていない場合は空文字"}]}
 
 summary_markdown のルール:
 - 上半分: 箇条書きタイトルのみ。録音の核心概念やキーワードを、理解に必要な分だけ含める。
@@ -512,9 +512,11 @@ summary_markdown のルール:
 terms のルール:
 - 今回の区間で出た重要な人物名・作品名・ルール名・概念・出来事・固有名詞・略語だけを選ぶ。
 - 注釈対象は「その語や人物・ルールを知らないと録音内容の理解が止まりやすいもの」に限定する。
+- 人物名・地名・道具名・一度だけ出た固有名詞を、出現したという理由だけで terms にしない。summary_markdown の文中で十分読めるもの、または白板の構造ラベルを読む妨げにならないものは省く。
+- 自由ノートでは、繰り返し話題の軸になる人物/場所/仕組み、複数の論点をつなぐ名前、または知らないと出来事の意味が分からない語だけを選ぶ。
 - 一般常識、日常語、単なる相槌、意味の薄い断片は注釈しない。
 - explanation は簡潔にする。語の意味だけで終わらせず、録音内の話題との関係、混同しやすい点、短い例、または見返す観点を補う。
-- source_excerpt は必ず録音内の根拠だけを書く。external_source は外部知識を使った場合だけ書く。
+- source_excerpt は必ず録音内の根拠だけを書く。external_source は外部知識を使った場合だけ書く。録音内だけで十分理解できる名前や固有設定に、公式サイト・百科事典などの外部出典を無理に付けない。
 - 該当語が少ない場合は terms を空配列にする。
 "#
     } else {
@@ -591,35 +593,38 @@ whiteboard は講義内容を中心に関連知識を整理する知識整理ボ
 - 現在の schema は role="main" と role="branch" の二層を基本にする。より深い階層が必要な場合でも、まず上位 main を作り、下位段階は branch の順序と branch 間 edge で表現する。深い入れ子を作る代わりに、読める因果・段階・包含関係を edge.label で明示する。
 
 判断手順:
-1. 直前ボードの全 nodes / edges / id を保持対象として読み、削除しない前提を置く。
+1. 直前ボードの全 nodes / edges / id を保持対象として読み、既に表現された情報を失わない前提を置く。
 2. 全履歴と今回区間から、時系列ではなく内容上の骨格（概念領域、問題、解決策、応用、帰結、現代課題など）を見直す。
 3. 今回区間の各材料を、既存 main の続き、既存 main の branch/term、上位 main を新設すべき新領域、または全体用語に分類する。
 4. 既存ノードの更新で十分な材料は label/detail/edge/parent_id を更新する。既存ノードでは表せない新材料だけ node として追加する。
 5. 最後に nodes の順序と edge.label を整え、読解順が「前提→展開→帰結」または「問題→解決策→結果」になるようにする。
 
 累積更新（最重要）:
-- whiteboard は差分ではなく、録音開始から現在までの累積ボード全体を毎回返す。ノード総数に上限はない。区間が進むほど確実に増える前提で設計する。
-- 既存ボードに含まれていた nodes は、原則すべてそのまま今回の出力にも含める。具体的には、既存の main / branch / term ノードを今回返さなかったら、それは「削除した」と解釈される。録音内で既に話された具体トピックは、その後に話題が変わっても削除しない。
-- 強い原則: 今回返す nodes 配列の長さは、直前ボードの長さ「以上」でなければならない。減らしてはいけない。新しい区間に、既存ノードの label/detail/edge 更新だけでは表せない新しい具体材料があれば、既存ノードを 1 つも消さずに、新規 structure node / branch / term を追加して純増させる。
+- whiteboard は差分ではなく、録音開始から現在までの累積ボード全体を毎回返す。ノード総数に上限はない。区間が進むほど表現すべき情報は増える前提で設計する。
+- 既存ボードに含まれていた情報は、原則すべて今回の出力にも引き継ぐ。録音内で既に話された具体トピックは、その後に話題が変わっても情報として消さない。
+- 強い原則: 今回返す nodes 配列の長さは、直前ボードの長さ「以上」を基本とする。新しい区間に、既存ノードの label/detail/edge 更新だけでは表せない新しい具体材料があれば、新規 structure node / branch / term を追加して純増させる。
 - 累積増加は「既存ノードを更新しない」という意味ではない。後続区間で理解が深まった場合、既存ノードの label / detail / source_excerpt / kind / edge label / 親子関係は、内容をより正確にするために更新してよい。
-- ただし更新は情報の精密化・訂正・関係整理のために行う。既に話された具体論点を消す、旧 branch / term を main の detail に押し込む、別の話題に吸収する、またはノードを返さない形で見えなくすることは更新ではなく削除なので禁止。
-- 重複・誤認識の扱い: 既存ノードが重複、STT 誤認識、意味不明に見えても、今回の出力から消して縮小しない。保持している id を維持したまま label / detail / source_excerpt / kind / parent_id / edge を訂正し、必要なら「同一概念」「訂正」「別名」などの edge.label で関係を整理する。
-- 「構造を綺麗にしたい」「話題が変わった」「直近の関心に絞りたい」「重複に見える」「誤認識だった」という理由で既存ノードを返さないことは禁止。整理は削除ではなく、既存ノードの更新・親子関係の修正・edge の追加で行う。
-- 旧話題の圧縮禁止: 既存 main の branch / term を消して、その内容を main の detail に文章で詰め込む書き方をしない。「（前区間の内容）」「録音前半の内容」のような要約表現を detail / source_excerpt に入れない。各論点は具体ノードのまま残し、detail はそのノード単体での説明にする。
-- id 安定性: 同じ概念には毎回まったく同じ id を使う。意味は同じでも別 id（例: social-gaming → social-interaction、game-activities → survival-management のような言い換え）は禁止。label を更新したくなった場合も id は据え置く。
-- 既存 edge は対応する両端ノードが残る限り維持する。両端が残っているのに edge だけ消えるのは情報損失なので避ける。新しい関係が見えた場合だけ追加する。
+- 旧ノードは、より正確な上位概念・分割・統合にアップグレードしてよい。その場合、旧ノードの情報を新しい node / detail / edge に明示的に引き継ぎ、旧ノードを単に消したように見せない。古い id に固執して構造を悪化させるより、情報を保った置換を優先する。
+- ただし更新は情報の精密化・訂正・関係整理のために行う。既に話された具体論点を消す、旧 branch / term を main の detail にだけ押し込んで見えなくする、別の話題に曖昧に吸収する、または内容を返さない形で見えなくすることは禁止。
+- 重複・誤認識の扱い: 既存ノードが重複、STT 誤認識、意味不明に見える場合は、label / detail / source_excerpt / kind / parent_id / edge を訂正し、必要ならより正確な node に置換する。置換する場合は「同一概念」「訂正」「統合」「分割」などの edge.label や detail で、旧情報がどこへ引き継がれたか分かるようにする。
+- 「構造を綺麗にしたい」「話題が変わった」「直近の関心に絞りたい」という理由だけで既出情報を落とさない。整理は、既存ノードの更新・親子関係の修正・edge の追加・より良い新ノードへの置換で行う。
+- 旧話題の圧縮禁止: 既存 main の branch / term を消して、その内容を main の detail にだけ文章で詰め込む書き方をしない。「（前区間の内容）」「録音前半の内容」のような要約表現を detail / source_excerpt に入れない。各論点は具体的に追える形で残す。
+- id 安定性: 同じ概念を同じ粒度で継続する場合は同じ id を使う。概念の粒度・役割・親子関係を大きく改めるアップグレードでは、新しい id を使ってよいが、旧情報との対応が detail または edge で分かるようにする。
+- 既存 edge は対応する両端ノードが残る限り維持する。ノードを置換した場合は、旧 edge の意味を新ノード間の edge に移す。新しい関係が見えた場合だけ追加する。
 - 一回の録音/講義には複数の課題・章・観点が自然に並ぶ。新しい main 課題は、既存 main クラスターを保ったまま、別の main クラスターとして追加する。冒頭の話題に従属させない。
 - まだ構造が不十分な最初期だけ nodes を空配列にしてよい。一度ノードを返した後の区間で空にしたり、極端に縮めたりしない。
 
 話題境界:
-- 今回区間が既存 main クラスターの続きか、新しい話題・章・素材・動画・論点かを必ず判定してからノードを追加する。
-- 新しい話題と判断する目安: 主語・対象・人物・作品・制度・問題設定が大きく変わる、前区間との因果や説明関係が薄い、締めの発話や導入文がある、別の動画/会話/教材に切り替わった形跡がある、または用語集合がほぼ重ならない。
-- 新しい話題なら、まずその区間内の散らばった点を束ねる合理的な上位テーマを探す。同じ動画・教材・会話単位、同じ人物/作品/制度/事例、同じ問題設定、同じ時代背景、同じ説明目的に属する点は、ばらばらの main にせず、1 つの上位 main クラスターにまとめる。
+- 今回区間が既存 main クラスターの続きか、新しい話題・章・素材・論点かを必ず判定してからノードを追加する。
+- 新しい話題と判断する目安: 主語・対象・人物・制度・問題設定が大きく変わる、前区間との因果や説明関係が薄い、締めの発話や導入文がある、別の素材/会話/教材/議題に切り替わった形跡がある、または用語集合がほぼ重ならない。
+- 新しい話題なら、まずその区間内の散らばった点を束ねる合理的な上位テーマを探す。同じ素材・教材・会話単位、同じ人物/制度/事例、同じ問題設定、同じ時代背景、同じ説明目的に属する点は、ばらばらの main にせず、1 つの上位 main クラスターにまとめる。
 - 新しい話題の中に細かい事実・名前・出来事・属性が多い場合、それぞれを main にしない。代表する role="main" は「何について整理しているか」を示す抽象度にし、個々の点は branch / term としてその配下に置く。
-- 発話に明示的な見出しがなくても、内容から自然に読める上位 main を合成してよい。例: 個別の団体名・年号・出来事が並ぶなら「○○における制度・勢力関係」「○○動画で紹介された主要事例」のように束ね、各団体名・年号・出来事は branch / term にする。
+- 発話に明示的な見出しがなくても、内容から自然に読める上位 main を合成してよい。例: 個別の団体名・年号・出来事が並ぶなら「○○における制度・勢力関係」「○○で扱われた主要事例」のように束ね、各団体名・年号・出来事は branch / term にする。
 - 新しい話題でも、既存ノードを残したまま上位 role="main" の topic/cluster ノードを作り、その区間の branch / term はその新 main 配下へ置く。旧 main の detail に無理に混ぜない。
 - 既存話題の続きなら、新しい main を増やさず、該当 main 配下の branch / term / edge として追加・更新する。
 - 複数話題が同じ区間に混ざる場合も、まず「同じ上位テーマで説明できる散点群」ごとにまとめる。それぞれ最も近い main クラスターに振り分け、どの既存 main にも自然に属さず、かつ同じ上位テーマにも束ねられない内容だけ新しい main にする。
+- 断片的な点が多い録音でも、同じ場面・同じ人物群・同じ固有設定・同じ反応種類・同じ問いに属するなら、合理的な大きな main の下にまとめる。細かい名前や一言コメントを main として乱立させない。
+- 同じ場面や会話の連続、同じイベントの前後、同じ人物への反応は、別々の branch を増やす前に一つの branch の detail 更新や、近接 branch 間の順序/edge で読めるかを検討する。
 - 別 main クラスター間の edge は、因果・比較・前提・反論・同一人物/同一作品など、明確な意味がある場合だけ作る。単に録音内で隣り合っただけの話題を edge で結ばない。
 
 ノード:
@@ -636,6 +641,7 @@ whiteboard は講義内容を中心に関連知識を整理する知識整理ボ
 - 親構造ノードを明確に選べないが全体理解に必要な用語は、parent_id を空文字にした全体用語ノードにする。全体用語ノードは白板の固定端に表示され、edge は持たない。
 - 用語ノードは関係を広げるためのノードではない。親構造ノードとだけ接続し、用語ノード同士や別グループへの横断 edge は作らない。
 - 用語ノードは「知らないと理解が止まる語」「何度も出る語」「既存構造のラベル理解に必要な語」に限る。出た語をすべてノード化しない。
+- 人物名・地名・組織名・固有名詞・道具名は、それが main/branch の主語になる、複数 branch を束ねる、または複数関係の結節点になる場合だけ構造ノードにする。単なる登場名・行き先・小道具・一回の言及なら detail や source_excerpt に含めるだけでよい。
 - 各 node の detail は白板内だけでも最低限理解できるように、講義文脈での役割・条件・注意点を短く具体的に書く。
 - 講義内に出た概念は source_type="lecture" とし、source_excerpt に根拠となる短い発話断片を書く。
 - 理解に役立つ標準的な背景知識・関連概念は必要に応じて少数追加してよいが、必ず source_type="external" とし、external_source に確認可能な出典を書く。外部補足ノードは原則 branch にし、detail の末尾にも外部補足だと分かる表現を入れる。
@@ -644,6 +650,7 @@ whiteboard は講義内容を中心に関連知識を整理する知識整理ボ
 レイアウト:
 - layout は内容に合わせて選ぶ。中心放射に見せるためだけに hub を選ばない。
 - 明確な時系列・手順・因果・継承・発展の流れがある場合は flow を優先する。
+- 自由ノートで「場面の推移」「理解の順番」「反応の流れ」が読める場合も flow を優先する。grid は主ノード同士が本当に独立した並列話題の場合だけ使う。
 - hub は、単一の中心概念を軸に複数の主ノードが放射する構造が本当に自然な場合だけ使う。
 - 二項以上の対比が講義の中心の場合だけ compare。
 - 反復循環が明示された場合だけ cycle。
@@ -657,6 +664,8 @@ whiteboard は講義内容を中心に関連知識を整理する知識整理ボ
 - edges は因果、流れ、対比、包含、条件など、見れば理解が早くなる関係だけを入れる。
 - 強い関連を持つ概念はできるだけ同じ主ノード配下へまとめ、別主ノード配下の横断 edges は重要な因果・対比・条件・制度上の接続に限定する。
 - 弱い関連、単なる連想、知識を増やすためだけのリンクは作らず summary_markdown/terms に回す。
+- edge を追加する前に「この edge を外すと構造理解が明確に悪くなるか」を確認する。悪くならないなら追加しない。
+- 内容本体のノードと話者の冗談・感想・メタコメントを横断 edge でつなぐのは、感想が具体的な理解、解釈、比較、因果説明を担う場合だけにする。単なる反応は、反応系 main/branch の内側に置き、本体側へ弱く結ばない。
 - parent_id だけで主従関係が十分分かる場合は、同じ関係を edge で重複表現しない。
 - 用語ノードに edge を入れる場合は親構造ノードとだけ接続し、label は空文字にする。
 - edge の label は、関係を明示した方が読みやすい場合だけ具体的な関係語を書く。構造維持用の単純な edge は label を空文字にしてよい。単に「関連」「説明」「補足」だけにしない。
@@ -677,7 +686,7 @@ whiteboard は講義内容を中心に関連知識を整理する知識整理ボ
             .replace("講義文脈", "録音文脈")
             .replace("講義の大きな論点", "録音の大きな話題");
         prompt.push_str(
-            "\n自由ノートでは source_type=\"lecture\" を「録音内に出た内容」という意味で使う。録音内容が非学術的でも、人物関係・出来事・ルール・話題の構造がある場合は whiteboard を作り、整理対象外にしない。\n",
+            "\n自由ノートでは source_type=\"lecture\" は互換性のための列挙値であり、「録音内に出た内容」という意味で使う。UI と保存 Markdown では録音内根拠として表示される前提で、source_excerpt も録音内の短い根拠を書く。録音内容が非学術的でも、人物関係・出来事・ルール・話題の構造がある場合は whiteboard を作り、整理対象外にしない。\n",
         );
     }
     prompt.push_str(language_instruction);
@@ -830,7 +839,7 @@ async fn summarize_chunk(
         crate::ai::ChatMessage {
             role: "user".into(),
             content: format!(
-                "{}\n\nこれまでの全分割要約と用語注釈（累積素材）:\n{}\n\n現在の累積知識整理ボード:\n{}\n\n今回新しく生成された区間の要約と用語:\n{}\n\n今回の文字起こし（補助参考、必要に応じて細部を拾う。長すぎる場合は末尾のみ表示）:\n{}\n\n指示: 上記の累積素材すべてと今回区間を統合して、現在までの累積 whiteboard を JSON で返す。既存ノードは絶対に削らず、id を維持すること。既存ノードの更新で表せる材料は label/detail/edge/parent_id を更新し、既存ノードでは表せない新材料だけ node として追加して純増させること。追加前に、分割区間や発話順ではなく内容の論理構造を見直し、今回区間が既存 main クラスターの続きか、新しい話題・章・素材・動画・論点かを判定すること。新しい話題でも、散らばった点が同じ動画・教材・人物・制度・事例・問題設定に属するなら、個別点を main に乱立させず、合理的な上位 main を 1 つ合成して branch / term を配下に置くこと。同一の発展脈絡にある概念は平行 main にせず、共通 main 配下の branch とし、branch 間 edge で「背景」「解決策」「応用」「完成」「帰結」「限界」などの関係を示すこと。既存話題の続きなら既存 main 配下へ配置すること。",
+                "{}\n\nこれまでの全分割要約と用語注釈（累積素材）:\n{}\n\n現在の累積知識整理ボード:\n{}\n\n今回新しく生成された区間の要約と用語:\n{}\n\n今回の文字起こし（補助参考、必要に応じて細部を拾う。長すぎる場合は末尾のみ表示）:\n{}\n\n指示: 上記の累積素材すべてと今回区間を統合して、現在までの累積 whiteboard を JSON で返す。既出情報を失わず、既存ノードの更新で表せる材料は label/detail/edge/parent_id を更新すること。より正確な構造にするためなら旧ノードを新ノードへアップグレード・統合・分割してよいが、旧情報がどこへ引き継がれたか分かるようにすること。既存ノードでは表せない新材料は node として追加して純増させること。追加前に、分割区間や発話順ではなく内容の論理構造を見直し、今回区間が既存 main クラスターの続きか、新しい話題・章・素材・論点かを判定すること。新しい話題でも、散らばった点が同じ素材・教材・人物・制度・事例・問題設定に属するなら、個別点を main に乱立させず、合理的な上位 main を 1 つ合成して branch / term を配下に置くこと。同一の発展脈絡にある概念は平行 main にせず、共通 main 配下の branch とし、branch 間 edge で「背景」「解決策」「応用」「完成」「帰結」「限界」などの関係を示すこと。既存話題の続きなら既存 main 配下へ配置すること。",
                 course_block,
                 full_history,
                 whiteboard_context,
@@ -880,6 +889,26 @@ async fn summarize_overall(
         .map(|line| format!("- [{}] {}", line.at, line.text))
         .collect::<Vec<_>>()
         .join("\n");
+    let user_content = if course.is_free_note {
+        format!(
+            "記録種別: 自由ノート\n題名: {}\n\n分割要約:\n{}\n\n終盤の文字起こし:\n{}\n\n注記: 文字起こしには STT 誤認識が含まれる可能性があります。録音内容の文脈から、明らかな誤りは自然に補正してください。自由ノートは講義とは限らないため、会話・素材記録・自習メモなど実際の内容に合わせて整理してください。",
+            course.course_name, summary_text, recent_transcript,
+        )
+    } else {
+        format!(
+            "講義: {}\n授業コード: {}\n教員: {}\n\n分割要約:\n{}\n\n終盤の文字起こし:\n{}\n\n注記: 文字起こしには STT 誤認識が含まれる可能性があります。講義名「{}」の分野脈絡から、明らかな誤りは自然に補正してください。",
+            course.course_name,
+            course.course_code,
+            if course.teacher.is_empty() {
+                "不明"
+            } else {
+                &course.teacher
+            },
+            summary_text,
+            recent_transcript,
+            course.course_name,
+        )
+    };
     let messages = vec![
         crate::ai::ChatMessage {
             role: "system".into(),
@@ -892,19 +921,7 @@ async fn summarize_overall(
         },
         crate::ai::ChatMessage {
             role: "user".into(),
-            content: format!(
-                "講義: {}\n授業コード: {}\n教員: {}\n\n分割要約:\n{}\n\n終盤の文字起こし:\n{}\n\n注記: 文字起こしには STT 誤認識が含まれる可能性があります。講義名「{}」の分野脈絡から、明らかな誤りは自然に補正してください。",
-                course.course_name,
-                course.course_code,
-                if course.teacher.is_empty() {
-                    "不明"
-                } else {
-                    &course.teacher
-                },
-                summary_text,
-                recent_transcript,
-                course.course_name,
-            ),
+            content: user_content,
             images: Vec::new(),
         },
     ];
@@ -2168,19 +2185,20 @@ mod tests {
         assert!(board_prompt.contains("既存ノードの更新で十分な材料"));
         assert!(board_prompt.contains("既存ノードでは表せない新材料だけ"));
         assert!(board_prompt.contains("ノード総数に上限はない"));
-        assert!(board_prompt.contains("原則すべてそのまま今回の出力にも含める"));
-        assert!(board_prompt.contains("減らしてはいけない"));
+        assert!(board_prompt.contains("既存ボードに含まれていた情報"));
+        assert!(board_prompt.contains("nodes 配列の長さは、直前ボードの長さ「以上」を基本"));
         assert!(board_prompt.contains("重複・誤認識の扱い"));
-        assert!(board_prompt.contains("今回の出力から消して縮小しない"));
         assert!(board_prompt.contains("既存ノードを更新しない"));
         assert!(board_prompt.contains("情報の精密化・訂正・関係整理"));
+        assert!(board_prompt.contains("アップグレードしてよい"));
+        assert!(board_prompt.contains("古い id に固執して構造を悪化させるより"));
         assert!(board_prompt.contains("旧話題の圧縮禁止"));
         assert!(board_prompt.contains("「（前区間の内容）」"));
         assert!(board_prompt.contains("id 安定性"));
-        assert!(board_prompt.contains("social-gaming → social-interaction"));
+        assert!(board_prompt.contains("新しい id を使ってよい"));
         assert!(board_prompt.contains("別の main クラスターとして追加する"));
         assert!(board_prompt.contains("話題境界"));
-        assert!(board_prompt.contains("別の動画/会話/教材に切り替わった形跡"));
+        assert!(board_prompt.contains("別の素材/会話/教材/議題に切り替わった形跡"));
         assert!(board_prompt.contains("既存 main クラスターの続き"));
         assert!(board_prompt.contains("散らばった点を束ねる合理的な上位テーマ"));
         assert!(board_prompt.contains("ばらばらの main にせず"));
@@ -2194,10 +2212,15 @@ mod tests {
         assert!(board_prompt.contains("node_type=\"term\""));
         assert!(board_prompt.contains("構造ノードか用語ノードかは次で判断する"));
         assert!(board_prompt.contains("名前の説明だけなら用語ノード"));
+        assert!(board_prompt.contains("人物名・地名・組織名・固有名詞・道具名"));
         assert!(board_prompt.contains("全体用語ノード"));
         assert!(board_prompt.contains("用語ノードに edge を入れる場合は親構造ノードとだけ接続"));
+        assert!(board_prompt.contains("この edge を外すと構造理解が明確に悪くなるか"));
         assert!(board_prompt.contains("result 同士"));
         assert!(board_prompt.contains("非空 edge.label 也必须使用简体中文"));
+        assert!(!board_prompt.contains("ゲーム"));
+        assert!(!board_prompt.contains("動画"));
+        assert!(!board_prompt.contains("実況"));
 
         let overall_prompt = live_overall_system_prompt("zh", language_hint, false);
         assert!(overall_prompt.contains("### 整体总结"));
@@ -2215,11 +2238,19 @@ mod tests {
         assert!(chunk_prompt.contains("自由ノートは講義とは限りません"));
         assert!(chunk_prompt.contains("非学術的という理由だけで「整理対象外」にしない"));
         assert!(chunk_prompt.contains("人物関係"));
+        assert!(chunk_prompt.contains("一度だけ出た固有名詞"));
+        assert!(chunk_prompt.contains("録音内だけで十分理解できる名前や固有設定"));
+        assert!(!chunk_prompt.contains("ゲーム"));
+        assert!(!chunk_prompt.contains("動画"));
+        assert!(!chunk_prompt.contains("実況"));
 
         let board_prompt =
             live_whiteboard_system_prompt(live_whiteboard_language_instruction("zh"), true);
         assert!(board_prompt.contains("録音内容"));
         assert!(board_prompt.contains("整理対象外にしない"));
+        assert!(board_prompt.contains("source_type=\"lecture\" は互換性のための列挙値"));
+        assert!(board_prompt.contains("断片的な点が多い録音でも"));
+        assert!(board_prompt.contains("単なる反応"));
 
         let overall_prompt = live_overall_system_prompt("zh", language_hint, true);
         assert!(overall_prompt.contains("自由ノート録音"));

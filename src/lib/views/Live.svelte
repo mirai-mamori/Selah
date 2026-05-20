@@ -292,18 +292,22 @@
       }
     };
   }
+  const isFreeNoteSession = $derived(Boolean(snapshot.course?.is_free_note));
   const termFloatLabels = $derived.by(() => {
+    const sourceLabel = isFreeNoteSession
+      ? { zh: "录音依据", en: "Recording source", ko: "녹음 근거", ja: "録音内根拠" }
+      : { zh: "课堂依据", en: "Class source", ko: "수업 근거", ja: "講義内根拠" };
     switch ((aiReplyLanguage || "ja").toLowerCase()) {
       case "zh":
       case "zh-cn":
       case "cn":
-        return { title: "用语注释", boardTitle: "知识整理", empty: "本段没有需要解释的术语", source: "课堂依据", externalSource: "外部来源", externalNode: "外部", collapse: "折叠", expand: "展开", previous: "上一个术语", next: "下一个术语" };
+        return { title: "用语注释", boardTitle: "知识整理", empty: "本段没有需要解释的术语", source: sourceLabel.zh, externalSource: "外部来源", externalNode: "外部", collapse: "折叠", expand: "展开", previous: "上一个术语", next: "下一个术语" };
       case "en":
-        return { title: "Key Terms", boardTitle: "Knowledge Board", empty: "No terms for this segment", source: "Class source", externalSource: "External source", externalNode: "External", collapse: "Collapse", expand: "Expand", previous: "Previous term", next: "Next term" };
+        return { title: "Key Terms", boardTitle: "Knowledge Board", empty: "No terms for this segment", source: sourceLabel.en, externalSource: "External source", externalNode: "External", collapse: "Collapse", expand: "Expand", previous: "Previous term", next: "Next term" };
       case "ko":
-        return { title: "핵심 용어", boardTitle: "지식 정리", empty: "이 구간의 용어 설명이 없습니다", source: "수업 근거", externalSource: "외부 출처", externalNode: "외부", collapse: "접기", expand: "펼치기", previous: "이전 용어", next: "다음 용어" };
+        return { title: "핵심 용어", boardTitle: "지식 정리", empty: "이 구간의 용어 설명이 없습니다", source: sourceLabel.ko, externalSource: "외부 출처", externalNode: "외부", collapse: "접기", expand: "펼치기", previous: "이전 용어", next: "다음 용어" };
       default:
-        return { title: "用語注釈", boardTitle: "知識整理", empty: "この区間の注釈はありません", source: "講義内根拠", externalSource: "外部出典", externalNode: "外部", collapse: "折りたたむ", expand: "展開", previous: "前の用語", next: "次の用語" };
+        return { title: "用語注釈", boardTitle: "知識整理", empty: "この区間の注釈はありません", source: sourceLabel.ja, externalSource: "外部出典", externalNode: "外部", collapse: "折りたたむ", expand: "展開", previous: "前の用語", next: "次の用語" };
     }
   });
 
