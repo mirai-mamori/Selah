@@ -165,7 +165,6 @@ pub async fn refresh_backend_now(
         "rooms",
         "student_profile",
         "exams",
-        "mail_profile",
     ]) {
         updated.extend(refresh_backend_data_with_request(app, &request).await?);
     }
@@ -234,7 +233,6 @@ async fn refresh_backend_data_inner(
     let session_status = sync_backend_session_status(app, true).await?;
     let kgc_authenticated = session_status.kgc_valid;
     let luna_authenticated = session_status.luna_authenticated;
-    let mail_authenticated = session_status.mail_authenticated;
     let mut updated_keys = Vec::new();
     let mut schedule_changed = false;
 
@@ -391,21 +389,6 @@ async fn refresh_backend_data_inner(
                 Ok(_) => updated_keys.push("exams".to_string()),
                 Err(e) => log::warn!("background refresh: exams failed: {}", e),
             }
-        }
-    }
-
-    if request.wants("mail_profile")
-        && mail_authenticated
-        && (request.force || cache_is_stale(&db, "mail_profile", STABLE_CACHE_MAX_AGE_SECS))
-    {
-        match crate::mail_commands::mail_fetch_profile(
-            app.state::<MailState>(),
-            app.state::<Database>(),
-        )
-        .await
-        {
-            Ok(_) => updated_keys.push("mail_profile".to_string()),
-            Err(e) => log::warn!("background refresh: mail_profile failed: {}", e),
         }
     }
 

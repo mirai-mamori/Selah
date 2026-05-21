@@ -1249,7 +1249,6 @@ function refreshVisibleBackendCaches() {
     "mail_inbox",
     "weather",
     "student_profile",
-    "mail_profile",
     "exams",
   ]);
 }
@@ -2311,7 +2310,6 @@ const TASK_LABELS: Record<string, string> = {
   makeup: "補講情報",
   rooms: "教室変更",
   student_profile: "学生プロフィール",
-  mail_profile: "メールプロフィール",
   preemptive_renewal: "セッション更新チェック",
   ai_scheduler: "AI 定期更新",
 };
@@ -2330,7 +2328,6 @@ const BACKEND_TASKS: Array<{ key: string; tier: "volatile" | "stable" | "system"
   { key: "grades", tier: "stable", intervalMs: 12 * 60 * 60 * 1000 },
   { key: "exams", tier: "stable", intervalMs: 12 * 60 * 60 * 1000 },
   { key: "registration", tier: "stable", intervalMs: 12 * 60 * 60 * 1000 },
-  { key: "mail_profile", tier: "stable", intervalMs: 12 * 60 * 60 * 1000 },
   { key: "kwic_home", tier: "stable", intervalMs: 12 * 60 * 60 * 1000 },
   { key: "preemptive_renewal", tier: "system", intervalMs: 5 * 60 * 1000 },
 ];
@@ -2363,7 +2360,7 @@ export async function refreshBackendTaskStatuses() {
     updateTask(task.key, {
       running: false,
       lastRunTs: syncedAt,
-      lastOk: syncedAt != null,
+      lastOk: syncedAt != null ? true : null,
     });
   }));
 }
@@ -2520,8 +2517,7 @@ function getRefreshSequence(): RefreshStep[] {
     // -- Luna --
     { key: "luna_todo", label: TASK_LABELS.luna_todo, platform: "Luna", guard: () => get(lunaAuthState).authenticated },
     { key: "luna_updates", label: TASK_LABELS.luna_updates, platform: "Luna", guard: () => get(lunaAuthState).authenticated },
-    // -- Mail stable then volatile --
-    { key: "mail_profile", label: TASK_LABELS.mail_profile, platform: "Mail", guard: () => get(mailAuthState).authenticated },
+    // -- Mail --
     { key: "mail_inbox", label: TASK_LABELS.mail_inbox, platform: "Mail", guard: () => get(mailAuthState).authenticated },
     // -- Other --
     { key: "weather", label: TASK_LABELS.weather, platform: "Other" },

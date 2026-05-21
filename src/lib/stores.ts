@@ -509,7 +509,7 @@ const DB_CACHE_KEYS = new Set([
   "grades", "registration",
   "kwic_home", "notifications", "luna_updates", "luna_todo",
   "cancellations", "makeup", "rooms", "mail_inbox",
-  "weather", "student_profile", "mail_profile",
+  "weather", "student_profile",
 ]);
 const BACKEND_CACHE_DB_KEYS: Record<string, string> = {
   exams: "exam_timetable",
