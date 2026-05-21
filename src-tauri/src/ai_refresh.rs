@@ -31,6 +31,33 @@ impl AiRefreshState {
     }
 }
 
+struct AiRefreshRequest {
+    keys: Option<HashSet<String>>,
+}
+
+impl AiRefreshRequest {
+    fn new(keys: Option<Vec<String>>) -> Self {
+        let keys = keys.map(|items| {
+            items
+                .into_iter()
+                .filter(|key| !key.trim().is_empty())
+                .collect::<HashSet<_>>()
+        });
+        Self { keys }
+    }
+
+    fn wants(&self, key: &str) -> bool {
+        self.keys
+            .as_ref()
+            .map(|keys| keys.contains(key))
+            .unwrap_or(true)
+    }
+
+    fn is_all(&self) -> bool {
+        self.keys.is_none()
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct AiRefreshStatus {
     pub running: bool,
@@ -104,8 +131,9 @@ pub async fn get_backend_ai_refresh_status(
 pub async fn backend_ai_refresh_now(
     app: AppHandle,
     force: bool,
+    keys: Option<Vec<String>>,
 ) -> Result<AiRefreshStatus, String> {
-    run_ai_refresh(&app, force, "manual").await
+    run_ai_refresh(&app, force, AiRefreshRequest::new(keys), "manual").await
 }
 
 async fn run_due_ai_refresh(app: &AppHandle) -> Result<(), String> {
@@ -143,12 +171,15 @@ async fn run_due_ai_refresh(app: &AppHandle) -> Result<(), String> {
         return Ok(());
     }
 
-    run_ai_refresh(app, true, "scheduled").await.map(|_| ())
+    run_ai_refresh(app, true, AiRefreshRequest::new(None), "scheduled")
+        .await
+        .map(|_| ())
 }
 
 async fn run_ai_refresh(
     app: &AppHandle,
     force: bool,
+    request: AiRefreshRequest,
     trigger: &str,
 ) -> Result<AiRefreshStatus, String> {
     let state = app.state::<AiRefreshState>();
@@ -163,11 +194,15 @@ async fn run_ai_refresh(
     let db = app.state::<Database>();
     let config = ai::load_ai_config();
     let mut status = load_status(&db);
+    let record_scheduler_status = request.is_all();
     status.running = true;
     status.interval_minutes = config.ai_refresh_interval;
     status.last_error.clear();
     status.items.clear();
-    save_status_and_emit(app, &db, &status)?;
+    if let Err(err) = record_status(app, &db, &status, record_scheduler_status) {
+        state.running.store(false, Ordering::SeqCst);
+        return Err(err);
+    }
 
     let mut changed_keys: Vec<String> = Vec::new();
     let mut any_error = false;
@@ -187,62 +222,68 @@ async fn run_ai_refresh(
             force
         );
 
-        status
-            .items
-            .push(item_status("ai_notif", "AI 通知分析", "running", ""));
-        save_status_and_emit(app, &db, &status)?;
-        match refresh_notification_analysis(&db, &config, &session).await {
-            Ok(()) => {
-                changed_keys.push(AI_NOTIF_CACHE_KEY.to_string());
-                update_item_status(&mut status, "ai_notif", "done", "");
+        if request.wants("ai_notif") {
+            status
+                .items
+                .push(item_status("ai_notif", "AI 通知分析", "running", ""));
+            record_status(app, &db, &status, record_scheduler_status)?;
+            match refresh_notification_analysis(&db, &config, &session).await {
+                Ok(()) => {
+                    changed_keys.push(AI_NOTIF_CACHE_KEY.to_string());
+                    update_item_status(&mut status, "ai_notif", "done", "");
+                }
+                Err(err) if is_no_data_error(&err) => {
+                    update_item_status(&mut status, "ai_notif", "skipped", &err);
+                }
+                Err(err) => {
+                    any_error = true;
+                    update_item_status(&mut status, "ai_notif", "error", &err);
+                }
             }
-            Err(err) if is_no_data_error(&err) => {
-                update_item_status(&mut status, "ai_notif", "skipped", &err);
-            }
-            Err(err) => {
-                any_error = true;
-                update_item_status(&mut status, "ai_notif", "error", &err);
-            }
+            record_status(app, &db, &status, record_scheduler_status)?;
         }
-        save_status_and_emit(app, &db, &status)?;
 
-        status
-            .items
-            .push(item_status("ai_todo", "AI 課題分析", "running", ""));
-        save_status_and_emit(app, &db, &status)?;
-        match refresh_todo_analysis(&db, force, &session).await {
-            Ok(_) => {
-                changed_keys.push("ai_todo_analysis".to_string());
-                update_item_status(&mut status, "ai_todo", "done", "");
+        if request.wants("ai_todo") {
+            status
+                .items
+                .push(item_status("ai_todo", "AI 課題分析", "running", ""));
+            record_status(app, &db, &status, record_scheduler_status)?;
+            match refresh_todo_analysis(&db, force, &session).await {
+                Ok(_) => {
+                    changed_keys.push("ai_todo_analysis".to_string());
+                    update_item_status(&mut status, "ai_todo", "done", "");
+                }
+                Err(err) if is_no_data_error(&err) => {
+                    update_item_status(&mut status, "ai_todo", "skipped", &err);
+                }
+                Err(err) => {
+                    any_error = true;
+                    update_item_status(&mut status, "ai_todo", "error", &err);
+                }
             }
-            Err(err) if is_no_data_error(&err) => {
-                update_item_status(&mut status, "ai_todo", "skipped", &err);
-            }
-            Err(err) => {
-                any_error = true;
-                update_item_status(&mut status, "ai_todo", "error", &err);
-            }
+            record_status(app, &db, &status, record_scheduler_status)?;
         }
-        save_status_and_emit(app, &db, &status)?;
 
-        status
-            .items
-            .push(item_status("ai_schedule", "AI 時間割分析", "running", ""));
-        save_status_and_emit(app, &db, &status)?;
-        match refresh_schedule_analysis(&db, force, &session).await {
-            Ok(()) => {
-                changed_keys.push("schedule_data".to_string());
-                update_item_status(&mut status, "ai_schedule", "done", "");
+        if request.wants("ai_schedule") {
+            status
+                .items
+                .push(item_status("ai_schedule", "AI 時間割分析", "running", ""));
+            record_status(app, &db, &status, record_scheduler_status)?;
+            match refresh_schedule_analysis(&db, force, &session).await {
+                Ok(()) => {
+                    changed_keys.push("schedule_data".to_string());
+                    update_item_status(&mut status, "ai_schedule", "done", "");
+                }
+                Err(err) if is_no_data_error(&err) => {
+                    update_item_status(&mut status, "ai_schedule", "skipped", &err);
+                }
+                Err(err) => {
+                    any_error = true;
+                    update_item_status(&mut status, "ai_schedule", "error", &err);
+                }
             }
-            Err(err) if is_no_data_error(&err) => {
-                update_item_status(&mut status, "ai_schedule", "skipped", &err);
-            }
-            Err(err) => {
-                any_error = true;
-                update_item_status(&mut status, "ai_schedule", "error", &err);
-            }
+            record_status(app, &db, &status, record_scheduler_status)?;
         }
-        save_status_and_emit(app, &db, &status)?;
 
         Ok::<(), String>(())
     }
@@ -250,7 +291,10 @@ async fn run_ai_refresh(
 
     state.running.store(false, Ordering::SeqCst);
     status.running = false;
-    status.last_run = Some(epoch_secs());
+    let attempted_ai = status.items.iter().any(item_attempted);
+    if attempted_ai && request.is_all() {
+        status.last_run = Some(epoch_secs());
+    }
 
     if let Err(err) = outcome {
         status.last_ok = Some(false);
@@ -263,12 +307,20 @@ async fn run_ai_refresh(
             .find(|item| item.status == "error")
             .map(|item| item.error.clone())
             .unwrap_or_else(|| "AI refresh failed".to_string());
-    } else {
+    } else if attempted_ai {
         status.last_ok = Some(true);
         status.last_error.clear();
+    } else {
+        status.last_ok = None;
+        status.last_error = status
+            .items
+            .iter()
+            .find(|item| item.status == "skipped")
+            .map(|item| item.error.clone())
+            .unwrap_or_default();
     }
 
-    save_status_and_emit(app, &db, &status)?;
+    record_status(app, &db, &status, record_scheduler_status)?;
     if !changed_keys.is_empty() {
         emit_cache_updated(app, changed_keys);
     }
@@ -696,6 +748,10 @@ fn update_item_status(status: &mut AiRefreshStatus, key: &str, next_status: &str
     }
 }
 
+fn item_attempted(item: &AiRefreshItemStatus) -> bool {
+    matches!(item.status.as_str(), "done" | "error")
+}
+
 fn load_cache_json<T: for<'de> Deserialize<'de>>(db: &Database, key: &str) -> Option<T> {
     db.get_data_cache(key)
         .ok()
@@ -743,6 +799,18 @@ fn save_status_and_emit(
     let json = serde_json::to_string(status).map_err(|e| e.to_string())?;
     db.save_data_cache(AI_STATUS_CACHE_KEY, &json)?;
     let _ = app.emit("backend-ai-refresh-status", status);
+    Ok(())
+}
+
+fn record_status(
+    app: &AppHandle,
+    db: &Database,
+    status: &AiRefreshStatus,
+    should_record: bool,
+) -> Result<(), String> {
+    if should_record {
+        save_status_and_emit(app, db, status)?;
+    }
     Ok(())
 }
 

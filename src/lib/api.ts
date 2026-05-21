@@ -1229,12 +1229,12 @@ export async function getBackendAiRefreshStatus(): Promise<BackendAiRefreshStatu
   return invoke<BackendAiRefreshStatus>("get_backend_ai_refresh_status");
 }
 
-export async function backendAiRefreshNow(force: boolean = true): Promise<BackendAiRefreshStatus> {
+export async function backendAiRefreshNow(force: boolean = true, keys?: string[]): Promise<BackendAiRefreshStatus> {
   if (_isDemo()) {
     return { running: false, last_run: Math.floor(Date.now() / 1000), last_ok: true, interval_minutes: 0, items: [] };
   }
-  const status = await invoke<BackendAiRefreshStatus>("backend_ai_refresh_now", { force });
-  applyBackendAiRefreshStatus(status);
+  const status = await invoke<BackendAiRefreshStatus>("backend_ai_refresh_now", { force, keys: keys ?? null });
+  if (!keys?.length) applyBackendAiRefreshStatus(status);
   return status;
 }
 

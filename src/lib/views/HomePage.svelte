@@ -477,7 +477,7 @@
     aiNotifLoading = true;
     aiNotifError = "";
     try {
-      await backendAiRefreshNow(true);
+      await backendAiRefreshNow(true, ["ai_notif"]);
     } catch (e: any) {
       aiNotifError = e?.message || String(e);
     } finally {

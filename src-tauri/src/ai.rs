@@ -622,7 +622,7 @@ pub fn delete_local_model(app: tauri::AppHandle, model_id: String) -> Result<(),
 #[tauri::command]
 pub async fn request_ai_refresh(app: tauri::AppHandle) -> Result<(), String> {
     log::info!("[ai] request_ai_refresh called, delegating to backend AI refresh");
-    crate::ai_refresh::backend_ai_refresh_now(app, true).await?;
+    crate::ai_refresh::backend_ai_refresh_now(app, true, None).await?;
     Ok(())
 }
 
