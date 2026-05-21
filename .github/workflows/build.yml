@@ -549,3 +549,31 @@ jobs:
             release_id=$(node -e 'const fs=require("fs"); console.log(JSON.parse(fs.readFileSync("release.json", "utf8")).id)')
             node scripts/upload-release-asset.mjs --release release.json --expected-release-id "${release_id}" --file latest.json --name latest.json --require-draft
           fi
+
+  # ── Prune old CI artifacts ────────────────────────────────────────────────
+  # Keep only the 3 newest artifacts per platform; delete the rest so the
+  # Actions storage quota never fills up. A full quota makes upload-artifact
+  # fail at FinalizeArtifact with a 403.
+  prune-artifacts:
+    needs: [build-macos, build-windows]
+    if: always()
+    runs-on: ubuntu-latest
+    permissions:
+      actions: write
+    steps:
+      - name: Keep only the latest 3 artifacts per platform
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          for suffix in -macos -windows-x64; do
+            SUFFIX="$suffix" gh api --paginate \
+              "repos/${REPO}/actions/artifacts?per_page=100" \
+              --jq '.artifacts[] | select(.expired == false) | select(.name | endswith(env.SUFFIX)) | "\(.created_at) \(.id)"' \
+              | sort -r | tail -n +4 | awk '{print $2}' \
+              | while read -r id; do
+                  echo "deleting old artifact $id ($suffix)"
+                  gh api -X DELETE "repos/${REPO}/actions/artifacts/$id"
+                done
+          done
