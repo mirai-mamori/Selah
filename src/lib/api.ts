@@ -105,6 +105,9 @@ if (!__selahGlobal[__SELAH_LISTENERS_KEY]) {
       aiReady.set(false);
       agentReady.set(false);
     });
+    refreshBackendAiTaskStatus().catch((err) => {
+      console.warn("[Selah] backend AI status refresh failed:", err);
+    });
   });
 
   listen<{ keys?: string[] }>("backend-cache-updated", (event) => {
@@ -114,6 +117,10 @@ if (!__selahGlobal[__SELAH_LISTENERS_KEY]) {
     syncBackendManagedKeys(keys).catch((err) => {
       console.warn("[Selah] backend cache sync failed:", err);
     });
+  });
+
+  listen<BackendAiRefreshStatus>("backend-ai-refresh-status", (event) => {
+    applyBackendAiRefreshStatus(event.payload);
   });
 
   listen<NotificationActivationTarget>("notification-activated", (event) => {
@@ -180,6 +187,32 @@ interface BackendSessionStatus {
   mail_authenticated: boolean;
   mail_email: string;
   mail_display_name: string;
+}
+
+interface BackendAiRefreshItemStatus {
+  key: string;
+  label: string;
+  status: "done" | "skipped" | "error" | string;
+  error?: string;
+}
+
+interface BackendAiRefreshStatus {
+  running: boolean;
+  last_run: number | null;
+  last_ok: boolean | null;
+  last_error?: string;
+  interval_minutes: number;
+  items?: BackendAiRefreshItemStatus[];
+}
+
+function applyBackendAiRefreshStatus(status: BackendAiRefreshStatus) {
+  updateTaskInterval("ai_scheduler", status.interval_minutes ? status.interval_minutes * 60 * 1000 : 0);
+  updateTask("ai_scheduler", {
+    running: status.running,
+    lastRunTs: status.last_run ? status.last_run * 1000 : null,
+    lastOk: status.last_ok ?? null,
+  });
+  aiRefreshing.set({ notif: status.running, todo: status.running });
 }
 
 interface NotificationActivationTarget {
@@ -1189,6 +1222,27 @@ export async function saveDataCache(key: string, json: string): Promise<void> {
   return invoke("save_data_cache", { key, json });
 }
 
+export async function getBackendAiRefreshStatus(): Promise<BackendAiRefreshStatus> {
+  if (_isDemo()) {
+    return { running: false, last_run: null, last_ok: null, interval_minutes: 0, items: [] };
+  }
+  return invoke<BackendAiRefreshStatus>("get_backend_ai_refresh_status");
+}
+
+export async function backendAiRefreshNow(force: boolean = true): Promise<BackendAiRefreshStatus> {
+  if (_isDemo()) {
+    return { running: false, last_run: Math.floor(Date.now() / 1000), last_ok: true, interval_minutes: 0, items: [] };
+  }
+  const status = await invoke<BackendAiRefreshStatus>("backend_ai_refresh_now", { force });
+  applyBackendAiRefreshStatus(status);
+  return status;
+}
+
+export async function refreshBackendAiTaskStatus(): Promise<void> {
+  const status = await getBackendAiRefreshStatus();
+  applyBackendAiRefreshStatus(status);
+}
+
 const BACKEND_CACHE_DB_KEY: Record<string, string> = {
   exams: "exam_timetable",
 };
@@ -1233,6 +1287,20 @@ async function syncBackendManagedKeys(keys: string[]): Promise<void> {
   await Promise.all(uniqueKeys.map(async (key) => {
     const data = await loadBackendManagedCache(key);
     if (data == null) return;
+    if (key === "ai_notif_analysis") {
+      aiNotifStore.set({
+        result: data.result ?? data,
+        sources: Array.isArray(data.sources) ? data.sources : [],
+        timestamp: typeof data.generated_at === "number" ? data.generated_at * 1000 : Date.now(),
+      });
+      return;
+    }
+    if (key === "ai_todo_analysis") {
+      const result = { ...(data as Record<string, unknown>) };
+      delete result._cache_fingerprint;
+      aiTodoStore.set({ result, timestamp: Date.now() });
+      return;
+    }
     replaceCacheEntry(key, data);
   }));
 
@@ -1250,6 +1318,8 @@ function refreshVisibleBackendCaches() {
     "weather",
     "student_profile",
     "exams",
+    "ai_notif_analysis",
+    "ai_todo_analysis",
   ]);
 }
 
@@ -2293,7 +2363,7 @@ export async function showMainAgentWindow(): Promise<void> {
 // in Rust. The frontend keeps only:
 //   1. cache hydration from backend-emitted updates
 //   2. a foreground catch-up when the WebView becomes visible
-//   3. AI-only scheduling that still depends on frontend stores/views
+//   3. AI status display and manual AI refresh commands
 
 const TASK_LABELS: Record<string, string> = {
   schedule_data: "時間割同期",
@@ -2325,9 +2395,9 @@ const BACKEND_TASKS: Array<{ key: string; tier: "volatile" | "stable" | "system"
   { key: "weather", tier: "stable", intervalMs: 60 * 60 * 1000 },
   { key: "schedule_data", tier: "stable", intervalMs: 6 * 60 * 60 * 1000 },
   { key: "student_profile", tier: "stable", intervalMs: 12 * 60 * 60 * 1000 },
-  { key: "grades", tier: "stable", intervalMs: 12 * 60 * 60 * 1000 },
+  { key: "grades", tier: "stable", intervalMs: 72 * 60 * 60 * 1000 },
   { key: "exams", tier: "stable", intervalMs: 12 * 60 * 60 * 1000 },
-  { key: "registration", tier: "stable", intervalMs: 12 * 60 * 60 * 1000 },
+  { key: "registration", tier: "stable", intervalMs: 72 * 60 * 60 * 1000 },
   { key: "kwic_home", tier: "stable", intervalMs: 12 * 60 * 60 * 1000 },
   { key: "preemptive_renewal", tier: "system", intervalMs: 5 * 60 * 1000 },
 ];
@@ -2378,23 +2448,24 @@ export function startBackgroundPolling() {
 
   stopBackgroundPolling();
   document.addEventListener("visibilitychange", handlePollVisibility);
-  // Routine cache/session refresh is backend-owned now. Frontend only keeps
-  // AI scheduling plus a foreground catch-up in case cache-update events were missed.
+  // Routine cache/session/AI refresh is backend-owned now. Frontend only keeps
+  // a foreground catch-up in case cache-update events were missed.
   registerBackendRefreshTasks();
   refreshBackendTaskStatuses().catch((err) => {
     console.warn("[Selah] backend task status hydration failed:", err);
   });
   registerTask("ai_scheduler", TASK_LABELS["ai_scheduler"], "stable", 0);
+  refreshBackendAiTaskStatus().catch((err) => {
+    console.warn("[Selah] backend AI task status hydration failed:", err);
+  });
   refreshVisibleBackendCaches();
   syncBackendSessionStatusNow().catch((err) => {
     console.warn("[Selah] backend session status sync failed:", err);
   });
-  startAiScheduler();
 }
 
 export function stopBackgroundPolling() {
   document.removeEventListener("visibilitychange", handlePollVisibility);
-  stopAiScheduler();
 }
 
 function handlePollVisibility() {
@@ -2403,93 +2474,18 @@ function handlePollVisibility() {
     syncBackendSessionStatusNow().catch((err) => {
       console.warn("[Selah] backend session status visibility sync failed:", err);
     });
+    refreshBackendAiTaskStatus().catch((err) => {
+      console.warn("[Selah] backend AI status visibility sync failed:", err);
+    });
   }
 }
 
-// ============ Unified AI Refresh Scheduler ============
-// Periodically triggers AI notification analysis and AI todo analysis
-// based on user-configured interval (ai_refresh_interval in AiConfig).
-
-let aiRefreshTimer: ReturnType<typeof setInterval> | null = null;
-let aiRefreshInitTimeout: ReturnType<typeof setTimeout> | null = null;
-const AI_LAST_RUN_KEY = "ai-scheduler-last-run";
-
-function getAiLastRun(): number {
-  try { return parseInt(localStorage.getItem(AI_LAST_RUN_KEY) || "0") || 0; } catch { return 0; }
-}
-
-function setAiLastRun(ts: number) {
-  try { localStorage.setItem(AI_LAST_RUN_KEY, String(ts)); } catch { /* ignore */ }
-}
-
-/** Run both AI analyses, updating shared stores. force=true bypasses backend cache. */
+// ============ Backend AI Refresh ============
+// Periodic non-Live AI analysis is timed and triggered by Rust. This wrapper is
+// kept for existing manual callers; it does not start any frontend scheduler.
 export async function runAiRefresh(force: boolean = false): Promise<void> {
   if (!get(authState).authenticated || get(reloginInProgress) || get(sessionExpired)) return;
-
-  if (!await isAiReady()) return;
-
-  // AI todo analysis (runs if Luna is authenticated)
-  if (get(lunaAuthState).authenticated) {
-    aiRefreshing.update(s => ({ ...s, todo: true }));
-    try {
-      const result = await aiAnalyzeTodo(force);
-      aiTodoStore.set({ result, timestamp: Date.now() });
-    } catch (e) {
-      console.warn("[AI Scheduler] todo analysis failed:", e);
-    } finally {
-      aiRefreshing.update(s => ({ ...s, todo: false }));
-    }
-  }
-
-  // Signal HomePage to refresh AI notifs via the existing store mechanism
-  aiNotifStore.update(s => {
-    // Set timestamp to 0 to signal that a refresh is needed
-    // HomePage will pick this up and run its own fetchAiNotifs with full context
-    return s ? { ...s, timestamp: 0 } : s;
-  });
-
-  setAiLastRun(Date.now());
-}
-
-async function aiSchedulerTick() {
-  if (!get(authState).authenticated || get(reloginInProgress) || get(sessionExpired)) return;
-  try {
-    if (!await isAiReady()) return;
-    const cfg = await getAiConfig();
-    if (!cfg.ai_refresh_interval) return;
-    const intervalMs = cfg.ai_refresh_interval * 60 * 1000;
-    const lastRun = getAiLastRun();
-    if (Date.now() - lastRun < intervalMs) return;
-    debugLog("[AI Scheduler] interval reached, running AI refresh");
-    updateTask("ai_scheduler", { running: true });
-    await runAiRefresh(true);
-    updateTask("ai_scheduler", { running: false, lastRunTs: Date.now(), lastOk: true });
-  } catch (e) {
-    console.warn("[AI Scheduler] tick error:", e);
-    updateTask("ai_scheduler", { running: false, lastRunTs: Date.now(), lastOk: false });
-  }
-}
-
-export function startAiScheduler() {
-  stopAiScheduler();
-  // Check after 30s initial delay (let data load first)
-  aiRefreshInitTimeout = setTimeout(async () => {
-    // Update interval display from config
-    try {
-      const cfg = await getAiConfig();
-      if (cfg.ai_refresh_interval) {
-        updateTaskInterval("ai_scheduler", cfg.ai_refresh_interval * 60 * 1000);
-      }
-    } catch { /* ignore */ }
-    aiSchedulerTick();
-    // Then check every 5 minutes if interval has been reached
-    aiRefreshTimer = setInterval(aiSchedulerTick, 5 * 60 * 1000);
-  }, 30_000);
-}
-
-export function stopAiScheduler() {
-  if (aiRefreshInitTimeout) { clearTimeout(aiRefreshInitTimeout); aiRefreshInitTimeout = null; }
-  if (aiRefreshTimer) { clearInterval(aiRefreshTimer); aiRefreshTimer = null; }
+  await backendAiRefreshNow(force);
 }
 
 /** One-click full refresh: invalidate all caches and re-fetch everything */
@@ -2544,6 +2540,7 @@ export async function refreshAllData(): Promise<void> {
     if (get(lunaAuthState).authenticated) {
       initialItems.push({ key: "ai_todo", label: "AI 課題分析", platform: "AI", status: "pending" });
     }
+    initialItems.push({ key: "ai_schedule", label: "AI 時間割分析", platform: "AI", status: "pending" });
   }
 
   cacheStatus.update(s => ({ ...s, fullRefreshing: true, refreshingCount: initialItems.length, items: initialItems }));
@@ -2585,26 +2582,19 @@ export async function refreshAllData(): Promise<void> {
     // AI refresh (after all data is fresh)
     if (aiReady && !aiBlocked2b) {
       setItemStatus("ai_notif", "running");
-      aiNotifStore.set(null); // clear so HomePage knows to generate fresh
-      // Brief wait for views to pick up fresh data
-      await new Promise(r => setTimeout(r, 500));
-      setItemStatus("ai_notif", "done");
-
-      // AI todo analysis
-      if (get(lunaAuthState).authenticated) {
-        setItemStatus("ai_todo", "running");
-        aiRefreshing.update(s => ({ ...s, todo: true }));
-        try {
-          const result = await aiAnalyzeTodo(true);
-          aiTodoStore.set({ result, timestamp: Date.now() });
-          setItemStatus("ai_todo", "done");
-        } catch {
-          setItemStatus("ai_todo", "error");
-        } finally {
-          aiRefreshing.update(s => ({ ...s, todo: false }));
+      try {
+        const status = await backendAiRefreshNow(true);
+        const itemStatus = new Map((status.items ?? []).map(item => [item.key, item.status]));
+        setItemStatus("ai_notif", itemStatus.get("ai_notif") === "error" ? "error" : "done");
+        if (get(lunaAuthState).authenticated) {
+          setItemStatus("ai_todo", itemStatus.get("ai_todo") === "error" ? "error" : "done");
         }
+        setItemStatus("ai_schedule", itemStatus.get("ai_schedule") === "error" ? "error" : "done");
+      } catch {
+        setItemStatus("ai_notif", "error");
+        if (get(lunaAuthState).authenticated) setItemStatus("ai_todo", "error");
+        setItemStatus("ai_schedule", "error");
       }
-      setAiLastRun(Date.now());
     }
     cacheStatus.update(s => ({ ...s, lastUpdated: Date.now() }));
   } finally {

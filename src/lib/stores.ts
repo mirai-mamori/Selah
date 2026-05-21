@@ -306,12 +306,11 @@ syllabusSearchState.subscribe((state) => {
 export const activeTab = writable<string>("home");
 export type SettingsPanel = "ai" | "session" | "mail" | "calendar" | "notification" | "download" | "about" | "debug";
 export const activeSettingsPanel = writable<SettingsPanel>("ai");
-export const aiRefreshRequested = writable<boolean>(false);
 export const unreadNotifCount = writable<number>(0);
 export const unreadMailCount = writable<number>(0);
 export const requestedMailMessageId = writable<string | null>(null);
 
-// ============ AI Refresh Scheduler ============
+// ============ Backend AI Analysis ============
 export const aiNotifStore = writable<{ result: any; sources: any[]; timestamp: number } | null>(null);
 export const aiTodoStore = writable<{ result: any; timestamp: number } | null>(null);
 export const aiRefreshing = writable<{ notif: boolean; todo: boolean }>({ notif: false, todo: false });
@@ -475,9 +474,9 @@ const DEFAULT_TTL = 5 * 60 * 1000; // 5 minutes
 const CACHE_TTLS: Record<string, number> = {
   // KG-Course
   schedule_data: 30 * 60 * 1000,
-  grades: 30 * 60 * 1000,
+  grades: 72 * 60 * 60 * 1000,
   exams: 30 * 60 * 1000,
-  registration: 30 * 60 * 1000,
+  registration: 72 * 60 * 60 * 1000,
   cancellations: 5 * 60 * 1000,
   makeup: 5 * 60 * 1000,
   rooms: 5 * 60 * 1000,
@@ -509,7 +508,7 @@ const DB_CACHE_KEYS = new Set([
   "grades", "registration",
   "kwic_home", "notifications", "luna_updates", "luna_todo",
   "cancellations", "makeup", "rooms", "mail_inbox",
-  "weather", "student_profile",
+  "weather", "student_profile", "ai_notif_analysis", "ai_todo_analysis",
 ]);
 const BACKEND_CACHE_DB_KEYS: Record<string, string> = {
   exams: "exam_timetable",

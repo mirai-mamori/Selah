@@ -817,7 +817,7 @@
           <option value={720}>12時間</option>
           <option value={1440}>24時間</option>
         </select>
-        <div class="hint">AI 通知分析と AI 課題分析を自動で再計算する間隔です。</div>
+        <div class="hint">バックエンドが AI 通知分析・AI 課題分析・AI 時間割分析をまとめて再計算する間隔です。LIVE の即時要約とは別です。</div>
       </div>
     </div>
     <div class="row">

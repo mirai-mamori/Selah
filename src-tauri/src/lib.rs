@@ -8,6 +8,7 @@ mod agent_prompts;
 mod agent_provider;
 mod agent_tools;
 pub mod ai;
+mod ai_refresh;
 mod app_updates;
 mod auth;
 mod background_refresh;
@@ -292,6 +293,7 @@ pub fn run() {
             app.manage(ThemeState(std::sync::Mutex::new("system".to_string())));
             app.manage(live::LiveState::new());
             app.manage(background_refresh::BackendRefreshState::new());
+            app.manage(ai_refresh::AiRefreshState::new());
             app.manage(notifier::NotificationPollState::new());
 
             // Initialize SQLite database for timetable enrichment
@@ -307,6 +309,7 @@ pub fn run() {
             tray::setup_tray(app.handle())?;
             tray::start_tray_cycle(app.handle(), tray_status);
             background_refresh::start_background_refresh_loop(app.handle());
+            ai_refresh::start_ai_refresh_loop(app.handle());
             notifier::start_notification_loop(app.handle());
             commands::migrate_uncategorized_to_other();
             commands::migrate_rename_course_folders();
@@ -501,6 +504,8 @@ pub fn run() {
             notifier::notification_sync_now,
             background_refresh::backend_refresh_now,
             background_refresh::backend_sync_session_status_now,
+            ai_refresh::backend_ai_refresh_now,
+            ai_refresh::get_backend_ai_refresh_status,
             commands::list_downloads,
             commands::scan_download_dir,
             commands::scan_duplicate_downloads,

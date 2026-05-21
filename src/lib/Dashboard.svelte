@@ -1,7 +1,7 @@
 <script lang="ts">
   import { onMount, onDestroy } from "svelte";
   import { listen } from "@tauri-apps/api/event";
-  import { activeTab, aiRefreshRequested, unreadNotifCount, unreadMailCount, readIdsStore, onCacheUpdate, getCached, loadReadIds, notifKey } from "./stores";
+  import { activeTab, unreadNotifCount, unreadMailCount, readIdsStore, onCacheUpdate, getCached, loadReadIds, notifKey } from "./stores";
   import { get } from "svelte/store";
   import type { NotificationsData } from "./stores";
   import Icon from "./Icon.svelte";
@@ -155,10 +155,6 @@
     loadReadIds().catch(() => {}).finally(() => recalcNotifBadge());
   }
   onMount(async () => {
-    unlistenRefresh = await listen('ai-refresh-request', () => {
-      activeTab.set('timetable');
-      aiRefreshRequested.set(true);
-    });
     const unlistenTrayTab = await listen<string>('tray-open-tab', (event) => {
       if (event.payload) activeTab.set(event.payload);
     });
@@ -173,8 +169,7 @@
     const unlistenAiCfg = await listen('ai-config-changed', () => {
       updateAiReadiness().catch(() => {});
     });
-    const _prevDestroy = unlistenRefresh;
-    unlistenRefresh = () => { _prevDestroy?.(); unlistenTrayTab(); unlistenOpenAgent(); unlistenAiCfg(); };
+    unlistenRefresh = () => { unlistenTrayTab(); unlistenOpenAgent(); unlistenAiCfg(); };
   });
   onDestroy(() => { if (unlistenRefresh) unlistenRefresh(); unsubMail(); unsubNotif(); unsubLuna(); unsubKwicHome(); });
 </script>

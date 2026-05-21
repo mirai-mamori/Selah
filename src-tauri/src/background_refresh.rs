@@ -14,6 +14,7 @@ const REFRESH_TICK: Duration = Duration::from_secs(5 * 60);
 const FAST_CACHE_MAX_AGE_SECS: i64 = 5 * 60;
 const WEATHER_CACHE_MAX_AGE_SECS: i64 = 60 * 60;
 const STABLE_CACHE_MAX_AGE_SECS: i64 = 12 * 60 * 60;
+const ACADEMIC_RECORD_CACHE_MAX_AGE_SECS: i64 = 72 * 60 * 60;
 const SCHEDULE_CACHE_MAX_AGE_SECS: i64 = 6 * 60 * 60;
 const SESSION_RENEW_THRESHOLD_SECS: i64 = 5 * 60;
 const GCAL_AUTO_SYNC_LAST_RUN_KEY: &str = "gcal_auto_sync_last_run";
@@ -303,7 +304,7 @@ async fn refresh_backend_data_inner(
 
     if kgc_authenticated {
         if request.wants("grades")
-            && (request.force || cache_is_stale(&db, "grades", STABLE_CACHE_MAX_AGE_SECS))
+            && (request.force || cache_is_stale(&db, "grades", ACADEMIC_RECORD_CACHE_MAX_AGE_SECS))
         {
             match crate::commands::fetch_grades(app.state::<KgcState>(), app.state::<Database>())
                 .await
@@ -313,7 +314,8 @@ async fn refresh_backend_data_inner(
             }
         }
         if request.wants("registration")
-            && (request.force || cache_is_stale(&db, "registration", STABLE_CACHE_MAX_AGE_SECS))
+            && (request.force
+                || cache_is_stale(&db, "registration", ACADEMIC_RECORD_CACHE_MAX_AGE_SECS))
         {
             match crate::commands::fetch_registration(
                 app.state::<KgcState>(),

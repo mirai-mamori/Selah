@@ -255,16 +255,6 @@
       });
       scheduleData = data;
       aiResult = data.ai_result;
-
-      // Auto-refresh AI when cache is stale (only if AI is validated)
-      if (data.ai_stale && data.ai_result && data.raw.current_week_label) {
-        isAiReady().then(async ready => {
-          if (ready && !await isLocalStandard2b()) {
-            debugLog("[Timetable] AI cache stale, triggering background refresh");
-            triggerAiGenerate(true);
-          }
-        });
-      }
     } catch (e: any) {
       error = e?.message || String(e);
     } finally {

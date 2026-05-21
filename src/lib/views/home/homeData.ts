@@ -24,12 +24,6 @@ export interface AiNotifResult {
   suggestions: string[];
 }
 
-export interface AiNotifCache {
-  timestamp: number;
-  result: AiNotifResult;
-  sources: UnifiedNotif[];
-}
-
 const WMO_DESCRIPTIONS: Record<number, { label: string; icon: string }> = {
   0: { label: "快晴", icon: "☀️" },
   1: { label: "晴れ", icon: "🌤" },
@@ -79,9 +73,6 @@ const GREETINGS: Record<string, string[]> = {
     "ゆっくり休んでね", "もうひと息",
   ],
 };
-
-export const AI_CACHE_KEY = "ai-notif-cache:v2";
-export const AI_REFRESH_MS = 12 * 60 * 60 * 1000;
 
 export function getGreetingSlot(date: Date) {
   const hour = date.getHours();
@@ -162,62 +153,6 @@ export function getRecentNotifications(
   });
 
   return merged.slice(0, 3);
-}
-
-export function buildLocalSystemPrompt(nowStr: string, lang: string): string {
-  let prompt = `あなたは関西学院大学の学生向けパーソナル通知アシスタントです。
-学生のプロフィール（学部・キャンパス・履修科目・課題状況）と通知一覧を受け取り、今この学生にとって重要な情報をJSON形式で出力します。
-
-現在の日時: ${nowStr}
-この日時がすべての判断の基準です。
-
-# キャンパスと学部
-- 西宮上ケ原（NUC）：神学部、文学部、社会学部、法学部、経済学部、商学部、人間福祉学部、国際学部、教育学部
-- 神戸三田（KSC）：総合政策学部、理学部、工学部、生命環境学部、建築学部
-NUCとKSCは約40km離れており、別キャンパスの通知は基本無関係です。
-
-# 判定基準
-各通知について以下を判定してください：
-- 日程が現在より前 → 終了済み → 除外
-- 学生の所属キャンパス・学部と無関係 → 除外
-- 各通知は独立です。似たタイトルでも各通知の「内容:」から個別に日程を読み取ること
-- 「内容:」がない通知はタイトルと日付で判断
-
-# 出力ルール
-
-summary（80〜150字）:
-- 除外した通知には言及しない
-- 課題の締切は「あとN日」と残り日数を書く
-- 具体的な情報（教室名・時間・場所）を引用する
-
-important（最大5件）:
-- 除外した通知は入れない
-- indexは通知一覧の番号（1始まり）と一致させる
-- 優先: 履修科目関連 > 学部関連 > キャンパス内イベント > 全学共通
-
-suggestions（最大3件、各10〜20字）:
-- 通知の繰り返しではなく、一歩踏み込んだ行動提案を書く
-- カジュアルな口調（丁寧語・命令形は使わない）
-- 終了済みイベントのsuggestionsは書かない
-- 良い例:「レポートは構成だけ先に書いとくといいよ」
-- 悪い例:「〇〇のクイズ、あと3日」（これはsummaryの内容）
-
-# 出力形式
-以下のJSONのみ出力。JSON以外のテキスト・説明・前置きは絶対に書かないでください。
-
-{"summary":"...","important":[{"title":"20字以内","reason":"15字以内","index":番号}],"suggestions":["..."]}`;
-  if (lang) prompt += `\n\nsummary, title, reason, suggestionsは${lang}で書くこと。`;
-  return prompt;
-}
-
-export function parseAiNotifResponse(raw: string): AiNotifResult {
-  let cleaned = raw.replace(/<think[\s\S]*?<\/think>/gi, "");
-  cleaned = cleaned.replace(/<think>/gi, "").replace(/<\/think>/gi, "").trim();
-  const match = cleaned.match(/\{[\s\S]*\}/);
-  if (!match) throw new Error("AI応答の解析に失敗しました");
-  const parsed = JSON.parse(match[0]);
-  delete parsed._check;
-  return parsed;
 }
 
 export function daysUntil(deadline: string, now: Date): number {

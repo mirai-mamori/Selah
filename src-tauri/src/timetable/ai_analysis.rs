@@ -281,8 +281,17 @@ pub async fn ai_generate_schedule(
     next_week_label: String,
     force: bool,
 ) -> Result<AiScheduleResult, String> {
+    ai_generate_schedule_internal(&db, current_week_label, next_week_label, force).await
+}
+
+pub async fn ai_generate_schedule_internal(
+    db: &Database,
+    current_week_label: String,
+    next_week_label: String,
+    force: bool,
+) -> Result<AiScheduleResult, String> {
     if !force {
-        if let Some((cached, _)) = load_ai_cache_inner(&db)? {
+        if let Some((cached, _)) = load_ai_cache_inner(db)? {
             if cached.current_week_label == current_week_label {
                 return Ok(cached);
             }
@@ -357,6 +366,13 @@ pub async fn ai_generate_schedule(
 #[tauri::command]
 pub async fn ai_analyze_todo(
     db: State<'_, Database>,
+    force: bool,
+) -> Result<serde_json::Value, String> {
+    ai_analyze_todo_internal(&db, force).await
+}
+
+pub async fn ai_analyze_todo_internal(
+    db: &Database,
     force: bool,
 ) -> Result<serde_json::Value, String> {
     let config = ai::load_ai_config();

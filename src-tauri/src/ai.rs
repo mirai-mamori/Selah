@@ -621,10 +621,8 @@ pub fn delete_local_model(app: tauri::AppHandle, model_id: String) -> Result<(),
 
 #[tauri::command]
 pub async fn request_ai_refresh(app: tauri::AppHandle) -> Result<(), String> {
-    use tauri::Emitter;
-    log::info!("[ai] request_ai_refresh called, emitting to all windows");
-    app.emit("ai-refresh-request", ())
-        .map_err(|e| format!("emit failed: {}", e))?;
+    log::info!("[ai] request_ai_refresh called, delegating to backend AI refresh");
+    crate::ai_refresh::backend_ai_refresh_now(app, true).await?;
     Ok(())
 }
 

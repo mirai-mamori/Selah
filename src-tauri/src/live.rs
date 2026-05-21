@@ -2251,7 +2251,8 @@ mod tests {
         assert!(board_prompt.contains("既存話題の続きなら"));
         assert!(board_prompt.contains("散らばった点"));
         assert!(board_prompt.contains("合理的な上位 main を合成"));
-        assert!(board_prompt.contains("新しい語・固有名詞・出来事・数値・属性だけを理由に main を増やさない"));
+        assert!(board_prompt
+            .contains("新しい語・固有名詞・出来事・数値・属性だけを理由に main を増やさない"));
         assert!(board_prompt.contains("branch が別 branch の下位要素に見える場合"));
         assert!(board_prompt.contains("中心放射に見せるためだけに hub を選ばない"));
         assert!(board_prompt.contains("発話順より概念上の前提→展開→帰結を優先する"));
