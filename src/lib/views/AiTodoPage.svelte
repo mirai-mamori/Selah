@@ -101,12 +101,10 @@
     if (tipInterval) { clearInterval(tipInterval); tipInterval = undefined; }
   }
 
+  // AI 補助モードは分析を自動で起動しない。既存の結果があればティッカーを
+  // 動かすだけで、無ければアイドル状態を表示し、ユーザーの操作を待つ。
   onMount(() => {
-    if (!result) {
-      reanalyze();
-    } else {
-      startTipCycle();
-    }
+    if (result) startTipCycle();
   });
   onDestroy(() => stopTipCycle());
 </script>
@@ -333,6 +331,19 @@
         </div>
       {/if}
     {/if}
+  {:else}
+    <!-- Idle: no analysis has been run yet -->
+    <div class="idle-state">
+      <div class="idle-icon">
+        <svg width="28" height="28" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.2">
+          <path d="M10 2l2 4.5L16.5 8l-4.5 2L10 14.5 8 10 3.5 8l4.5-2z" stroke-linejoin="round"/>
+          <path d="M15 13l1 2.2L18.2 16l-2.2 1L15 19.2 14 17l-2.2-1L14 15z" stroke-linejoin="round" stroke-width="0.9"/>
+        </svg>
+      </div>
+      <p class="idle-text">分析結果がありません</p>
+      <p class="idle-sub">AI が課題とコース情報をもとに学習プランを作成します。結果は12時間有効で、期限切れの課題は対象外です。</p>
+      <button class="idle-btn" onclick={reanalyze} disabled={loading}>分析を開始</button>
+    </div>
   {/if}
 </div>
 
@@ -434,6 +445,49 @@
     0%, 80%, 100% { opacity: 0.3; transform: scale(0.8); }
     40% { opacity: 1; transform: scale(1); }
   }
+
+  /* ── Idle (no analysis yet) ── */
+  .idle-state {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 6px;
+    padding: 44px 24px;
+    text-align: center;
+  }
+  .idle-icon {
+    color: rgba(175, 82, 222, 0.8);
+    margin-bottom: 2px;
+  }
+  .idle-text {
+    margin: 0;
+    font-size: 14px;
+    font-weight: 700;
+    color: var(--text-primary);
+  }
+  .idle-sub {
+    margin: 0;
+    font-size: 12px;
+    color: var(--text-tertiary);
+    line-height: 1.5;
+    max-width: 270px;
+  }
+  .idle-btn {
+    margin-top: 12px;
+    padding: 8px 22px;
+    border: none;
+    border-radius: 50px;
+    font-family: inherit;
+    font-size: 12px;
+    font-weight: 600;
+    color: #fff;
+    cursor: pointer;
+    background: linear-gradient(135deg, #af52de, #007aff);
+    transition: opacity 0.15s, transform 0.1s;
+  }
+  .idle-btn:hover { opacity: 0.9; }
+  .idle-btn:active { transform: scale(0.97); }
+  .idle-btn:disabled { opacity: 0.5; cursor: default; }
 
   /* ── Advice ticker ── */
   .advice-bar {

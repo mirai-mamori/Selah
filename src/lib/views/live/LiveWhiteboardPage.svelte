@@ -108,8 +108,8 @@
         type="button"
         class="board-topic-reopen"
         onclick={() => (topicSidebarCollapsed = false)}
-        aria-label={termFloatLabels.boardTitle}
-        title={termFloatLabels.boardTitle}
+        aria-label={termFloatLabels.expand}
+        title={termFloatLabels.expand}
       >
         <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><line x1="4" y1="7" x2="20" y2="7"/><line x1="4" y1="12" x2="20" y2="12"/><line x1="4" y1="17" x2="20" y2="17"/></svg>
       </button>
@@ -217,7 +217,7 @@
           {/if}
           {#if node.chips?.length}
             <span class="visual-board-node-chips">
-              {#each node.chips as chip (chip.label)}
+              {#each node.chips as chip, ci (ci)}
                 <span class="visual-board-chip" title={chip.detail}>{chip.label}</span>
               {/each}
             </span>
@@ -243,7 +243,6 @@
     flex: 1 1 auto;
     height: auto;
     min-height: 0;
-    min-width: 0;
     border-radius: 0;
   }
   .board-page-back {

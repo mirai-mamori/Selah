@@ -43,7 +43,6 @@ export type WhiteboardLayoutEdge = {
   cy: number;
   lx: number;
   ly: number;
-  labelWidth: number;
   trunk: boolean;
   redundant: boolean;
 };

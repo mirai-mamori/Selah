@@ -11,7 +11,8 @@ use tauri::State;
 const AI_CACHE_MAX_AGE: i64 = 12 * 3600; // 12 hours
 
 const TODO_AI_CACHE_KEY: &str = "ai_todo_analysis";
-const TODO_AI_CACHE_MAX_AGE: i64 = 6 * 3600; // 6 hours
+// 分析結果の有効期限。これを過ぎたキャッシュは無効とみなし、「再分析」が必要。
+const TODO_AI_CACHE_MAX_AGE: i64 = 12 * 3600; // 12 hours
 const TODO_API_LIVE_NOTE_MAX_PER_COURSE: usize = 2;
 const TODO_API_LIVE_NOTE_MAX_CHARS: usize = 1600;
 
@@ -81,7 +82,7 @@ const TODO_SYSTEM_PROMPT: &str = r#"あなたは関西学院大学の学生専�
 - daily_planのlabelには日付を含める（例: 「今日（4/12）」）
 - daily_plan.tasksの各文字列は「{task_guidesのtask_nameと完全一致}（N分）」の形式にする。task_nameと一致しないと詳細が表示されないため厳守
 - free_hoursは時間割の授業時間を除いた学習可能時間（9:00-22:00の範囲で概算）
-- 期限切れタスクは最優先で今日の計画に入れる
+- タスク一覧には期限切れ（締切超過）タスクは含まれない。締切が近いタスクを優先して今日の計画に入れる
 - estimated_minutesは課題の複雑さと授業レベルを考慮した現実的な見積もり
 - adviceは「。」区切りで循環表示されるため、各文が独立して意味をなすようにする
 - liveノートが授業計画と食い違う場合は、実際の授業進度としてliveノートを優先しつつ、不確実なら断定を避ける
@@ -122,7 +123,7 @@ const LOCAL_TODO_SYSTEM_PROMPT: &str = r#"あなたは関西学院大学の学�
 - background は授業計画/教材の具体語を入れる（抽象論のみは禁止）
 - study_hints は課題固有の行動手順にする（汎用文禁止）
 - daily_plan.tasks は task_guides.task_name と完全一致させる
-- 期限超過・24h以内のタスクを最優先にする
+- 24h以内のタスクを最優先にする（一覧に期限切れタスクは含まれない）
 - 各フィールドは必ず型を守る（string/array/number）。nullを使わない
 - 回答は指定された言語で書くこと"#;
 
@@ -130,7 +131,6 @@ const LOCAL_TODO_SYSTEM_PROMPT: &str = r#"あなたは関西学院大学の学�
 struct RelevantLiveNote {
     matched_course_name: String,
     file_name: String,
-    path: String,
     downloaded_at: i64,
     summary: String,
 }
@@ -377,15 +377,42 @@ pub async fn ai_analyze_todo_internal(
 ) -> Result<serde_json::Value, String> {
     let config = ai::load_ai_config();
 
-    let (todo_items, todo_cache_ts): (Vec<crate::luna_parser::LunaTodoItem>, i64) = db
+    let todo_items: Vec<crate::luna_parser::LunaTodoItem> = db
         .get_data_cache("luna_todo")
         .ok()
         .flatten()
-        .and_then(|(json, ts)| serde_json::from_str(&json).ok().map(|items| (items, ts)))
+        .and_then(|(json, _ts)| serde_json::from_str(&json).ok())
         .unwrap_or_default();
 
     if todo_items.is_empty() {
         return Err("TODO項目がありません。先にTODOリストを読み込んでください。".into());
+    }
+
+    // AI 補助モードは分析を自動で起動しない。force=false のときは AI を呼ばず、
+    // 直近の「再分析」で保存した結果（あれば）をそのまま返す。ただし有効期限
+    // (TODO_AI_CACHE_MAX_AGE) を過ぎた結果は無効とみなし、再分析を促す。
+    if !force {
+        if let Ok(Some((json, ts))) = db.get_data_cache(TODO_AI_CACHE_KEY) {
+            if crate::db::epoch_secs() - ts > TODO_AI_CACHE_MAX_AGE {
+                return Err(
+                    "AI 分析結果の有効期限が切れました。「再分析」を実行してください。".into(),
+                );
+            }
+            if let Ok(cached) = serde_json::from_str::<serde_json::Value>(&json) {
+                return Ok(strip_todo_internal_fields(cached));
+            }
+        }
+        return Err("AI 分析結果がまだありません。「再分析」を実行してください。".into());
+    }
+
+    // 期限切れ（締切超過）タスクは分析データに含めない。期限内の未提出タスクが
+    // 1件も無ければ、AI を呼ばずに終了する。
+    let now_naive = chrono::Local::now().naive_local();
+    let has_actionable = todo_items
+        .iter()
+        .any(|t| !t.status.contains("提出済") && !todo_is_overdue(t, now_naive));
+    if !has_actionable {
+        return Err("期限内の未提出タスクがありません。".into());
     }
 
     let snap = db.get_snapshot_state()?.unwrap_or_default();
@@ -396,25 +423,6 @@ pub async fn ai_analyze_todo_internal(
     } else {
         collect_relevant_live_notes(&todo_items)
     };
-    let cache_fingerprint =
-        build_todo_cache_fingerprint(&todo_items, todo_cache_ts, snap.updated_at, &live_notes);
-
-    if !force {
-        if let Ok(Some((json, ts))) = db.get_data_cache(TODO_AI_CACHE_KEY) {
-            let now = crate::db::epoch_secs();
-            if now - ts < TODO_AI_CACHE_MAX_AGE {
-                if let Ok(cached) = serde_json::from_str::<serde_json::Value>(&json) {
-                    if extract_todo_cache_fingerprint(&cached) == Some(cache_fingerprint.as_str()) {
-                        log::info!(
-                            "ai_analyze_todo: returning cached result (age={}s, fingerprint matched)",
-                            now - ts
-                        );
-                        return Ok(strip_todo_internal_fields(cached));
-                    }
-                }
-            }
-        }
-    }
 
     let prompt = build_todo_ai_prompt(&todo_items, &raw, is_local, &live_notes);
     log::info!(
@@ -484,18 +492,10 @@ pub async fn ai_analyze_todo_internal(
 
     let result = normalize_ai_todo_json(result);
 
-    let mut cache_value = result.clone();
-    if let Some(obj) = cache_value.as_object_mut() {
-        obj.insert(
-            "_cache_fingerprint".to_string(),
-            serde_json::Value::String(cache_fingerprint),
-        );
-    }
-
-    let cache_json = serde_json::to_string(&cache_value).unwrap_or_default();
+    let cache_json = serde_json::to_string(&result).unwrap_or_default();
     let _ = db.save_data_cache(TODO_AI_CACHE_KEY, &cache_json);
 
-    Ok(strip_todo_internal_fields(cache_value))
+    Ok(result)
 }
 
 // ── 詳細TODO抽出 (extract TODOs from Luna 消息/課題/通知) ──────────────────
@@ -907,6 +907,17 @@ fn load_ai_cache_inner(db: &Database) -> Result<Option<(AiScheduleResult, i64)>,
     db.get_ai_schedule_cache()
 }
 
+/// 締切超過のタスクか判定する。締切が空、または解析できない場合は false。
+fn todo_is_overdue(item: &crate::luna_parser::LunaTodoItem, now: chrono::NaiveDateTime) -> bool {
+    let deadline = item.deadline.trim();
+    if deadline.is_empty() {
+        return false;
+    }
+    chrono::NaiveDateTime::parse_from_str(deadline, "%Y-%m-%d %H:%M")
+        .map(|dl| dl < now)
+        .unwrap_or(false)
+}
+
 fn build_todo_ai_prompt(
     todos: &[crate::luna_parser::LunaTodoItem],
     raw: &ScheduleRawData,
@@ -947,9 +958,12 @@ fn build_todo_ai_prompt(
     }
 
     text.push_str("\n## 未提出タスク一覧\n");
+    // 期限切れ（締切超過）タスクは分析データに含めない。
+    let now_naive = today.naive_local();
     let pending: Vec<&crate::luna_parser::LunaTodoItem> = todos
         .iter()
         .filter(|t| !t.status.contains("提出済"))
+        .filter(|t| !todo_is_overdue(t, now_naive))
         .collect();
 
     for item in &pending {
@@ -1201,9 +1215,12 @@ fn build_todo_ai_prompt(
 fn collect_relevant_live_notes(
     todos: &[crate::luna_parser::LunaTodoItem],
 ) -> Vec<RelevantLiveNote> {
+    // 期限切れタスクは分析対象外なので、その科目の live ノートも収集しない。
+    let now_naive = chrono::Local::now().naive_local();
     let mut course_names: Vec<String> = todos
         .iter()
         .filter(|t| !t.status.contains("提出済"))
+        .filter(|t| !todo_is_overdue(t, now_naive))
         .map(|t| t.course_name.trim().to_string())
         .filter(|name| !name.is_empty())
         .collect();
@@ -1266,7 +1283,6 @@ fn build_relevant_live_note(
     Some(RelevantLiveNote {
         matched_course_name: matched_course_name.to_string(),
         file_name: record.filename.clone(),
-        path: record.path.clone(),
         downloaded_at: record.downloaded_at,
         summary,
     })
@@ -1350,51 +1366,7 @@ fn record_matches_course(record: &crate::commands::DownloadRecord, course_key: &
     })
 }
 
-fn build_todo_cache_fingerprint(
-    todos: &[crate::luna_parser::LunaTodoItem],
-    todo_cache_ts: i64,
-    snapshot_updated_at: i64,
-    live_notes: &[RelevantLiveNote],
-) -> String {
-    let mut pending: Vec<String> = todos
-        .iter()
-        .filter(|t| !t.status.contains("提出済"))
-        .map(|t| {
-            format!(
-                "{}|{}|{}|{}|{}",
-                t.course_name, t.content_type, t.content_name, t.deadline, t.feedback
-            )
-        })
-        .collect();
-    pending.sort();
-
-    let mut note_parts: Vec<String> = live_notes
-        .iter()
-        .map(|note| {
-            format!(
-                "{}|{}|{}|{}",
-                note.matched_course_name, note.file_name, note.path, note.downloaded_at
-            )
-        })
-        .collect();
-    note_parts.sort();
-
-    let payload = format!(
-        "todo_cache_ts={todo_cache_ts}|snapshot_updated_at={snapshot_updated_at}|pending={}|live_notes={}",
-        pending.join("||"),
-        note_parts.join("||"),
-    );
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    payload.hash(&mut hasher);
-    format!("{:016x}", hasher.finish())
-}
-
-fn extract_todo_cache_fingerprint(value: &serde_json::Value) -> Option<&str> {
-    value
-        .get("_cache_fingerprint")
-        .and_then(|fingerprint| fingerprint.as_str())
-}
-
+/// 旧バージョンが保存した内部フィールドを取り除いてから結果を返す。
 fn strip_todo_internal_fields(mut value: serde_json::Value) -> serde_json::Value {
     if let Some(obj) = value.as_object_mut() {
         obj.remove("_cache_fingerprint");

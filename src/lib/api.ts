@@ -1247,6 +1247,9 @@ const BACKEND_CACHE_DB_KEY: Record<string, string> = {
   exams: "exam_timetable",
 };
 
+// AI 課題分析の有効期限（秒）。これを過ぎた結果は無効とみなし「再分析」が必要。
+const AI_TODO_ANALYSIS_TTL_SECS = 12 * 3600;
+
 async function loadBackendManagedCache(key: string): Promise<any | null> {
   if (_isDemo()) return null;
   if (key === "schedule_data") {
@@ -1296,9 +1299,16 @@ async function syncBackendManagedKeys(keys: string[]): Promise<void> {
       return;
     }
     if (key === "ai_todo_analysis") {
+      // 有効期限を過ぎた分析結果はストアに載せない（「再分析」を促すため）。
+      const updatedAt = await getDataCacheUpdatedAt("ai_todo_analysis");
+      const ageSecs = updatedAt ? Date.now() / 1000 - updatedAt : Infinity;
+      if (ageSecs > AI_TODO_ANALYSIS_TTL_SECS) {
+        aiTodoStore.set(null);
+        return;
+      }
       const result = { ...(data as Record<string, unknown>) };
       delete result._cache_fingerprint;
-      aiTodoStore.set({ result, timestamp: Date.now() });
+      aiTodoStore.set({ result, timestamp: updatedAt ? updatedAt * 1000 : Date.now() });
       return;
     }
     replaceCacheEntry(key, data);
@@ -1437,6 +1447,8 @@ export async function aiGenerateSchedule(
   });
 }
 
+// force=false はキャッシュのみ（AI を呼ばない）。直近の「再分析」結果が無ければ
+// 失敗する。force=true で実際に AI 分析を実行する（AI 補助モードの「再分析」専用）。
 export async function aiAnalyzeTodo(force: boolean = false): Promise<AiTodoAnalysis> {
   if (_isDemo()) {
     await new Promise(r => setTimeout(r, 1500));
@@ -2537,9 +2549,7 @@ export async function refreshAllData(): Promise<void> {
   const aiBlocked2b = aiReady && await isLocalStandard2b();
   if (aiReady && !aiBlocked2b) {
     initialItems.push({ key: "ai_notif", label: "AI 通知分析", platform: "AI", status: "pending" });
-    if (get(lunaAuthState).authenticated) {
-      initialItems.push({ key: "ai_todo", label: "AI 課題分析", platform: "AI", status: "pending" });
-    }
+    // AI 課題分析は一括更新では実行しない。AI 補助モードの「再分析」専用。
     initialItems.push({ key: "ai_schedule", label: "AI 時間割分析", platform: "AI", status: "pending" });
   }
 
@@ -2586,13 +2596,9 @@ export async function refreshAllData(): Promise<void> {
         const status = await backendAiRefreshNow(true);
         const itemStatus = new Map((status.items ?? []).map(item => [item.key, item.status]));
         setItemStatus("ai_notif", itemStatus.get("ai_notif") === "error" ? "error" : "done");
-        if (get(lunaAuthState).authenticated) {
-          setItemStatus("ai_todo", itemStatus.get("ai_todo") === "error" ? "error" : "done");
-        }
         setItemStatus("ai_schedule", itemStatus.get("ai_schedule") === "error" ? "error" : "done");
       } catch {
         setItemStatus("ai_notif", "error");
-        if (get(lunaAuthState).authenticated) setItemStatus("ai_todo", "error");
         setItemStatus("ai_schedule", "error");
       }
     }

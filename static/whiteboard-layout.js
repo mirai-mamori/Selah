@@ -15,12 +15,14 @@
  *                       sourceLabel, nodeType, x, y, chips }
  *   layout.edges[i] = { id, label, colorKind, colorSourceType,
  *                       x1, y1, x2, y2, cx, cy, lx, ly,
- *                       labelWidth, trunk, redundant }
+ *                       trunk, redundant }
  *   layout.stage   = { width, height } | null — pixel canvas the layout was
  *                    computed for; the renderer sizes the stage to match.
  *
- * x/y are 0..100 board coordinates. cx/cy is the quadratic Bezier control
- * point so renderers do `M x1 y1 Q cx cy x2 y2`. lx/ly are the label centre.
+ * Node x/y are 0..100 board coordinates. Edge x1/y1/x2/y2 and the cx/cy
+ * quadratic-Bezier control point are in stage pixels (the SVG edge layer uses
+ * a pixel viewBox), so renderers do `M x1 y1 Q cx cy x2 y2`. lx/ly are the
+ * label centre in 0..100 board coordinates.
  * chips are term annotations folded into a structure node (drawn in-card).
  *
  * ── Normalization contract ────────────────────────────────────────────────
@@ -695,7 +697,6 @@
         x2: px2, y2: py2,
         cx: pcx, cy: pcy,
         lx: lp.x, ly: lp.y,
-        labelWidth: labelWidth,
         trunk: geom.trunk,
         redundant: geom.redundant
       };

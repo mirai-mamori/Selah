@@ -243,26 +243,8 @@ async fn run_ai_refresh(
             record_status(app, &db, &status, record_scheduler_status)?;
         }
 
-        if request.wants("ai_todo") {
-            status
-                .items
-                .push(item_status("ai_todo", "AI 課題分析", "running", ""));
-            record_status(app, &db, &status, record_scheduler_status)?;
-            match refresh_todo_analysis(&db, force, &session).await {
-                Ok(_) => {
-                    changed_keys.push("ai_todo_analysis".to_string());
-                    update_item_status(&mut status, "ai_todo", "done", "");
-                }
-                Err(err) if is_no_data_error(&err) => {
-                    update_item_status(&mut status, "ai_todo", "skipped", &err);
-                }
-                Err(err) => {
-                    any_error = true;
-                    update_item_status(&mut status, "ai_todo", "error", &err);
-                }
-            }
-            record_status(app, &db, &status, record_scheduler_status)?;
-        }
+        // AI 課題分析は定期スケジューラでは実行しない。AI 補助モードの
+        // 「再分析」ボタンを押したときだけ ai_analyze_todo が呼ばれる。
 
         if request.wants("ai_schedule") {
             status
@@ -350,22 +332,6 @@ async fn refresh_schedule_analysis(
     )
     .await
     .map(|_| ())
-}
-
-async fn refresh_todo_analysis(
-    db: &Database,
-    force: bool,
-    session: &BackendSessionStatusPayload,
-) -> Result<(), String> {
-    if !session.luna_authenticated {
-        return Err("Luna未ログインのためAI課題分析をスキップします".to_string());
-    }
-    if !cache_is_fresh(db, "luna_todo", FAST_INPUT_MAX_AGE_SECS) {
-        return Err("Luna課題データが最新ではないためAI分析をスキップします".to_string());
-    }
-    timetable::ai_analyze_todo_internal(db, force)
-        .await
-        .map(|_| ())
 }
 
 async fn refresh_notification_analysis(
