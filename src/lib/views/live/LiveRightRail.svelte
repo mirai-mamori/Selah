@@ -4,7 +4,7 @@
   import type { TermFloatLabels } from "./liveTypes";
 
   interface Props {
-    activeWhiteboardLayout: WhiteboardLayoutResult | null;
+    previewLayout: WhiteboardLayoutResult | null;
     activeSummaryTerms: LiveTermExplanation[];
     termsCollapsed: boolean;
     collapsedTermPreview: LiveTermExplanation[];
@@ -19,7 +19,7 @@
   }
 
   let {
-    activeWhiteboardLayout,
+    previewLayout,
     activeSummaryTerms,
     termsCollapsed,
     collapsedTermPreview,
@@ -32,27 +32,41 @@
     onTermCardPrev,
     onTermCardNext,
   }: Props = $props();
+
+  // Glanceable thumbnail of the whole board: edges in the layout's pixel
+  // stage, nodes positioned by percentage at a fixed readable size, stretched
+  // to fill the card. It's a rough "there's a board" indicator — tap to open.
+  const previewViewBox = $derived(
+    previewLayout?.stage
+      ? `0 0 ${previewLayout.stage.width} ${previewLayout.stage.height}`
+      : "0 0 100 100",
+  );
 </script>
 
-{#if activeWhiteboardLayout || activeSummaryTerms.length > 0}
+{#if previewLayout || activeSummaryTerms.length > 0}
   <div class="right-rail">
-    {#if activeWhiteboardLayout}
+    {#if previewLayout}
       <aside class="board-stack" aria-label={termFloatLabels.boardTitle}>
         <button
           type="button"
           class="board-preview-card"
-          class:dense={activeWhiteboardLayout.nodes.length > 8}
-          class:very-dense={activeWhiteboardLayout.nodes.length > 14}
+          class:dense={previewLayout.nodes.length > 8}
+          class:very-dense={previewLayout.nodes.length > 14}
           onclick={onOpenWhiteboard}
           aria-label={termFloatLabels.expand}
           title={termFloatLabels.expand}
         >
           <div class="board-preview-canvas">
-            <svg class="board-preview-links" viewBox="0 0 100 100" preserveAspectRatio="none" aria-hidden="true">
-              {#each activeWhiteboardLayout.edges as edge (edge.id)}
+            <svg
+              class="board-preview-links"
+              viewBox={previewViewBox}
+              preserveAspectRatio="none"
+              aria-hidden="true"
+            >
+              {#each previewLayout.edges as edge (edge.id)}
                 <line
                   class="edge-kind-{edge.colorKind} edge-source-{edge.colorSourceType}"
-                  class:term-edge={edge.termEdge}
+                  class:trunk={edge.trunk}
                   x1={edge.x1}
                   y1={edge.y1}
                   x2={edge.x2}
@@ -60,12 +74,11 @@
                 />
               {/each}
             </svg>
-            {#each activeWhiteboardLayout.nodes as node (node.id)}
+            {#each previewLayout.nodes as node (node.id)}
               <span
                 class="board-preview-node kind-{node.kind}"
                 class:role-main={node.role === "main"}
                 class:role-branch={node.role !== "main"}
-                class:node-term={node.nodeType === "term"}
                 class:external={node.sourceType === "external"}
                 style="left: {node.x}%; top: {node.y}%;"
               >{node.label}</span>
@@ -200,7 +213,7 @@
   .board-preview-canvas {
     position: relative;
     width: 100%;
-    height: 150px;
+    height: 156px;
     background:
       linear-gradient(color-mix(in srgb, var(--text-tertiary) 7%, transparent) 1px, transparent 1px),
       linear-gradient(90deg, color-mix(in srgb, var(--text-tertiary) 7%, transparent) 1px, transparent 1px),
@@ -218,9 +231,15 @@
   }
   .board-preview-links line {
     stroke: var(--edge-color, currentColor);
-    stroke-width: 0.7;
+    /* Non-scaling: stroke stays 1px no matter how the px viewBox is squished
+       into the small preview card. */
+    vector-effect: non-scaling-stroke;
+    stroke-width: 1;
     stroke-linecap: round;
-    opacity: 0.7;
+    opacity: 0.5;
+  }
+  .board-preview-links line.trunk {
+    opacity: 0.78;
   }
   .board-preview-links line.edge-kind-core,
   .board-preview-links line.edge-kind-support {
@@ -233,19 +252,13 @@
     --edge-color: color-mix(in srgb, var(--orange, #e67700) 64%, var(--text-tertiary));
   }
   .board-preview-links line.edge-source-external {
-    stroke-dasharray: 1.6 1.4;
-    opacity: 0.64;
-  }
-  .board-preview-links line.term-edge {
-    stroke-width: 0.9;
-    opacity: 0.86;
-    stroke-dasharray: none;
+    stroke-dasharray: 3 2;
   }
   .board-preview-node {
     position: absolute;
     transform: translate(-50%, -50%);
     z-index: 2;
-    max-width: 64px;
+    max-width: 66px;
     padding: 2px 6px;
     border-radius: 6px;
     border: 0.5px solid color-mix(in srgb, var(--accent) 22%, var(--glass-border));
@@ -259,13 +272,14 @@
     text-overflow: ellipsis;
     box-shadow: 0 1px 3px rgba(0, 0, 0, 0.06);
   }
+  /* Denser boards → smaller preview nodes so more of them stay distinguishable. */
   .board-preview-card.dense .board-preview-node {
-    max-width: 52px;
+    max-width: 54px;
     padding: 1.5px 5px;
     font-size: 8.5px;
   }
   .board-preview-card.very-dense .board-preview-node {
-    max-width: 42px;
+    max-width: 44px;
     padding: 1px 4px;
     font-size: 8px;
   }
@@ -284,15 +298,6 @@
   .board-preview-node.external {
     border-style: dashed;
     border-color: color-mix(in srgb, var(--accent) 38%, var(--glass-border));
-  }
-  .board-preview-node.node-term {
-    max-width: 46px;
-    padding: 1px 5px;
-    border-radius: 999px;
-    font-size: 8px;
-    font-weight: 800;
-    opacity: 0.84;
-    z-index: 3;
   }
 
   .term-stack {

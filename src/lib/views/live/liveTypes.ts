@@ -25,6 +25,8 @@ export type TermFloatLabels = {
   expand: string;
   previous: string;
   next: string;
+  selectAll: string;
+  deselectAll: string;
 };
 
 export type WhiteboardStagePreset = { width: number; height: number; zoom: number };

@@ -890,7 +890,9 @@ pub async fn open_markdown_file_window(app: tauri::AppHandle, path: String) -> R
         tauri::WebviewUrl::App("markdown-reader.html".into()),
     )
     .title(&filename)
-    .inner_size(820.0, 720.0)
+    // Wide enough for the 220px TOC + the document's full 760px max-width, so
+    // body text and embedded whiteboards render at their intended width.
+    .inner_size(1020.0, 770.0)
     .min_inner_size(420.0, 360.0)
     .resizable(true)
     .build()

@@ -5,27 +5,32 @@
  * Usage:
  *   var layout = window.WhiteboardLayout.compute(rawBoard, {
  *     fallbackBoardTitle: 'Knowledge Board',
- *     externalNodeLabel: '外部'     // used when external_source is empty
+ *     externalNodeLabel: '外部',    // used when external_source is empty
+ *     topicIds: ['m1', 'm2']       // optional: render only these main topics
  *   });
+ *   var topics = window.WhiteboardLayout.topics(rawBoard);  // [{id,label}]
  *
  *   layout === null when the board is unusable (less than 2 valid nodes).
  *   layout.nodes[i] = { id, label, detail, kind, role, parentId, sourceType,
- *                       sourceLabel, nodeType, x, y }
+ *                       sourceLabel, nodeType, x, y, chips }
  *   layout.edges[i] = { id, label, colorKind, colorSourceType,
  *                       x1, y1, x2, y2, cx, cy, lx, ly,
  *                       labelWidth, trunk, redundant }
+ *   layout.stage   = { width, height } | null — pixel canvas the layout was
+ *                    computed for; the renderer sizes the stage to match.
  *
  * x/y are 0..100 board coordinates. cx/cy is the quadratic Bezier control
  * point so renderers do `M x1 y1 Q cx cy x2 y2`. lx/ly are the label centre.
+ * chips are term annotations folded into a structure node (drawn in-card).
  *
  * ── Normalization contract ────────────────────────────────────────────────
  * When board.normalized_by === 'backend' (schema_version >= 1), structural
  * fields (node_type, role, kind, parent_id, source_type) have already been
  * validated by parse_live_whiteboard and are passed through verbatim.
  * This module is then responsible ONLY for:
- *   - coordinate assignment (x/y via hierarchyPoints / relaxPoints)
+ *   - coordinate assignment (x/y via the Layered Topic Forest layout)
+ *   - folding term nodes into their parent's chip list
  *   - edge geometry (Bézier control points, label placement)
- *   - visual edge supplementation (auto term-edge generation)
  *
  * For legacy / demo / model-raw boards (normalized_by !== 'backend'), full
  * local normalization runs as before so heuristic defaults remain available.
@@ -79,38 +84,6 @@
     if (a === 'question' || b === 'question') return 'question';
     if (a === 'result' || b === 'result') return 'result';
     return 'support';
-  }
-
-  function radialMainAnchors(count, layout) {
-    if (count <= 0) return [];
-    if (layout === 'flow') {
-      if (count === 1) return [{ angle: 0, point: [30, 50] }];
-      var flow = [];
-      for (var f = 0; f < count; f++) {
-        var x = 14 + (f * 66) / (count - 1);
-        flow.push({ angle: 0, point: [Math.round(x * 10) / 10, 50] });
-      }
-      return flow;
-    }
-    if (layout === 'compare' && count === 2) {
-      return [
-        { angle: Math.PI, point: [35, 48] },
-        { angle: 0, point: [65, 48] }
-      ];
-    }
-    if (count === 1) return [{ angle: -Math.PI / 2, point: [50, 48] }];
-    var out = [];
-    for (var i = 0; i < count; i++) {
-      var angle = -Math.PI / 2 + (i * Math.PI * 2) / count;
-      out.push({
-        angle: angle,
-        point: [
-          Math.round((50 + Math.cos(angle) * 19) * 10) / 10,
-          Math.round((50 + Math.sin(angle) * 15) * 10) / 10
-        ]
-      });
-    }
-    return out;
   }
 
   function ellipsePoints(count, cx, cy, rx, ry) {
@@ -243,407 +216,231 @@
     return { x: best.x, y: best.y };
   }
 
-  function rebalanceBranchesByBarycenter(branchesByParent, edges, points) {
-    Object.keys(branchesByParent).forEach(function (parentId) {
-      var branches = branchesByParent[parentId];
-      if (!branches || branches.length < 2) return;
-      var parentPos = points[parentId];
-      if (!parentPos) return;
-      var siblingIds = {};
-      branches.forEach(function (b) { siblingIds[b.id] = true; });
+  // ── Layered Topic Forest layout ─────────────────────────────────────────
+  // The board is a forest of topic trees (main → branches → …) plus a sparse
+  // overlay of cross edges; term annotations are folded into parent chips
+  // upstream. Each topic is laid out as a tidy tree: subtrees are packed by
+  // contour (each sibling slid toward the block until its slots just touch —
+  // van der Ploeg's non-layered result, computed by direct minimal-shift,
+  // O(n²) which is irrelevant at board scale). Many-leaf fan-outs wrap into a
+  // grid; orientation is per topic (shallow→top-down, deep→left-right). Topic
+  // boxes are shelf-packed, then normalised to the 0..100 board space; the
+  // pixel bounds become the stage-size hint.
+  function computeForestLayout(nodes) {
+    if (!nodes.length) return { points: {}, stage: null };
 
-      var slots = [];
-      branches.forEach(function (b) {
-        var p = points[b.id];
-        if (!p) return;
-        var dx = p[0] - parentPos[0];
-        var dy = p[1] - parentPos[1];
-        slots.push({ angle: Math.atan2(dy, dx), radius: Math.sqrt(dx * dx + dy * dy) || 40 });
-      });
-      if (slots.length < 2) return;
-      slots.sort(function (a, b) { return a.angle - b.angle; });
-
-      var preferred = branches.map(function (b) {
-        var sx = 0, sy = 0, count = 0;
-        for (var i = 0; i < edges.length; i++) {
-          var e = edges[i];
-          var otherId = null;
-          if (e.from === b.id) otherId = e.to;
-          else if (e.to === b.id) otherId = e.from;
-          if (!otherId) continue;
-          if (otherId === parentId || siblingIds[otherId]) continue;
-          var op = points[otherId];
-          if (!op) continue;
-          sx += op[0] - parentPos[0];
-          sy += op[1] - parentPos[1];
-          count++;
-        }
-        var p = points[b.id];
-        var fallback = p ? Math.atan2(p[1] - parentPos[1], p[0] - parentPos[0]) : 0;
-        return { id: b.id, angle: count > 0 ? Math.atan2(sy, sx) : fallback };
-      });
-      preferred.sort(function (a, b) { return a.angle - b.angle; });
-
-      preferred.forEach(function (entry, i) {
-        var slot = slots[i];
-        points[entry.id] = [
-          clampBoardPoint(parentPos[0] + Math.cos(slot.angle) * slot.radius, 6, 94),
-          clampBoardPoint(parentPos[1] + Math.sin(slot.angle) * slot.radius, 7, 93)
-        ];
-      });
-    });
-  }
-
-  function relaxPoints(nodes, edges, initialPoints, mainAnchors, mains, iterations) {
-    if (iterations == null) iterations = 130;
-    var nodeIds = {};
-    var nodeById = {};
-    var points = {};
-    nodes.forEach(function (n) {
-      nodeIds[n.id] = true;
-      nodeById[n.id] = n;
-      points[n.id] = initialPoints[n.id] || [50, 50];
-    });
-    var anchorById = {};
-    mains.forEach(function (n, i) {
-      anchorById[n.id] = (mainAnchors[i] && mainAnchors[i].point) || [50, 46];
-    });
-    var springs = [];
-    edges.forEach(function (e) {
-      if (!e || !nodeIds[e.from] || !nodeIds[e.to] || e.from === e.to) return;
-      var from = nodeById[e.from];
-      var to = nodeById[e.to];
-      var parentLink = (from && from.parentId === e.to) || (to && to.parentId === e.from);
-      springs.push({ from: e.from, to: e.to, ideal: parentLink ? 23 : 22, strength: parentLink ? 0.09 : 0.085 });
-    });
-    nodes.forEach(function (n) {
-      if (n.role === 'main' || !nodeById[n.parentId]) return;
-      var exists = springs.some(function (s) {
-        return (s.from === n.id && s.to === n.parentId) || (s.to === n.id && s.from === n.parentId);
-      });
-      if (!exists) springs.push({ from: n.id, to: n.parentId, ideal: 24, strength: 0.08 });
-    });
-
-    var adjacency = {};
-    springs.forEach(function (s) {
-      (adjacency[s.from] = adjacency[s.from] || []).push(s.to);
-      (adjacency[s.to] = adjacency[s.to] || []).push(s.from);
-    });
-
-    for (var step = 0; step < iterations; step++) {
-      var delta = {};
-      nodes.forEach(function (n) { delta[n.id] = [0, 0]; });
-      springs.forEach(function (s) {
-        var a = points[s.from];
-        var b = points[s.to];
-        if (!a || !b) return;
-        var dx = b[0] - a[0];
-        var dy = b[1] - a[1];
-        var distance = Math.sqrt(dx * dx + dy * dy) || 0.001;
-        var force = (distance - s.ideal) * s.strength;
-        var fx = (dx / distance) * force;
-        var fy = (dy / distance) * force;
-        var fromMain = nodeById[s.from] && nodeById[s.from].role === 'main';
-        var toMain = nodeById[s.to] && nodeById[s.to].role === 'main';
-        delta[s.from][0] += fx * (fromMain ? 0.28 : 1);
-        delta[s.from][1] += fy * (fromMain ? 0.28 : 1);
-        delta[s.to][0] -= fx * (toMain ? 0.28 : 1);
-        delta[s.to][1] -= fy * (toMain ? 0.28 : 1);
-      });
-
-      for (var i = 0; i < nodes.length; i++) {
-        for (var j = i + 1; j < nodes.length; j++) {
-          var aNode = nodes[i];
-          var bNode = nodes[j];
-          var a2 = points[aNode.id];
-          var b2 = points[bNode.id];
-          if (!a2 || !b2) continue;
-          var dx2 = b2[0] - a2[0];
-          var dy2 = b2[1] - a2[1];
-          var distance2 = Math.sqrt(dx2 * dx2 + dy2 * dy2) || 0.001;
-          var aTerm = aNode.nodeType === 'term';
-          var bTerm = bNode.nodeType === 'term';
-          var minDistance;
-          if (aTerm && bTerm) {
-            minDistance = 10;
-          } else if (aTerm || bTerm) {
-            minDistance = 13;
-          } else if (aNode.role === 'main' || bNode.role === 'main') {
-            minDistance = 20;
-          } else {
-            minDistance = 16;
-          }
-          if (distance2 >= minDistance) continue;
-          var force2 = (minDistance - distance2) * 0.24;
-          var fx2 = (dx2 / distance2) * force2;
-          var fy2 = (dy2 / distance2) * force2;
-          delta[aNode.id][0] -= fx2 * (aNode.role === 'main' ? 0.25 : 1);
-          delta[aNode.id][1] -= fy2 * (aNode.role === 'main' ? 0.25 : 1);
-          delta[bNode.id][0] += fx2 * (bNode.role === 'main' ? 0.25 : 1);
-          delta[bNode.id][1] += fy2 * (bNode.role === 'main' ? 0.25 : 1);
-        }
-      }
-
-      Object.keys(adjacency).forEach(function (hubId) {
-        var neighbors = adjacency[hubId];
-        if (!neighbors || neighbors.length < 3) return;
-        var center = points[hubId];
-        if (!center) return;
-        var info = [];
-        for (var k = 0; k < neighbors.length; k++) {
-          var p = points[neighbors[k]];
-          if (!p) continue;
-          info.push({ id: neighbors[k], angle: Math.atan2(p[1] - center[1], p[0] - center[0]) });
-        }
-        if (info.length < 3) return;
-        info.sort(function (a, b) { return a.angle - b.angle; });
-        var idealSep = (Math.PI * 2) / info.length;
-        var threshold = idealSep * 0.85;
-        for (var i2 = 0; i2 < info.length; i2++) {
-          var aa = info[i2];
-          var bb = info[(i2 + 1) % info.length];
-          var diff = bb.angle - aa.angle;
-          if (i2 === info.length - 1) diff += Math.PI * 2;
-          if (diff >= threshold) continue;
-          var fAng = (threshold - diff) * 0.7;
-          var aTanX = -Math.sin(aa.angle);
-          var aTanY = Math.cos(aa.angle);
-          var bTanX = -Math.sin(bb.angle);
-          var bTanY = Math.cos(bb.angle);
-          var aMain = nodeById[aa.id] && nodeById[aa.id].role === 'main';
-          var bMain = nodeById[bb.id] && nodeById[bb.id].role === 'main';
-          var aScale = aMain ? 0.3 : 1;
-          var bScale = bMain ? 0.3 : 1;
-          if (delta[aa.id]) {
-            delta[aa.id][0] -= aTanX * fAng * aScale;
-            delta[aa.id][1] -= aTanY * fAng * aScale;
-          }
-          if (delta[bb.id]) {
-            delta[bb.id][0] += bTanX * fAng * bScale;
-            delta[bb.id][1] += bTanY * fAng * bScale;
-          }
-        }
-      });
-
-      var totalMovement = 0;
-      nodes.forEach(function (n) {
-        var p = points[n.id];
-        var d = delta[n.id];
-        if (!p || !d) return;
-        var anchor = anchorById[n.id];
-        if (anchor) {
-          d[0] += (anchor[0] - p[0]) * 0.12;
-          d[1] += (anchor[1] - p[1]) * 0.12;
-        }
-        totalMovement += Math.abs(d[0]) + Math.abs(d[1]);
-        var maxX = n.nodeType === 'term' && !n.parentId ? 94 : 84;
-        points[n.id] = [
-          clampBoardPoint(p[0] + d[0], 5, maxX),
-          clampBoardPoint(p[1] + d[1], 6, 94)
-        ];
-      });
-      // Early exit: once per-node movement averages below ~0.025 units there's
-      // nothing visually changing — running the remaining iterations would
-      // just burn CPU.
-      if (step > 12 && totalMovement < nodes.length * 0.025) break;
+    // Slot = node box + surrounding gap, so touching slots leave a clean gap
+    // between the cards. Height tracks the node's real content — detail-text
+    // line estimate + chip rows — so a tall card never overlaps its neighbour.
+    function slotOf(n) {
+      var isMain = n.role === 'main';
+      var chips = n.chips ? n.chips.length : 0;
+      var chipH = chips ? chips * 20 + 8 : 0;
+      var perLine = isMain ? 17 : 14;
+      var detail = n.detail || '';
+      var lines = detail ? Math.min(4, Math.ceil(detail.length / perLine)) : 0;
+      var base = isMain ? 80 : 66;          // card height with the label only
+      return { w: isMain ? 200 : 174, h: base + lines * 15 + chipH + 40 };
     }
-    return points;
-  }
+    var GRID_MIN = 6;     // child count that triggers grid wrapping
+    var TOPIC_GAP = 70;
+    var MARGIN = 60;
 
-  function hierarchyPoints(nodes, layout, edges) {
-    var points = {};
+    var byId = {};
+    nodes.forEach(function (n) { byId[n.id] = n; });
     var mains = nodes.filter(function (n) { return n.role === 'main'; });
-    var mainAnchors = radialMainAnchors(mains.length, layout);
-    mainAnchors.forEach(function (anchor, i) {
-      if (mains[i]) points[mains[i].id] = anchor.point;
-    });
-    var branchesByParent = {};
-    var termNodes = [];
-    function clampContentX(x) {
-      return clampBoardPoint(x, 6, 84);
-    }
-    function placeGlobalTerms(targetPoints) {
-      var globalTerms = termNodes.filter(function (n) { return !points[n.parentId] && !targetPoints[n.parentId]; });
-      globalTerms.forEach(function (n, i) {
-        var y = globalTerms.length === 1 ? 50 : 18 + (i * 64) / (globalTerms.length - 1);
-        targetPoints[n.id] = [91, Math.round(y * 10) / 10];
-      });
-    }
-    function placeAttachedTerms(targetPoints) {
-      var termsByParent = {};
-      termNodes.forEach(function (n) {
-        var parent = targetPoints[n.parentId];
-        if (!parent) return;
-        if (!termsByParent[n.parentId]) termsByParent[n.parentId] = [];
-        termsByParent[n.parentId].push(n);
-      });
-      Object.keys(termsByParent).forEach(function (parentId) {
-        var parent = targetPoints[parentId];
-        var terms = termsByParent[parentId];
-        var side = parent[0] > 74 ? -1 : 1;
-        terms.forEach(function (n, i) {
-          var row = i - (terms.length - 1) / 2;
-          var distance = terms.length <= 2 ? 15 : 17;
-          var stagger = terms.length > 2 && i % 2 === 1 ? 4 : 0;
-          targetPoints[n.id] = [
-            clampContentX(parent[0] + side * (distance + stagger)),
-            clampBoardPoint(parent[1] + row * 13, 9, 91)
-          ];
-        });
-      });
-    }
-    function placeTerms(targetPoints) {
-      placeAttachedTerms(targetPoints);
-      placeGlobalTerms(targetPoints);
-    }
+    var rootFallback = (mains[0] || nodes[0]).id;
+
+    var childIds = {};
+    nodes.forEach(function (n) { childIds[n.id] = []; });
     nodes.forEach(function (n) {
       if (n.role === 'main') return;
-      if (n.nodeType === 'term') {
-        termNodes.push(n);
-        return;
-      }
-      var parentId = points[n.parentId] ? n.parentId : (mains[0] && mains[0].id);
-      if (!parentId) return;
-      if (!branchesByParent[parentId]) branchesByParent[parentId] = [];
-      branchesByParent[parentId].push(n);
+      var pid = (byId[n.parentId] && n.parentId !== n.id) ? n.parentId : rootFallback;
+      if (childIds[pid]) childIds[pid].push(n.id);
     });
-    var crossDegree = {};
-    nodes.forEach(function (n) { crossDegree[n.id] = 0; });
-    var edgeList = edges || [];
-    var nodeById = {};
-    nodes.forEach(function (n) { nodeById[n.id] = n; });
-    for (var ei = 0; ei < edgeList.length; ei++) {
-      var e = edgeList[ei];
-      if (!e || e.from === e.to) continue;
-      var f = nodeById[e.from];
-      var t = nodeById[e.to];
-      if (!f || !t) continue;
-      if (f.parentId === t.id || t.parentId === f.id) continue;
-      crossDegree[e.from] = (crossDegree[e.from] || 0) + 1;
-      crossDegree[e.to] = (crossDegree[e.to] || 0) + 1;
+
+    // Structural depth — used only to pick orientation.
+    function structuralDepth(id, seen) {
+      seen = seen || {};
+      if (seen[id]) return 1;
+      seen[id] = true;
+      var d = 1;
+      childIds[id].forEach(function (cid) {
+        if (byId[cid]) d = Math.max(d, 1 + structuralDepth(cid, seen));
+      });
+      return d;
     }
 
-    Object.keys(branchesByParent).forEach(function (parentId) {
-      var mainIndex = mains.findIndex(function (n) { return n.id === parentId; });
-      var anchor = mainAnchors[Math.max(0, mainIndex)] || { angle: -Math.PI / 2, point: [50, 46] };
-      var branches = branchesByParent[parentId];
-      var fullCircle = mains.length <= 1;
-      var sector = fullCircle ? Math.PI * 2 : Math.min(2.15, (Math.PI * 2) / Math.max(2, mains.length * 0.95));
-      branches.forEach(function (n, i) {
-        var angle = fullCircle
-          ? -Math.PI / 2 + (i * Math.PI * 2) / branches.length
-          : anchor.angle - sector / 2 + (branches.length === 1 ? sector / 2 : (i * sector) / (branches.length - 1));
-        var deg = crossDegree[n.id] || 0;
-        var term = n.nodeType === 'term';
-        var extraRing = term ? -12 : (deg === 0 ? 9 : (deg === 1 ? 4 : 0));
-        var ringOffset = (fullCircle || term ? 0 : (i % 3) * 7) + extraRing;
-        if (layout === 'flow') {
-          var parentPoint = points[parentId] || [50, 50];
-          var side = i % 2 === 0 ? -1 : 1;
-          var lane = Math.floor(i / 2);
-          points[n.id] = [
-            clampContentX(parentPoint[0] + (lane % 2 === 0 ? 0 : 8)),
-            clampBoardPoint(parentPoint[1] + side * (18 + lane * 7), 8, 92)
-          ];
-        } else {
-          points[n.id] = [
-            clampContentX(50 + Math.cos(angle) * (44 + ringOffset)),
-            clampBoardPoint(50 + Math.sin(angle) * (38 + ringOffset), 7, 93)
-          ];
-        }
-      });
-    });
-    placeTerms(points);
+    // Combine child subtree-boxes into one block. `placed` entries carry x/y/w/h
+    // (slot top-left + size) so contour packing can test real collisions.
+    // Returns rootMin/rootMax: the child roots' centres along the main axis,
+    // so the parent can be centred over them (tidy-tree centring).
+    function arrangeBlock(childLayouts, orient) {
+      var n = childLayouts.length;
+      var placed = [];
 
-    // Trivial graphs (no edges, or fewer than 3 nodes) don't benefit from
-    // relaxation — the initial radial placement is already optimal.
-    if (nodes.length < 3 || edgeList.length === 0) return points;
+      if (orient === 'TB' && n >= GRID_MIN) {
+        var cellW = 0, cellH = 0;
+        childLayouts.forEach(function (c) {
+          cellW = Math.max(cellW, c.w); cellH = Math.max(cellH, c.h);
+        });
+        var cols = Math.max(1, Math.ceil(Math.sqrt(n * 1.5)));
+        var rows = Math.ceil(n / cols);
+        childLayouts.forEach(function (c, i) {
+          var ox = (i % cols) * cellW + (cellW - c.w) / 2;
+          var oy = Math.floor(i / cols) * cellH + (cellH - c.h) / 2;
+          c.placed.forEach(function (p) {
+            placed.push({ id: p.id, x: p.x + ox, y: p.y + oy, w: p.w, h: p.h });
+          });
+        });
+        var gw = cols * cellW;
+        return { w: gw, h: rows * cellH, placed: placed, rootMin: gw / 2, rootMax: gw / 2 };
+      }
 
-    rebalanceBranchesByBarycenter(branchesByParent, edgeList, points);
-    var result = relaxPoints(nodes, edgeList, points, mainAnchors, mains, 50);
-    rebalanceBranchesByBarycenter(branchesByParent, edgeList, result);
-    result = relaxPoints(nodes, edgeList, result, mainAnchors, mains, 85);
-    placeTerms(result);
-
-    // ── Term-node post-placement avoidance ──────────────────────────────
-    // placeTerms uses fixed offsets with no collision awareness, so term
-    // nodes can overlap structure nodes or each other. Run a lightweight
-    // repulsion pass that nudges term nodes only, keeping them tethered
-    // to their parent position.
-    (function nudgeTermNodes() {
-      if (termNodes.length === 0) return;
-      var allNodes = nodes; // all nodes in hierarchyPoints scope
-      var termIdSet = {};
-      termNodes.forEach(function (t) { termIdSet[t.id] = true; });
-      var nonTermNodes = allNodes.filter(function (n) { return !termIdSet[n.id]; });
-      var termMinDist = 9;    // min distance between two term nodes
-      var structMinDist = 11; // min distance term ↔ structure node
-
-      for (var iter = 0; iter < 40; iter++) {
-        var moved = 0;
-        for (var ti = 0; ti < termNodes.length; ti++) {
-          var tn = termNodes[ti];
-          var tp = result[tn.id];
-          if (!tp) continue;
-          var dx = 0, dy = 0;
-
-          // Repel from structure nodes
-          for (var si = 0; si < nonTermNodes.length; si++) {
-            var sn = nonTermNodes[si];
-            var sp = result[sn.id];
-            if (!sp) continue;
-            var ddx = tp[0] - sp[0];
-            var ddy = tp[1] - sp[1];
-            var dist = Math.sqrt(ddx * ddx + ddy * ddy) || 0.001;
-            if (dist >= structMinDist) continue;
-            var push = (structMinDist - dist) * 0.25;
-            dx += (ddx / dist) * push;
-            dy += (ddy / dist) * push;
-          }
-
-          // Repel from other term nodes
-          for (var tj = 0; tj < termNodes.length; tj++) {
-            if (tj === ti) continue;
-            var tn2 = termNodes[tj];
-            var tp2 = result[tn2.id];
-            if (!tp2) continue;
-            var ddx2 = tp[0] - tp2[0];
-            var ddy2 = tp[1] - tp2[1];
-            var dist2 = Math.sqrt(ddx2 * ddx2 + ddy2 * ddy2) || 0.001;
-            if (dist2 >= termMinDist) continue;
-            var push2 = (termMinDist - dist2) * 0.22;
-            dx += (ddx2 / dist2) * push2;
-            dy += (ddy2 / dist2) * push2;
-          }
-
-          // Gentle tether back toward parent so terms don't drift too far
-          var parentPos = tn.parentId ? result[tn.parentId] : null;
-          if (parentPos) {
-            var maxDrift = 28;
-            var pdx = tp[0] - parentPos[0];
-            var pdy = tp[1] - parentPos[1];
-            var pDist = Math.sqrt(pdx * pdx + pdy * pdy) || 0.001;
-            if (pDist > maxDrift) {
-              var pull = (pDist - maxDrift) * 0.06;
-              dx -= (pdx / pDist) * pull;
-              dy -= (pdy / pDist) * pull;
+      // Contour packing: slide each child toward the accumulated block until
+      // its slots just touch — sibling subtrees interleave into free space.
+      var horizontal = orient !== 'LR';
+      var block = [];
+      var rootMin = 0, rootMax = 0;
+      childLayouts.forEach(function (c, ci) {
+        var shift = 0;
+        for (var bi = 0; bi < block.length; bi++) {
+          var a = block[bi];
+          for (var pi = 0; pi < c.placed.length; pi++) {
+            var b = c.placed[pi];
+            if (horizontal) {
+              if (b.y < a.y + a.h && a.y < b.y + b.h) {
+                shift = Math.max(shift, a.x + a.w - b.x);
+              }
+            } else if (b.x < a.x + a.w && a.x < b.x + b.w) {
+              shift = Math.max(shift, a.y + a.h - b.y);
             }
           }
-
-          if (Math.abs(dx) > 0.05 || Math.abs(dy) > 0.05) {
-            result[tn.id] = [
-              clampBoardPoint(tp[0] + dx, 6, 94),
-              clampBoardPoint(tp[1] + dy, 7, 93)
-            ];
-            moved += Math.abs(dx) + Math.abs(dy);
-          }
         }
-        // Converged — no meaningful movement
-        if (moved < termNodes.length * 0.03) break;
-      }
-    })();
+        c.placed.forEach(function (p) {
+          var np = horizontal
+            ? { id: p.id, x: p.x + shift, y: p.y, w: p.w, h: p.h }
+            : { id: p.id, x: p.x, y: p.y + shift, w: p.w, h: p.h };
+          placed.push(np);
+          block.push(np);
+        });
+        var root = c.placed[0];
+        var rc = horizontal ? root.x + shift + root.w / 2 : root.y + shift + root.h / 2;
+        if (ci === 0) rootMin = rc;
+        rootMax = rc;
+      });
+      var w = 0, h = 0;
+      placed.forEach(function (p) { w = Math.max(w, p.x + p.w); h = Math.max(h, p.y + p.h); });
+      return { w: w, h: h, placed: placed, rootMin: rootMin, rootMax: rootMax };
+    }
 
-    return result;
+    // Lay out the subtree rooted at `id`; placed x/y/w/h are slot rects,
+    // relative to the subtree's own top-left corner. The parent is centred
+    // over its children's roots.
+    function layoutNode(id, orient, seen) {
+      var slot = slotOf(byId[id]);
+      var kids = (seen[id] ? [] : childIds[id]);
+      seen[id] = true;
+      if (!kids.length) {
+        return { w: slot.w, h: slot.h, placed: [{ id: id, x: 0, y: 0, w: slot.w, h: slot.h }] };
+      }
+      var childLayouts = kids.map(function (cid) { return layoutNode(cid, orient, seen); });
+      var block = arrangeBlock(childLayouts, orient);
+      var mid = (block.rootMin + block.rootMax) / 2;
+      var placed = [];
+      var w, h;
+      if (orient === 'LR') {
+        var selfY0 = mid - slot.h / 2;
+        var blockY = Math.max(0, -selfY0);
+        var selfY = Math.max(0, selfY0);
+        w = slot.w + block.w;
+        h = Math.max(selfY + slot.h, blockY + block.h);
+        placed.push({ id: id, x: 0, y: selfY, w: slot.w, h: slot.h });
+        block.placed.forEach(function (p) {
+          placed.push({ id: p.id, x: p.x + slot.w, y: p.y + blockY, w: p.w, h: p.h });
+        });
+      } else {
+        var selfX0 = mid - slot.w / 2;
+        var blockX = Math.max(0, -selfX0);
+        var selfX = Math.max(0, selfX0);
+        w = Math.max(selfX + slot.w, blockX + block.w);
+        h = slot.h + block.h;
+        placed.push({ id: id, x: selfX, y: 0, w: slot.w, h: slot.h });
+        block.placed.forEach(function (p) {
+          placed.push({ id: p.id, x: p.x + blockX, y: p.y + slot.h, w: p.w, h: p.h });
+        });
+      }
+      return { w: w, h: h, placed: placed };
+    }
+
+    var topicRoots = mains.length ? mains : [nodes[0]];
+    var topicBoxes = topicRoots.map(function (m) {
+      var orient = structuralDepth(m.id) <= 2 ? 'TB' : 'LR';
+      return layoutNode(m.id, orient, {});
+    });
+
+    // Shelf-pack the topic boxes into a roughly landscape area.
+    var totalArea = 0;
+    topicBoxes.forEach(function (b) { totalArea += b.w * b.h; });
+    var rowLimit = Math.max(
+      topicBoxes.reduce(function (mx, b) { return Math.max(mx, b.w); }, 0),
+      Math.sqrt(totalArea) * 1.3
+    );
+    var abs = {};
+    var cursorX = 0, cursorY = 0, rowH = 0, maxX = 0;
+    topicBoxes.forEach(function (b) {
+      if (cursorX > 0 && cursorX + b.w > rowLimit) {
+        cursorX = 0; cursorY += rowH + TOPIC_GAP; rowH = 0;
+      }
+      b.placed.forEach(function (p) {
+        abs[p.id] = { x: p.x + cursorX, y: p.y + cursorY };
+      });
+      cursorX += b.w + TOPIC_GAP;
+      rowH = Math.max(rowH, b.h);
+      maxX = Math.max(maxX, cursorX - TOPIC_GAP);
+    });
+    var stageW = maxX + MARGIN * 2;
+    var stageH = cursorY + rowH + MARGIN * 2;
+
+    // Normalise slot centres to 0..100; the renderer scales them to the stage.
+    var points = {};
+    nodes.forEach(function (n) {
+      var a = abs[n.id];
+      if (!a) { points[n.id] = [50, 50]; return; }
+      var slot = slotOf(n);
+      var cx = a.x + slot.w / 2 + MARGIN;
+      var cy = a.y + slot.h / 2 + MARGIN;
+      points[n.id] = [
+        Math.round((cx / stageW) * 1000) / 10,
+        Math.round((cy / stageH) * 1000) / 10
+      ];
+    });
+    return { points: points, stage: { width: Math.round(stageW), height: Math.round(stageH) } };
+  }
+
+  // Enumerate the main ("topic") nodes of a board so a renderer can offer a
+  // topic switcher. Returns [{ id, label }] in board order; empty when the
+  // board has no explicit hierarchy (nothing to switch between).
+  function topics(board) {
+    if (!board || typeof board !== 'object') return [];
+    var rawNodes = (Array.isArray(board.nodes) ? board.nodes : [])
+      .filter(function (n) { return n && typeof n.label === 'string' && n.label.trim(); });
+    if (rawNodes.length < 2) return [];
+    var backendNormalized = !!(board.normalized_by === 'backend');
+    var hasExplicitHierarchy = backendNormalized || rawNodes.some(function (n) {
+      return (n.role && String(n.role).trim()) || (n.parent_id && String(n.parent_id).trim());
+    });
+    if (!hasExplicitHierarchy) return [];
+    var out = [];
+    rawNodes.forEach(function (n, i) {
+      var role = backendNormalized
+        ? String(n.role || 'branch')
+        : normalizeRole(n.role, n.kind, n.parent_id);
+      if (role === 'main') {
+        out.push({ id: (n.id && String(n.id)) || ('n' + (i + 1)), label: String(n.label).trim() });
+      }
+    });
+    return out;
   }
 
   function compute(board, opts) {
@@ -692,6 +489,7 @@
     }
 
     var points;
+    var stageHint = null;
     if (hasExplicitHierarchy) {
       // For backend-normalised boards, structural constraints (main existence,
       // parent-ID validity) are already guaranteed — skip redundant fixup passes
@@ -721,11 +519,65 @@
           }
         });
       }
-      points = hierarchyPoints(drafts, String(board.layout || 'grid').toLowerCase(), Array.isArray(board.edges) ? board.edges : []);
+      // Topic filter: when the caller requests a subset of main topics, keep
+      // only nodes that belong to one of them — a node belongs to the nearest
+      // main ancestor on its parent chain. Edges referencing dropped nodes are
+      // skipped automatically downstream (byId lookups fail for missing ids).
+      var topicIds = opts && Array.isArray(opts.topicIds) ? opts.topicIds : null;
+      if (topicIds && topicIds.length) {
+        var keepTopic = {};
+        topicIds.forEach(function (id) { keepTopic[String(id)] = true; });
+        var draftById = {};
+        drafts.forEach(function (d) { draftById[d.id] = d; });
+        drafts = drafts.filter(function (d) {
+          var seen = {};
+          var cur = d;
+          while (cur && !seen[cur.id]) {
+            if (cur.role === 'main') return !!keepTopic[cur.id];
+            seen[cur.id] = true;
+            cur = draftById[cur.parentId];
+          }
+          return false;
+        });
+      }
+      // Fold term nodes into their parent's chip list. Terms are annotations,
+      // not first-class graph nodes — folding them keeps the layout to the
+      // structural skeleton (≈40% fewer nodes) and renders them as compact
+      // chips inside the parent card instead of scattered pills.
+      var foldById = {};
+      drafts.forEach(function (d) { foldById[d.id] = d; });
+      var structureDrafts = [];
+      var orphanTerms = [];
+      drafts.forEach(function (d) {
+        if (d.nodeType !== 'term') { structureDrafts.push(d); return; }
+        var parent = foldById[d.parentId];
+        var chip = { label: d.label, detail: d.detail, sourceType: d.sourceType, sourceLabel: d.sourceLabel };
+        if (parent && parent.nodeType !== 'term') {
+          (parent.chips = parent.chips || []).push(chip);
+        } else {
+          orphanTerms.push(chip);
+        }
+      });
+      if (orphanTerms.length && structureDrafts.length) {
+        var chipHost = null;
+        for (var ci = 0; ci < structureDrafts.length; ci++) {
+          if (structureDrafts[ci].role === 'main') { chipHost = structureDrafts[ci]; break; }
+        }
+        chipHost = chipHost || structureDrafts[0];
+        chipHost.chips = (chipHost.chips || []).concat(orphanTerms);
+      }
+      drafts = structureDrafts;
+      var ltf = computeForestLayout(drafts);
+      points = ltf.points;
+      stageHint = ltf.stage;
     } else {
       var fallbackPoints = whiteboardPoints(drafts.length, String(board.layout || 'grid').toLowerCase());
       points = {};
       drafts.forEach(function (n, i) { points[n.id] = fallbackPoints[i] || [50, 50]; });
+      // Legacy non-hierarchical boards still get a pixel stage so edges are
+      // drawn in pixel space (the renderer's SVG viewBox / stroke width assume
+      // pixels — a 0..100 viewBox would render edges far too thick).
+      stageHint = { width: 1100, height: 740 };
     }
 
     var nodes = drafts.map(function (n) {
@@ -740,35 +592,21 @@
 
     var occupiedLabelRects = [];
     var nodeLabelRects = nodes.map(function (n) {
-      var halfW = n.nodeType === 'term' ? 4.8 : (n.role === 'main' ? 7.2 : 6.0);
-      var halfH = n.nodeType === 'term' ? 3.2 : (n.role === 'main' ? 5.7 : 5.0);
+      var halfW = n.role === 'main' ? 7.2 : 6.0;
+      var halfH = n.role === 'main' ? 5.7 : 5.0;
       return { x1: n.x - halfW, y1: n.y - halfH, x2: n.x + halfW, y2: n.y + halfH };
     });
 
+    // Term nodes were folded into chips upstream, so every layout node is a
+    // structure node — edges are simply the board's edges between them.
     var rawEdges = Array.isArray(board.edges) ? board.edges : [];
     var validEdges = [];
-    var termEdgeSeen = {};
     rawEdges.forEach(function (e, i) {
       if (!e) return;
       var from = byId[e.from];
       var to = byId[e.to];
       if (!from || !to || from.id === to.id) return;
-      var term = from.nodeType === 'term' ? from : (to.nodeType === 'term' ? to : null);
-      if (term) {
-        var other = from.id === term.id ? to : from;
-        if (other.id !== term.parentId || termEdgeSeen[term.id]) return;
-        termEdgeSeen[term.id] = true;
-        validEdges.push({ raw: { from: other.id, to: term.id, label: '' }, index: i, from: other, to: term });
-        return;
-      }
       validEdges.push({ raw: e, index: i, from: from, to: to });
-    });
-    nodes.forEach(function (n, i) {
-      if (n.nodeType !== 'term' || termEdgeSeen[n.id]) return;
-      var parent = byId[n.parentId];
-      if (!parent || parent.id === n.id) return;
-      termEdgeSeen[n.id] = true;
-      validEdges.push({ raw: { from: parent.id, to: n.id, label: '' }, index: rawEdges.length + i, from: parent, to: n });
     });
     var edgeAdj = {};
     validEdges.forEach(function (ve) {
@@ -783,30 +621,21 @@
       return false;
     }
 
+    // 0..100 inset endpoints — used for label placement (board-space scoring)
+    // and for the label-collision segment list.
     var edgeGeoms = validEdges.map(function (ve) {
-      var from = ve.from, to = ve.to, i = ve.index;
+      var from = ve.from, to = ve.to;
       var trunk = (from.role === 'main' && to.role === 'main') || from.parentId === to.id || to.parentId === from.id;
       var redundant = !trunk && isRedundant(from.id, to.id);
-      var dx = to.x - from.x;
-      var dy = to.y - from.y;
+      var dx = to.x - from.x, dy = to.y - from.y;
       var len = Math.sqrt(dx * dx + dy * dy) || 1;
       var insetDist = Math.min(5.5, len * 0.18);
       var ux = dx / len, uy = dy / len;
-      var ix1 = from.x + ux * insetDist;
-      var iy1 = from.y + uy * insetDist;
-      var ix2 = to.x - ux * insetDist;
-      var iy2 = to.y - uy * insetDist;
-      var nx = -dy / len, ny = dx / len;
-      var curveSign = i % 2 === 0 ? 1 : -1;
-      var curveMag = trunk ? 0.7 : (redundant ? 1.4 : 2.6);
-      var midX = (ix1 + ix2) / 2;
-      var midY = (iy1 + iy2) / 2;
-      var cx = midX + nx * curveSign * curveMag;
-      var cy = midY + ny * curveSign * curveMag;
-      var anchorX = (ix1 + 2 * cx + ix2) / 4;
-      var anchorY = (iy1 + 2 * cy + iy2) / 4;
-      return { raw: ve.raw, index: i, from: from, to: to, trunk: trunk, redundant: redundant,
-               ix1: ix1, iy1: iy1, ix2: ix2, iy2: iy2, cx: cx, cy: cy, anchorX: anchorX, anchorY: anchorY };
+      return {
+        raw: ve.raw, index: ve.index, from: from, to: to, trunk: trunk, redundant: redundant,
+        ix1: from.x + ux * insetDist, iy1: from.y + uy * insetDist,
+        ix2: to.x - ux * insetDist, iy2: to.y - uy * insetDist
+      };
     });
     var allSegments = edgeGeoms.map(function (g) {
       return { x1: g.ix1, y1: g.iy1, x2: g.ix2, y2: g.iy2 };
@@ -815,27 +644,56 @@
       var label = geom.raw.label ? String(geom.raw.label).trim() : '';
       var labelWidth = label ? clampBoardPoint(estimateLabelWidthEm(label), 5, 13.2) : 0;
       var labelHeight = 3.3;
+
+      // Path geometry in stage pixels: the SVG layer uses a pixel viewBox so
+      // the curve is drawn undistorted (the 0..100 space is non-square once
+      // mapped to the stage).
+      var sw = stageHint ? stageHint.width : 100;
+      var sh = stageHint ? stageHint.height : 100;
+      var fpx = geom.from.x / 100 * sw, fpy = geom.from.y / 100 * sh;
+      var tpx = geom.to.x / 100 * sw, tpy = geom.to.y / 100 * sh;
+      var pdx = tpx - fpx, pdy = tpy - fpy;
+      var plen = Math.sqrt(pdx * pdx + pdy * pdy) || 1;
+      var pinset = Math.min(46, Math.max(8, plen * 0.16));
+      var pux = pdx / plen, puy = pdy / plen;
+      var px1 = fpx + pux * pinset, py1 = fpy + puy * pinset;
+      var px2 = tpx - pux * pinset, py2 = tpy - puy * pinset;
+      var pnx = -pdy / plen, pny = pdx / plen;
+      var pcurveSign = geom.index % 2 === 0 ? 1 : -1;
+      // Gentle bow, scaled by length but capped so long cross-edges don't swoop.
+      var pcurveMag = Math.min(
+        geom.trunk ? 32 : 58,
+        plen * (geom.trunk ? 0.05 : (geom.redundant ? 0.08 : 0.11))
+      );
+      var pcx = (px1 + px2) / 2 + pnx * pcurveSign * pcurveMag;
+      var pcy = (py1 + py2) / 2 + pny * pcurveSign * pcurveMag;
+
+      // Label anchor = the actual (pixel) curve's quarter-point, mapped back
+      // to 0..100 so placeEdgeLabel scores it against the curve really drawn.
+      // The label is positioned by percentage, so a point maps with no
+      // aspect distortion (only SVG shapes stretch, not point positions).
+      var anchorX = ((px1 + 2 * pcx + px2) / 4) / sw * 100;
+      var anchorY = ((py1 + 2 * pcy + py2) / 4) / sh * 100;
       var otherSegs = [];
       for (var oi = 0; oi < allSegments.length; oi++) if (oi !== gi) otherSegs.push(allSegments[oi]);
       var lp = label ? placeEdgeLabel(
-        geom.anchorX, geom.anchorY,
+        anchorX, anchorY,
         { x: geom.ix1, y: geom.iy1 }, { x: geom.ix2, y: geom.iy2 },
         labelWidth, labelHeight,
         occupiedLabelRects, nodeLabelRects,
         otherSegs,
         geom.index
-      ) : { x: geom.anchorX, y: geom.anchorY };
+      ) : { x: anchorX, y: anchorY };
       return {
         id: geom.from.id + '-' + geom.to.id + '-' + geom.index,
         from: geom.from.id,
         to: geom.to.id,
         label: label,
-        termEdge: geom.from.nodeType === 'term' || geom.to.nodeType === 'term',
         colorKind: edgeColorKind(geom.from, geom.to),
         colorSourceType: edgeColorSourceType(geom.from, geom.to),
-        x1: geom.ix1, y1: geom.iy1,
-        x2: geom.ix2, y2: geom.iy2,
-        cx: geom.cx, cy: geom.cy,
+        x1: px1, y1: py1,
+        x2: px2, y2: py2,
+        cx: pcx, cy: pcy,
         lx: lp.x, ly: lp.y,
         labelWidth: labelWidth,
         trunk: geom.trunk,
@@ -846,9 +704,10 @@
     return {
       title: (board.title ? String(board.title).trim() : '') || fallbackTitle,
       nodes: nodes,
-      edges: edges
+      edges: edges,
+      stage: stageHint
     };
   }
 
-  global.WhiteboardLayout = { compute: compute };
+  global.WhiteboardLayout = { compute: compute, topics: topics };
 })(typeof window !== 'undefined' ? window : globalThis);

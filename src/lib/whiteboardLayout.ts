@@ -5,6 +5,13 @@
 
 import type { LiveWhiteboard } from "./api";
 
+export type WhiteboardLayoutChip = {
+  label: string;
+  detail: string;
+  sourceType: string;
+  sourceLabel: string;
+};
+
 export type WhiteboardLayoutNode = {
   id: string;
   label: string;
@@ -17,6 +24,8 @@ export type WhiteboardLayoutNode = {
   sourceLabel: string;
   x: number;
   y: number;
+  // Term annotations folded into this node, rendered as in-card chips.
+  chips?: WhiteboardLayoutChip[];
 };
 
 export type WhiteboardLayoutEdge = {
@@ -24,7 +33,6 @@ export type WhiteboardLayoutEdge = {
   from: string;
   to: string;
   label: string;
-  termEdge?: boolean;
   colorKind: string;
   colorSourceType: string;
   x1: number;
@@ -44,11 +52,21 @@ export type WhiteboardLayoutResult = {
   title: string;
   nodes: WhiteboardLayoutNode[];
   edges: WhiteboardLayoutEdge[];
+  // Pixel canvas the layout was computed against; the renderer sizes the
+  // stage to match so the 0..100 coordinates scale without distortion.
+  stage?: { width: number; height: number } | null;
+};
+
+export type WhiteboardLayoutTopic = {
+  id: string;
+  label: string;
 };
 
 export type WhiteboardLayoutOptions = {
   fallbackBoardTitle?: string;
   externalNodeLabel?: string;
+  // When set, only nodes belonging to these main topics are laid out.
+  topicIds?: string[];
 };
 
 declare global {
@@ -58,6 +76,7 @@ declare global {
         board: unknown,
         options?: WhiteboardLayoutOptions,
       ): WhiteboardLayoutResult | null;
+      topics(board: unknown): WhiteboardLayoutTopic[];
     };
   }
 }
@@ -76,8 +95,18 @@ function makeOptionsKey(options?: WhiteboardLayoutOptions): string {
   // reactive read.
   return (
     (options.fallbackBoardTitle ?? "") + "|" +
-    (options.externalNodeLabel ?? "")
+    (options.externalNodeLabel ?? "") + "|" +
+    ((options.topicIds ?? []).join(","))
   );
+}
+
+export function whiteboardTopics(
+  board: LiveWhiteboard | null,
+): WhiteboardLayoutTopic[] {
+  if (!board) return [];
+  const impl = typeof window !== "undefined" ? window.WhiteboardLayout : undefined;
+  if (!impl || typeof impl.topics !== "function") return [];
+  return impl.topics(board);
 }
 
 export function computeWhiteboardLayout(

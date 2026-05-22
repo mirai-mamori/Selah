@@ -1,5 +1,5 @@
 <script lang="ts">
-  import type { WhiteboardLayoutResult } from "../../whiteboardLayout";
+  import type { WhiteboardLayoutResult, WhiteboardLayoutTopic } from "../../whiteboardLayout";
   import type { BoardHighlight, TermFloatLabels, WhiteboardStagePreset } from "./liveTypes";
 
   type WhiteboardDragStart = { x: number; y: number; panX: number; panY: number } | null;
@@ -14,6 +14,10 @@
     whiteboardDragStart: WhiteboardDragStart;
     selectedBoardNodeId: string | null;
     boardHighlight: BoardHighlight;
+    topics: WhiteboardLayoutTopic[];
+    selectedTopicIds: string[];
+    onToggleTopic: (id: string) => void;
+    onToggleAllTopics: () => void;
     boardCanvasWidth: number;
     boardCanvasHeight: number;
     bindWhiteboardOverlayDismiss: (node: HTMLElement) => { destroy?: () => void } | void;
@@ -39,6 +43,10 @@
     whiteboardDragStart,
     selectedBoardNodeId,
     boardHighlight,
+    topics,
+    selectedTopicIds,
+    onToggleTopic,
+    onToggleAllTopics,
     boardCanvasWidth = $bindable(),
     boardCanvasHeight = $bindable(),
     bindWhiteboardOverlayDismiss,
@@ -54,6 +62,20 @@
     onToggleNodeSelection,
   }: Props = $props();
 
+  // Left topic sidebar: collapsible, with a one-click select-all toggle.
+  let topicSidebarCollapsed = $state(false);
+  const allTopicsSelected = $derived(
+    topics.length > 0 && selectedTopicIds.length >= topics.length,
+  );
+
+  // Edges are drawn in stage-pixel space so the SVG viewBox matches the stage
+  // aspect — a 0..100 viewBox stretched to a non-square stage distorts curves.
+  const boardViewBox = $derived(
+    activeWhiteboardLayout.stage
+      ? `0 0 ${activeWhiteboardLayout.stage.width} ${activeWhiteboardLayout.stage.height}`
+      : "0 0 100 100",
+  );
+
   function handleNodeKeydown(id: string, event: KeyboardEvent) {
     if (event.key !== "Enter" && event.key !== " ") return;
     event.preventDefault();
@@ -63,8 +85,6 @@
 
 <section
   class="board-page"
-  class:dense={activeWhiteboardLayout.nodes.length > 8}
-  class:very-dense={activeWhiteboardLayout.nodes.length > 14}
   use:bindWhiteboardOverlayDismiss
   aria-label={termFloatLabels.boardTitle}
 >
@@ -82,6 +102,57 @@
     <button type="button" onclick={onResetZoom} title="Reset zoom" aria-label="Reset zoom">{Math.round(whiteboardZoom * 100)}%</button>
     <button type="button" onclick={onZoomIn} title="Zoom in" aria-label="Zoom in">＋</button>
   </div>
+  {#if topics.length > 1}
+    {#if topicSidebarCollapsed}
+      <button
+        type="button"
+        class="board-topic-reopen"
+        onclick={() => (topicSidebarCollapsed = false)}
+        aria-label={termFloatLabels.boardTitle}
+        title={termFloatLabels.boardTitle}
+      >
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><line x1="4" y1="7" x2="20" y2="7"/><line x1="4" y1="12" x2="20" y2="12"/><line x1="4" y1="17" x2="20" y2="17"/></svg>
+      </button>
+    {:else}
+      <aside class="board-topic-sidebar" aria-label={termFloatLabels.boardTitle}>
+        <div class="board-topic-head">
+          <button
+            type="button"
+            class="board-topic-fold"
+            onclick={() => (topicSidebarCollapsed = true)}
+            title={termFloatLabels.collapse}
+          >
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><polyline points="11 7 6 12 11 17"/><polyline points="18 7 13 12 18 17"/></svg>
+            <span>{termFloatLabels.collapse}</span>
+          </button>
+          <button
+            type="button"
+            class="board-topic-all"
+            onclick={onToggleAllTopics}
+            title={allTopicsSelected ? termFloatLabels.deselectAll : termFloatLabels.selectAll}
+          >
+            {#if allTopicsSelected}
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><rect x="3.5" y="3.5" width="17" height="17" rx="4"/><path d="M8.2 12h7.6"/></svg>
+            {:else}
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><rect x="3.5" y="3.5" width="17" height="17" rx="4"/><path d="M8 12.4l2.9 2.9L16.5 9"/></svg>
+            {/if}
+            <span>{allTopicsSelected ? termFloatLabels.deselectAll : termFloatLabels.selectAll}</span>
+          </button>
+        </div>
+        <div class="board-topic-list">
+          {#each topics as topic (topic.id)}
+            <button
+              type="button"
+              class="board-topic-chip"
+              class:is-active={selectedTopicIds.includes(topic.id)}
+              aria-pressed={selectedTopicIds.includes(topic.id)}
+              onclick={() => onToggleTopic(topic.id)}
+            >{topic.label}</button>
+          {/each}
+        </div>
+      </aside>
+    {/if}
+  {/if}
   <!-- svelte-ignore a11y_click_events_have_key_events -->
   <!-- svelte-ignore a11y_no_noninteractive_element_interactions -->
   <div
@@ -103,12 +174,12 @@
       class="visual-board-stage"
       style="width: {activeWhiteboardStage.width}px; height: {activeWhiteboardStage.height}px; transform: translate(-50%, -50%) translate({whiteboardPanX}px, {whiteboardPanY}px) scale({whiteboardZoom});"
     >
-      <svg class="visual-board-links" viewBox="0 0 100 100" preserveAspectRatio="none" aria-hidden="true">
+      <svg class="visual-board-links" viewBox={boardViewBox} preserveAspectRatio="none" aria-hidden="true">
         {#each activeWhiteboardLayout.edges as edge (edge.id)}
           <path
             class="visual-board-edge edge-kind-{edge.colorKind} edge-source-{edge.colorSourceType}"
+            class:trunk={edge.trunk}
             class:redundant={edge.redundant}
-            class:term-edge={edge.termEdge}
             class:is-highlighted={boardHighlight?.edges.has(edge.id)}
             d="M {edge.x1} {edge.y1} Q {edge.cx} {edge.cy} {edge.x2} {edge.y2}"
           />
@@ -128,7 +199,6 @@
           class="visual-board-node kind-{node.kind} source-{node.sourceType}"
           class:role-main={node.role === "main"}
           class:role-branch={node.role !== "main"}
-          class:node-term={node.nodeType === "term"}
           class:is-highlighted={boardHighlight?.nodes.has(node.id)}
           class:is-selected={selectedBoardNodeId === node.id}
           style="left: {node.x}%; top: {node.y}%;"
@@ -144,6 +214,13 @@
           <span class="visual-board-node-label">{node.label}</span>
           {#if node.detail}
             <span class="visual-board-node-detail">{node.detail}</span>
+          {/if}
+          {#if node.chips?.length}
+            <span class="visual-board-node-chips">
+              {#each node.chips as chip (chip.label)}
+                <span class="visual-board-chip" title={chip.detail}>{chip.label}</span>
+              {/each}
+            </span>
           {/if}
         </div>
       {/each}
@@ -166,6 +243,7 @@
     flex: 1 1 auto;
     height: auto;
     min-height: 0;
+    min-width: 0;
     border-radius: 0;
   }
   .board-page-back {
@@ -234,6 +312,128 @@
     color: var(--text-primary);
   }
 
+  /* Topic switcher — a compact glass panel floating over the canvas, the
+     same family as the back button and zoom pill. Sized to its content. */
+  .board-topic-sidebar,
+  .board-topic-reopen {
+    position: absolute;
+    left: 20px;
+    top: 66px;
+    z-index: 5;
+    box-sizing: border-box;
+    border: 0.5px solid var(--glass-border);
+    background: var(--glass-bg, rgba(255, 255, 255, 0.5));
+    backdrop-filter: var(--glass-blur) var(--glass-saturate);
+    -webkit-backdrop-filter: var(--glass-blur) var(--glass-saturate);
+    box-shadow: var(--shadow-glass), 0 4px 16px rgba(0, 0, 0, 0.06);
+  }
+  .board-topic-sidebar {
+    width: 220px;
+    max-height: calc(100% - 88px);
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    padding: 8px;
+    overflow-y: auto;
+    border-radius: 14px;
+    scrollbar-width: thin;
+  }
+  .board-topic-reopen {
+    width: 36px;
+    height: 36px;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    padding: 0;
+    border-radius: 12px;
+    color: var(--text-secondary);
+    cursor: pointer;
+    transition: background 0.15s, color 0.15s;
+  }
+  .board-topic-reopen:hover {
+    background: color-mix(in srgb, var(--text-primary) 8%, var(--glass-bg, rgba(255, 255, 255, 0.5)));
+    color: var(--text-primary);
+  }
+  .board-topic-head {
+    display: flex;
+    align-items: center;
+    gap: 5px;
+  }
+  /* Header: two equal-size buttons — fold (left) and select-all (right),
+     each an icon + label, each taking half the width. */
+  .board-topic-all,
+  .board-topic-fold {
+    flex: 1 1 0;
+    min-width: 0;
+    height: 30px;
+    box-sizing: border-box;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    gap: 5px;
+    padding: 0 8px;
+    border: 0.5px solid transparent;
+    border-radius: 8px;
+    background: transparent;
+    color: var(--text-secondary);
+    font: inherit;
+    font-size: 10.5px;
+    font-weight: 700;
+    white-space: nowrap;
+    cursor: pointer;
+    transition: background 0.14s, color 0.14s;
+  }
+  .board-topic-all:hover,
+  .board-topic-fold:hover {
+    background: color-mix(in srgb, var(--text-primary) 9%, transparent);
+    color: var(--text-primary);
+  }
+  .board-topic-all svg,
+  .board-topic-fold svg {
+    flex: 0 0 auto;
+  }
+  .board-topic-all span,
+  .board-topic-fold span {
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  .board-topic-list {
+    display: flex;
+    flex-direction: column;
+    gap: 5px;
+  }
+  /* Topic chips — each carries a subtle surface; the selected one uses accent. */
+  .board-topic-chip {
+    box-sizing: border-box;
+    width: 100%;
+    padding: 7px 10px;
+    border: 0.5px solid transparent;
+    border-radius: 8px;
+    background: color-mix(in srgb, var(--text-primary) 5%, transparent);
+    color: var(--text-secondary);
+    font: inherit;
+    font-size: 11.5px;
+    font-weight: 700;
+    line-height: 1.3;
+    text-align: left;
+    cursor: pointer;
+    transition: background 0.14s, color 0.14s, border-color 0.14s;
+  }
+  .board-topic-chip:hover {
+    background: color-mix(in srgb, var(--text-primary) 10%, transparent);
+    color: var(--text-primary);
+  }
+  .board-topic-chip.is-active {
+    border-color: color-mix(in srgb, var(--accent) 45%, transparent);
+    background: color-mix(in srgb, var(--accent) 13%, transparent);
+    color: var(--text-primary);
+    font-weight: 800;
+  }
+  .board-topic-chip.is-active:hover {
+    background: color-mix(in srgb, var(--accent) 18%, transparent);
+    color: var(--text-primary);
+  }
+
   @keyframes board-page-in {
     from { transform: translateY(10px); }
     to { transform: translateY(0); }
@@ -269,12 +469,19 @@
     color: color-mix(in srgb, var(--blue) 52%, var(--text-tertiary));
     overflow: visible;
   }
+  /* Relations are de-emphasised by default (structure first, relations on
+     demand); hierarchy/trunk edges stay visible; selection makes the
+     relevant edges pop. Stroke widths are pixels (the viewBox is the stage). */
   .visual-board-links path {
     fill: none;
     stroke: var(--edge-color, currentColor);
-    stroke-width: 0.75;
+    stroke-width: 1.5;
     stroke-linecap: round;
-    opacity: 0.74;
+    opacity: 0.32;
+  }
+  .visual-board-links path.trunk {
+    stroke-width: 1.8;
+    opacity: 0.7;
   }
   .visual-board-links path.edge-kind-core {
     --edge-color: color-mix(in srgb, var(--text-tertiary) 76%, var(--text-secondary));
@@ -289,17 +496,11 @@
     --edge-color: color-mix(in srgb, var(--text-tertiary) 76%, var(--text-secondary));
   }
   .visual-board-links path.edge-source-external {
-    stroke-dasharray: 3 2.2;
-    opacity: 0.64;
-  }
-  .visual-board-links path.term-edge {
-    stroke-width: 0.95;
-    opacity: 0.86;
-    stroke-dasharray: none;
+    stroke-dasharray: 5 4;
   }
   .visual-board-links path.redundant {
-    stroke-dasharray: 1.6 1.4;
-    opacity: 0.42;
+    stroke-dasharray: 4 4;
+    opacity: 0.2;
   }
   .visual-board-canvas.has-selection .visual-board-links path,
   .visual-board-canvas.has-selection .visual-board-edge-label,
@@ -307,11 +508,11 @@
     transition: opacity 0.16s ease, box-shadow 0.16s ease, border-color 0.16s ease;
   }
   .visual-board-canvas.has-selection .visual-board-links path {
-    opacity: 0.12;
+    opacity: 0.08;
   }
   .visual-board-canvas.has-selection .visual-board-links path.is-highlighted {
-    opacity: 0.95;
-    stroke-width: 1.1;
+    opacity: 0.96;
+    stroke-width: 2.6;
   }
   .visual-board-canvas.has-selection .visual-board-edge-label {
     opacity: 0.14;
@@ -390,17 +591,6 @@
     box-shadow: 0 3px 8px rgba(0, 0, 0, 0.08);
     text-align: center;
   }
-  .board-page.dense .visual-board-node {
-    width: 106px;
-    min-height: 58px;
-    padding: 6px 7px;
-    gap: 2px;
-  }
-  .board-page.very-dense .visual-board-node {
-    width: 94px;
-    min-height: 50px;
-    padding: 5px 6px;
-  }
   .visual-board-node.role-main {
     width: 142px;
     min-height: 74px;
@@ -411,32 +601,6 @@
     width: 114px;
     min-height: 62px;
     opacity: 0.94;
-  }
-  .visual-board-node.node-term {
-    width: auto;
-    min-width: 64px;
-    max-width: 96px;
-    min-height: 0;
-    padding: 5px 8px;
-    gap: 0;
-    border-radius: 999px;
-    opacity: 0.86;
-    box-shadow: 0 2px 5px rgba(0, 0, 0, 0.06);
-    z-index: 4;
-  }
-  .board-page.dense .visual-board-node.role-main {
-    width: 124px;
-    min-height: 66px;
-  }
-  .board-page.very-dense .visual-board-node.role-main {
-    width: 110px;
-    min-height: 58px;
-  }
-  .board-page.dense .visual-board-node.node-term,
-  .board-page.very-dense .visual-board-node.node-term {
-    min-width: 54px;
-    max-width: 80px;
-    padding: 4px 7px;
   }
   .visual-board-node.kind-core {
     background: color-mix(in srgb, var(--blue) 14%, var(--bg-primary));
@@ -483,11 +647,26 @@
     line-height: 1.25;
     overflow-wrap: anywhere;
   }
-  .board-page.dense .visual-board-node-label {
-    font-size: 10.8px;
+  .visual-board-node-chips {
+    display: flex;
+    flex-wrap: wrap;
+    justify-content: center;
+    gap: 3px;
+    margin-top: 4px;
+    max-width: 100%;
   }
-  .board-page.very-dense .visual-board-node-label {
-    font-size: 10px;
+  .visual-board-chip {
+    max-width: 100%;
+    padding: 1px 6px;
+    border-radius: 999px;
+    background: color-mix(in srgb, var(--text-tertiary) 15%, transparent);
+    color: var(--text-secondary);
+    font-size: 8.5px;
+    font-weight: 700;
+    line-height: 1.55;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
   }
   .visual-board-node-detail {
     max-width: 100%;
@@ -501,38 +680,6 @@
     -webkit-box-orient: vertical;
     overflow: hidden;
     overflow-wrap: anywhere;
-  }
-  .visual-board-node.node-term .visual-board-node-label {
-    font-size: 10.5px;
-    line-height: 1.18;
-  }
-  .visual-board-node.node-term .visual-board-node-detail {
-    display: none;
-  }
-  .visual-board-node.node-term:is(:hover, :focus-visible, .is-selected) {
-    max-width: 142px;
-    padding: 7px 9px;
-    border-radius: 8px;
-    opacity: 0.96;
-    z-index: 5;
-  }
-  .visual-board-node.node-term:is(:hover, :focus-visible, .is-selected) .visual-board-node-detail {
-    display: -webkit-box;
-    margin-top: 3px;
-    font-size: 9px;
-    -webkit-line-clamp: 3;
-    line-clamp: 3;
-  }
-  .board-page.dense .visual-board-node-detail {
-    font-size: 9px;
-    -webkit-line-clamp: 3;
-    line-clamp: 3;
-  }
-  .board-page.very-dense .visual-board-node-detail {
-    display: -webkit-box;
-    font-size: 8.5px;
-    -webkit-line-clamp: 2;
-    line-clamp: 2;
   }
 
   @media (max-width: 700px) {
@@ -550,10 +697,6 @@
     .visual-board-node {
       width: 108px;
       min-height: 58px;
-    }
-    .board-page.dense .visual-board-node {
-      width: 94px;
-      min-height: 50px;
     }
   }
 </style>

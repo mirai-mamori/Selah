@@ -44,7 +44,7 @@
   import type { ScheduleResponse } from "../types";
   import { PERIOD_TIMES } from "../types";
   import { buildCourseSlots, type CourseSlot } from "../schedule";
-  import { computeWhiteboardLayout } from "../whiteboardLayout";
+  import { computeWhiteboardLayout, whiteboardTopics } from "../whiteboardLayout";
   import type { LiveTodoDraft, NoticeAction, NoticeKind, NoticeSource, NoticeState, SttPhase, WhiteboardStagePreset } from "./live/liveTypes";
 
   let scheduleData = $state<ScheduleResponse | null>(null);
@@ -220,7 +220,7 @@
   function openWhiteboardOverlay() {
     // Reset pan/zoom to preset defaults; the auto-fit effect will recalculate
     // once the canvas dimensions are measured after the DOM renders.
-    const preset = getWhiteboardStagePreset(activeWhiteboardLayout?.nodes.length ?? 0);
+    const preset = getWhiteboardStagePreset(activeWhiteboardLayout);
     whiteboardZoom = preset.zoom;
     whiteboardPanX = 0;
     whiteboardPanY = 0;
@@ -237,7 +237,7 @@
     whiteboardZoom = clampWhiteboardZoom(value);
   }
   function resetWhiteboardView() {
-    const preset = getWhiteboardStagePreset(activeWhiteboardLayout?.nodes.length ?? 0);
+    const preset = getWhiteboardStagePreset(activeWhiteboardLayout);
     if (boardCanvasWidth > 0 && boardCanvasHeight > 0) {
       // Fit the full stage inside the measured canvas, leaving a small margin.
       const fitZoom = Math.min(boardCanvasWidth / preset.width, boardCanvasHeight / preset.height) * 0.94;
@@ -301,23 +301,72 @@
       case "zh":
       case "zh-cn":
       case "cn":
-        return { title: "用语注释", boardTitle: "知识整理", empty: "本段没有需要解释的术语", source: sourceLabel.zh, externalSource: "外部来源", externalNode: "外部", collapse: "折叠", expand: "展开", previous: "上一个术语", next: "下一个术语" };
+        return { title: "用语注释", boardTitle: "知识整理", empty: "本段没有需要解释的术语", source: sourceLabel.zh, externalSource: "外部来源", externalNode: "外部", collapse: "折叠", expand: "展开", previous: "上一个术语", next: "下一个术语", selectAll: "全选", deselectAll: "取消全选" };
       case "en":
-        return { title: "Key Terms", boardTitle: "Knowledge Board", empty: "No terms for this segment", source: sourceLabel.en, externalSource: "External source", externalNode: "External", collapse: "Collapse", expand: "Expand", previous: "Previous term", next: "Next term" };
+        return { title: "Key Terms", boardTitle: "Knowledge Board", empty: "No terms for this segment", source: sourceLabel.en, externalSource: "External source", externalNode: "External", collapse: "Collapse", expand: "Expand", previous: "Previous term", next: "Next term", selectAll: "Select all", deselectAll: "Deselect all" };
       case "ko":
-        return { title: "핵심 용어", boardTitle: "지식 정리", empty: "이 구간의 용어 설명이 없습니다", source: sourceLabel.ko, externalSource: "외부 출처", externalNode: "외부", collapse: "접기", expand: "펼치기", previous: "이전 용어", next: "다음 용어" };
+        return { title: "핵심 용어", boardTitle: "지식 정리", empty: "이 구간의 용어 설명이 없습니다", source: sourceLabel.ko, externalSource: "외부 출처", externalNode: "외부", collapse: "접기", expand: "펼치기", previous: "이전 용어", next: "다음 용어", selectAll: "전체 선택", deselectAll: "선택 해제" };
       default:
-        return { title: "用語注釈", boardTitle: "知識整理", empty: "この区間の注釈はありません", source: sourceLabel.ja, externalSource: "外部出典", externalNode: "外部", collapse: "折りたたむ", expand: "展開", previous: "前の用語", next: "次の用語" };
+        return { title: "用語注釈", boardTitle: "知識整理", empty: "この区間の注釈はありません", source: sourceLabel.ja, externalSource: "外部出典", externalNode: "外部", collapse: "折りたたむ", expand: "展開", previous: "前の用語", next: "次の用語", selectAll: "すべて選択", deselectAll: "選択解除" };
     }
   });
 
+  const rawWhiteboard = $derived(snapshot.summaries[activeSummaryIdx]?.whiteboard ?? null);
+  // Topic switcher: a dense board carries several main topics; the bottom bar
+  // lets the user show one (default) or several at a time instead of cramming
+  // every topic onto one canvas.
+  const whiteboardTopicList = $derived(whiteboardTopics(rawWhiteboard));
+  let selectedTopicIds = $state<string[]>([]);
+  // Reset the selection only when the *set* of topics changes — the board
+  // object is re-derived on every transcript tick, but as long as the topic
+  // ids are unchanged we keep the user's current pick.
+  const whiteboardTopicFingerprint = $derived(whiteboardTopicList.map((t) => t.id).join("|"));
+  $effect(() => {
+    whiteboardTopicFingerprint;
+    untrack(() => {
+      const ids = whiteboardTopicList.map((t) => t.id);
+      const kept = selectedTopicIds.filter((id) => ids.includes(id));
+      // Default to the first topic only — one topic shown at a time.
+      selectedTopicIds = kept.length ? kept : ids.slice(0, 1);
+    });
+  });
   const activeWhiteboardLayout = $derived.by(() =>
-    computeWhiteboardLayout(snapshot.summaries[activeSummaryIdx]?.whiteboard ?? null, {
+    computeWhiteboardLayout(rawWhiteboard, {
+      fallbackBoardTitle: termFloatLabels.boardTitle,
+      externalNodeLabel: termFloatLabels.externalNode,
+      topicIds: whiteboardTopicList.length > 1 ? selectedTopicIds : undefined,
+    })
+  );
+  // The rail preview is an overview — it always shows the whole board; topic
+  // filtering only applies inside the expanded overlay.
+  const previewWhiteboardLayout = $derived(
+    computeWhiteboardLayout(rawWhiteboard, {
       fallbackBoardTitle: termFloatLabels.boardTitle,
       externalNodeLabel: termFloatLabels.externalNode,
     })
   );
-  const activeWhiteboardStage = $derived(getWhiteboardStagePreset(activeWhiteboardLayout?.nodes.length ?? 0));
+  function toggleWhiteboardTopic(id: string) {
+    if (selectedTopicIds.includes(id)) {
+      // Keep at least one topic selected.
+      if (selectedTopicIds.length > 1) {
+        selectedTopicIds = selectedTopicIds.filter((x) => x !== id);
+      }
+    } else {
+      selectedTopicIds = [...selectedTopicIds, id];
+    }
+    selectedBoardNodeId = null;
+    // The stage size depends on node count, so refit the view to the new set.
+    initialFitDone = false;
+  }
+  function toggleAllWhiteboardTopics() {
+    const ids = whiteboardTopicList.map((t) => t.id);
+    // One click: select every topic, or — when all are already on — collapse
+    // back to just the first.
+    selectedTopicIds = selectedTopicIds.length >= ids.length ? ids.slice(0, 1) : ids;
+    selectedBoardNodeId = null;
+    initialFitDone = false;
+  }
+  const activeWhiteboardStage = $derived(getWhiteboardStagePreset(activeWhiteboardLayout));
 
   const boardHighlight = $derived.by(() => {
     if (!selectedBoardNodeId || !activeWhiteboardLayout) return null;
@@ -358,9 +407,12 @@
   });
 
   // Auto-fit: once the board-page canvas has been measured, recalculate the
-  // initial zoom so the stage fills the real available area. We only do this
-  // once per open (initialFitDone guard) to avoid fighting with user pans/zooms.
+  // initial zoom so the stage fills the real available area. We do this once
+  // per open (initialFitDone guard) to avoid fighting with user pans/zooms —
+  // and again whenever the topic selection changes, since that resizes the
+  // stage (toggleWhiteboardTopic clears the guard).
   $effect(() => {
+    void selectedTopicIds;
     if (!whiteboardExpanded) {
       untrack(() => { initialFitDone = false; });
       return;
@@ -375,7 +427,13 @@
     });
   });
 
-  function getWhiteboardStagePreset(nodeCount: number): WhiteboardStagePreset {
+  function getWhiteboardStagePreset(layout: typeof activeWhiteboardLayout): WhiteboardStagePreset {
+    // The forest layout reports the exact pixel canvas it was computed for;
+    // the auto-fit effect then derives a zoom that fits it to the viewport.
+    if (layout?.stage) {
+      return { width: layout.stage.width, height: layout.stage.height, zoom: 0.8 };
+    }
+    const nodeCount = layout?.nodes.length ?? 0;
     if (nodeCount > 14) {
       const extra = nodeCount - 14;
       const spread = Math.sqrt(extra);
@@ -1296,7 +1354,7 @@
   <LiveScrollToBottomButton visible={showScrollBtn && hasContent} onScrollToBottom={scrollToBottom} />
 
   <LiveRightRail
-    {activeWhiteboardLayout}
+    previewLayout={previewWhiteboardLayout}
     {activeSummaryTerms}
     {termsCollapsed}
     {collapsedTermPreview}
@@ -1321,6 +1379,10 @@
       {whiteboardDragStart}
       {selectedBoardNodeId}
       {boardHighlight}
+      topics={whiteboardTopicList}
+      {selectedTopicIds}
+      onToggleTopic={toggleWhiteboardTopic}
+      onToggleAllTopics={toggleAllWhiteboardTopics}
       bind:boardCanvasWidth
       bind:boardCanvasHeight
       {bindWhiteboardOverlayDismiss}

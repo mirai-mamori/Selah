@@ -352,6 +352,150 @@ fn format_current_chunk_for_whiteboard(
     out
 }
 
+fn normalized_excerpt_match_text(value: &str) -> String {
+    value
+        .chars()
+        .filter(|c| !c.is_whitespace())
+        .collect::<String>()
+        .to_ascii_lowercase()
+}
+
+fn whiteboard_excerpt_terms(node: &LiveWhiteboardNode) -> Vec<String> {
+    let mut terms = Vec::new();
+    for source in [&node.label, &node.detail] {
+        for part in source.split(|c: char| {
+            c.is_whitespace()
+                || matches!(
+                    c,
+                    'の' | 'と'
+                        | 'や'
+                        | '・'
+                        | '、'
+                        | '。'
+                        | '，'
+                        | ','
+                        | '.'
+                        | ':'
+                        | '：'
+                        | ';'
+                        | '；'
+                        | '('
+                        | ')'
+                        | '（'
+                        | '）'
+                        | '['
+                        | ']'
+                        | '【'
+                        | '】'
+                        | '/'
+                        | '／'
+                        | '-'
+                        | '_'
+                        | '+'
+                        | '＋'
+                        | '='
+                )
+        }) {
+            let normalized = normalized_excerpt_match_text(part);
+            let char_count = normalized.chars().count();
+            if char_count >= 3 || (char_count >= 2 && normalized.is_ascii()) {
+                terms.push(normalized);
+            }
+        }
+    }
+    terms.sort_by_key(|term| std::cmp::Reverse(term.chars().count()));
+    terms.dedup();
+    terms.truncate(8);
+    terms
+}
+
+fn best_transcript_excerpt_for_node(
+    node: &LiveWhiteboardNode,
+    lines: &[LiveTranscriptLine],
+) -> Option<String> {
+    let terms = whiteboard_excerpt_terms(node);
+    if terms.is_empty() {
+        return None;
+    }
+
+    lines
+        .iter()
+        .filter_map(|line| {
+            let normalized = normalized_excerpt_match_text(&line.text);
+            if normalized.is_empty() {
+                return None;
+            }
+            let score = terms
+                .iter()
+                .filter(|term| normalized.contains(term.as_str()))
+                .map(|term| term.chars().count())
+                .sum::<usize>();
+            if score == 0 {
+                None
+            } else {
+                Some((score, line.text.as_str()))
+            }
+        })
+        .max_by_key(|(score, text)| (*score, text.chars().count()))
+        .map(|(_, text)| clamp_chars(text, 80))
+}
+
+fn enrich_whiteboard_source_excerpts(
+    mut board: Option<LiveWhiteboard>,
+    previous: Option<&LiveWhiteboard>,
+    terms: &[LiveTermExplanation],
+    lines: &[LiveTranscriptLine],
+) -> Option<LiveWhiteboard> {
+    let whiteboard = board.as_mut()?;
+    let previous_by_id = previous
+        .map(|prev| {
+            prev.nodes
+                .iter()
+                .filter(|node| !node.source_excerpt.trim().is_empty())
+                .map(|node| (node.id.as_str(), node.source_excerpt.as_str()))
+                .collect::<std::collections::HashMap<_, _>>()
+        })
+        .unwrap_or_default();
+    let previous_by_label = previous
+        .map(|prev| {
+            prev.nodes
+                .iter()
+                .filter(|node| !node.source_excerpt.trim().is_empty())
+                .map(|node| (node.label.as_str(), node.source_excerpt.as_str()))
+                .collect::<std::collections::HashMap<_, _>>()
+        })
+        .unwrap_or_default();
+
+    for node in &mut whiteboard.nodes {
+        if node.source_type != "lecture" || !node.source_excerpt.trim().is_empty() {
+            continue;
+        }
+        if let Some(excerpt) = previous_by_id
+            .get(node.id.as_str())
+            .or_else(|| previous_by_label.get(node.label.as_str()))
+        {
+            node.source_excerpt = clamp_chars(excerpt, 80);
+            continue;
+        }
+        if node.node_type == "term" {
+            if let Some(term) = terms.iter().find(|term| {
+                !term.source_excerpt.trim().is_empty()
+                    && (term.term == node.label
+                        || node.label.contains(term.term.as_str())
+                        || term.term.contains(node.label.as_str()))
+            }) {
+                node.source_excerpt = clamp_chars(&term.source_excerpt, 80);
+                continue;
+            }
+        }
+        if let Some(excerpt) = best_transcript_excerpt_for_node(node, lines) {
+            node.source_excerpt = excerpt;
+        }
+    }
+
+    board
+}
+
 fn live_whiteboard_language_instruction(reply_language: &str) -> &'static str {
     match reply_language {
         "zh" => {
@@ -660,7 +804,7 @@ fn live_whiteboard_system_prompt(language_instruction: &str, is_free_note: bool)
 - 用語は「知らないと理解が止まる語」「何度も出る語」「構造ラベル理解に必要な語」に限る。出た語をすべて term にしない。
 - 人物名・地名・組織名・道具名は、主語/結節点になる時だけ構造ノード。単発の登場名や属性は detail/source_excerpt に含める。
 - 各 node の detail は白板内だけでも最低限理解できるように、講義文脈での役割・条件・注意点を短く具体的に書く。
-- 講義内に出た概念は source_type="lecture" とし、source_excerpt に根拠となる短い発話断片を書く。
+- 講義内に出た概念は source_type="lecture" とし、source_excerpt に根拠となる短い発話断片を可能な限り入れる。外部補足以外で根拠がある node の source_excerpt をまとめて空にしない。
 - 理解に役立つ標準的な背景知識・関連概念は必要に応じて少数追加してよいが、必ず source_type="external" とし、external_source に確認可能な出典を書く。外部補足ノードは原則 branch にし、detail の末尾にも外部補足だと分かる表現を入れる。
 - 出典を示せない外部補足、具体値や固有事実の断定、講義から離れすぎた発展は追加しない。
 
@@ -870,6 +1014,12 @@ async fn summarize_chunk(
             None
         }
     };
+    let whiteboard = enrich_whiteboard_source_excerpts(
+        whiteboard,
+        latest_whiteboard(recent_summaries),
+        &parsed_1.terms,
+        lines,
+    );
 
     Ok(LiveChunkAiResult {
         body: parsed_1.body,
@@ -2163,6 +2313,106 @@ mod tests {
         assert!(!context.contains("古いボード"));
     }
 
+    fn test_whiteboard_node(
+        id: &str,
+        label: &str,
+        node_type: &str,
+        source_type: &str,
+        source_excerpt: &str,
+    ) -> LiveWhiteboardNode {
+        LiveWhiteboardNode {
+            id: id.to_string(),
+            label: label.to_string(),
+            detail: String::new(),
+            node_type: node_type.to_string(),
+            kind: if node_type == "term" {
+                "support".to_string()
+            } else {
+                "core".to_string()
+            },
+            role: if node_type == "term" {
+                "branch".to_string()
+            } else {
+                "main".to_string()
+            },
+            parent_id: String::new(),
+            source_type: source_type.to_string(),
+            source_excerpt: source_excerpt.to_string(),
+            external_source: String::new(),
+        }
+    }
+
+    fn test_whiteboard(nodes: Vec<LiveWhiteboardNode>) -> LiveWhiteboard {
+        LiveWhiteboard {
+            title: "テスト白板".to_string(),
+            layout: "grid".to_string(),
+            nodes,
+            edges: Vec::new(),
+            schema_version: 1,
+            normalized_by: "backend".to_string(),
+        }
+    }
+
+    #[test]
+    fn enrich_whiteboard_source_excerpts_uses_previous_terms_and_transcript() {
+        let previous = test_whiteboard(vec![test_whiteboard_node(
+            "old",
+            "既存ノード",
+            "structure",
+            "lecture",
+            "既存の根拠",
+        )]);
+        let mut term_node =
+            test_whiteboard_node("term-source", "一次資料", "term", "lecture", "");
+        term_node.parent_id = "old".to_string();
+        let mut external_node =
+            test_whiteboard_node("external", "外部補足", "structure", "external", "");
+        external_node.external_source = "外部資料".to_string();
+        let board = test_whiteboard(vec![
+            test_whiteboard_node("old", "既存ノード", "structure", "lecture", ""),
+            term_node,
+            test_whiteboard_node(
+                "theme",
+                "個人発表のテーマ選定",
+                "structure",
+                "lecture",
+                "",
+            ),
+            external_node,
+        ]);
+        let terms = vec![LiveTermExplanation {
+            term: "一次資料".to_string(),
+            explanation: "大元の資料".to_string(),
+            source_excerpt: "一次資料まで遡る必要があります".to_string(),
+            external_source: String::new(),
+        }];
+        let lines = vec![LiveTranscriptLine {
+            at: "12:00:00".to_string(),
+            text: "個人発表のテーマ選定では、賛否が分かれる問いを選んでください。"
+                .to_string(),
+        }];
+
+        let enriched =
+            enrich_whiteboard_source_excerpts(Some(board), Some(&previous), &terms, &lines)
+                .expect("whiteboard should remain available");
+        let source_by_id = enriched
+            .nodes
+            .iter()
+            .map(|node| (node.id.as_str(), node.source_excerpt.as_str()))
+            .collect::<std::collections::HashMap<_, _>>();
+
+        assert_eq!(source_by_id.get("old"), Some(&"既存の根拠"));
+        assert_eq!(
+            source_by_id.get("term-source"),
+            Some(&"一次資料まで遡る必要があります")
+        );
+        assert_eq!(
+            source_by_id.get("theme"),
+            Some(&"個人発表のテーマ選定では、賛否が分かれる問いを選んでください。")
+        );
+        assert_eq!(source_by_id.get("external"), Some(&""));
+    }
+
     #[test]
     fn live_prompts_keep_language_policy_consistent() {
         let language_hint = live_reply_language_hint("zh");
@@ -2259,6 +2509,8 @@ mod tests {
         assert!(board_prompt.contains("構造ノード"));
         assert!(board_prompt.contains("node_type=\"term\""));
         assert!(board_prompt.contains("用語ノード"));
+        assert!(board_prompt.contains("source_excerpt に根拠となる短い発話断片"));
+        assert!(board_prompt.contains("source_excerpt をまとめて空にしない"));
         assert!(board_prompt.contains("人物名・地名・組織名・道具名"));
         assert!(board_prompt.contains("parent_id=\"\""));
         assert!(board_prompt.contains("用語ノードの edge は親構造ノードとだけ"));

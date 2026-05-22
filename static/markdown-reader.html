@@ -363,6 +363,117 @@
     background: color-mix(in srgb, var(--bg-primary) 92%, transparent);
     box-shadow: 0 4px 14px rgba(0, 0, 0, 0.06);
   }
+  /* Topic switcher — a compact glass panel floating over the canvas. */
+  .mdr-wb-topics {
+    position: absolute;
+    left: 18px;
+    top: 18px;
+    z-index: 7;
+    box-sizing: border-box;
+    width: 220px;
+    max-height: calc(100% - 56px);
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    padding: 7px;
+    overflow-y: auto;
+    border-radius: 12px;
+    border: 0.5px solid var(--glass-border);
+    background: var(--glass-bg);
+    backdrop-filter: var(--glass-blur) var(--glass-saturate);
+    -webkit-backdrop-filter: var(--glass-blur) var(--glass-saturate);
+    box-shadow: var(--shadow-glass), 0 4px 16px rgba(0, 0, 0, 0.06);
+  }
+  .mdr-wb-topics.collapsed {
+    width: auto;
+    padding: 5px;
+  }
+  .mdr-wb-topics-head {
+    display: flex;
+    align-items: center;
+    gap: 5px;
+  }
+  .mdr-wb-topics.collapsed .mdr-wb-topics-head {
+    justify-content: center;
+  }
+  .mdr-wb-topics.collapsed .mdr-wb-topic-all,
+  .mdr-wb-topics.collapsed .mdr-wb-topic-list {
+    display: none;
+  }
+  /* Header: two equal-size buttons — fold (left) and select-all (right),
+     each an icon + label. Transparent; fill only on hover. */
+  .mdr-wb-topic-all,
+  .mdr-wb-topic-fold {
+    flex: 1 1 0;
+    min-width: 32px;
+    height: 30px;
+    box-sizing: border-box;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    gap: 5px;
+    padding: 0 8px;
+    border: 0.5px solid transparent;
+    border-radius: 8px;
+    background: transparent;
+    color: var(--text-secondary);
+    font: inherit;
+    font-size: 10.5px;
+    font-weight: 700;
+    white-space: nowrap;
+    cursor: pointer;
+    transition: background 0.14s, color 0.14s;
+  }
+  .mdr-wb-topic-all:hover,
+  .mdr-wb-topic-fold:hover {
+    background: color-mix(in srgb, var(--text-primary) 9%, transparent);
+    color: var(--text-primary);
+  }
+  .mdr-wb-topic-all svg,
+  .mdr-wb-topic-fold svg {
+    flex: 0 0 auto;
+  }
+  .mdr-wb-topic-all span,
+  .mdr-wb-topic-fold span {
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  .mdr-wb-topic-list {
+    display: flex;
+    flex-direction: column;
+    gap: 5px;
+  }
+  /* Topic chips — each carries a subtle surface; the selected one uses accent. */
+  .mdr-wb-topic {
+    box-sizing: border-box;
+    width: 100%;
+    padding: 7px 10px;
+    border: 0.5px solid transparent;
+    border-radius: 8px;
+    background: color-mix(in srgb, var(--text-primary) 5%, transparent);
+    color: var(--text-secondary);
+    font: inherit;
+    font-size: 11.5px;
+    font-weight: 700;
+    line-height: 1.3;
+    text-align: left;
+    cursor: pointer;
+    transition: background 0.14s, color 0.14s, border-color 0.14s;
+  }
+  .mdr-wb-topic:hover {
+    background: color-mix(in srgb, var(--text-primary) 10%, transparent);
+    color: var(--text-primary);
+  }
+  .mdr-wb-topic.is-active {
+    border-color: color-mix(in srgb, var(--accent) 45%, transparent);
+    background: color-mix(in srgb, var(--accent) 13%, transparent);
+    color: var(--text-primary);
+    font-weight: 800;
+  }
+  .mdr-wb-topic.is-active:hover {
+    background: color-mix(in srgb, var(--accent) 18%, transparent);
+    color: var(--text-primary);
+  }
   .mdr-wb-canvas {
     position: relative;
     width: 100%;
@@ -421,8 +532,6 @@
     background: color-mix(in srgb, var(--text-primary) 8%, transparent);
     color: var(--text-primary);
   }
-  .mdr-whiteboard.dense .mdr-wb-canvas { height: 500px; }
-  .mdr-whiteboard.very-dense .mdr-wb-canvas { height: 560px; }
   .mdr-wb-links {
     position: absolute;
     inset: 0;
@@ -430,13 +539,19 @@
     color: color-mix(in srgb, var(--blue) 52%, var(--text-tertiary));
     overflow: visible;
   }
+  /* Relations de-emphasised by default; trunk/hierarchy edges stay visible;
+     selection makes the relevant edges pop. Stroke widths are pixels. */
   .mdr-wb-links line,
   .mdr-wb-links path {
     fill: none;
     stroke: var(--edge-color, currentColor);
-    stroke-width: 0.75;
+    stroke-width: 1.5;
     stroke-linecap: round;
-    opacity: 0.74;
+    opacity: 0.32;
+  }
+  .mdr-wb-links path.trunk {
+    stroke-width: 1.8;
+    opacity: 0.7;
   }
   .mdr-wb-links path.edge-kind-core {
     --edge-color: color-mix(in srgb, var(--text-tertiary) 76%, var(--text-secondary));
@@ -451,12 +566,11 @@
     --edge-color: color-mix(in srgb, var(--text-tertiary) 76%, var(--text-secondary));
   }
   .mdr-wb-links path.edge-source-external {
-    stroke-dasharray: 3 2.2;
-    opacity: 0.64;
+    stroke-dasharray: 5 4;
   }
   .mdr-wb-links path.redundant {
-    stroke-dasharray: 1.6 1.4;
-    opacity: 0.42;
+    stroke-dasharray: 4 4;
+    opacity: 0.2;
   }
   /* Click-to-focus: dim everything outside the selected node's neighbourhood. */
   .mdr-wb-canvas.has-selection .mdr-wb-links path,
@@ -464,8 +578,8 @@
   .mdr-wb-canvas.has-selection .mdr-wb-node {
     transition: opacity 0.16s ease, box-shadow 0.16s ease, border-color 0.16s ease;
   }
-  .mdr-wb-canvas.has-selection .mdr-wb-links path { opacity: 0.12; }
-  .mdr-wb-canvas.has-selection .mdr-wb-links path.is-highlighted { opacity: 0.95; stroke-width: 1.1; }
+  .mdr-wb-canvas.has-selection .mdr-wb-links path { opacity: 0.08; }
+  .mdr-wb-canvas.has-selection .mdr-wb-links path.is-highlighted { opacity: 0.96; stroke-width: 2.6; }
   .mdr-wb-canvas.has-selection .mdr-wb-edge-label { opacity: 0.14; }
   .mdr-wb-canvas.has-selection .mdr-wb-edge-label.is-highlighted { opacity: 1; }
   .mdr-wb-canvas.has-selection .mdr-wb-node { opacity: 0.24; }
@@ -533,16 +647,6 @@
     box-shadow: 0 3px 8px rgba(0, 0, 0, 0.08);
     text-align: center;
   }
-  .mdr-whiteboard.dense .mdr-wb-node {
-    width: 106px;
-    min-height: 58px;
-    padding: 6px 8px;
-  }
-  .mdr-whiteboard.very-dense .mdr-wb-node {
-    width: 94px;
-    min-height: 50px;
-    padding: 5px 6px;
-  }
   .mdr-wb-node.role-main {
     width: 144px;
     min-height: 74px;
@@ -553,14 +657,6 @@
     width: 116px;
     min-height: 62px;
     opacity: 0.94;
-  }
-  .mdr-whiteboard.dense .mdr-wb-node.role-main {
-    width: 126px;
-    min-height: 66px;
-  }
-  .mdr-whiteboard.very-dense .mdr-wb-node.role-main {
-    width: 110px;
-    min-height: 58px;
   }
   .mdr-wb-node.kind-core {
     background: color-mix(in srgb, var(--blue) 14%, var(--bg-primary));
@@ -607,8 +703,27 @@
     line-height: 1.25;
     overflow-wrap: anywhere;
   }
-  .mdr-whiteboard.dense .mdr-wb-node-label { font-size: 11px; }
-  .mdr-whiteboard.very-dense .mdr-wb-node-label { font-size: 10px; }
+  .mdr-wb-node-chips {
+    display: flex;
+    flex-wrap: wrap;
+    justify-content: center;
+    gap: 3px;
+    margin-top: 4px;
+    max-width: 100%;
+  }
+  .mdr-wb-chip {
+    max-width: 100%;
+    padding: 1px 6px;
+    border-radius: 999px;
+    background: color-mix(in srgb, var(--text-tertiary) 15%, transparent);
+    color: var(--text-secondary);
+    font-size: 8.5px;
+    font-weight: 700;
+    line-height: 1.55;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
   .mdr-wb-node-detail {
     max-width: 100%;
     color: var(--text-secondary);
@@ -622,62 +737,10 @@
     overflow: hidden;
     overflow-wrap: anywhere;
   }
-  .mdr-whiteboard.dense .mdr-wb-node-detail {
-    font-size: 9.5px;
-    -webkit-line-clamp: 3;
-    line-clamp: 3;
-  }
-  .mdr-whiteboard.very-dense .mdr-wb-node-detail {
-    display: -webkit-box;
-    font-size: 9px;
-    -webkit-line-clamp: 2;
-    line-clamp: 2;
-  }
-  .mdr-wb-node.node-type-term {
-    width: auto;
-    min-width: 64px;
-    max-width: 96px;
-    min-height: 0;
-    padding: 5px 8px;
-    gap: 0;
-    border-radius: 999px;
-    opacity: 0.86;
-    box-shadow: 0 2px 5px rgba(0, 0, 0, 0.06);
-  }
-  .mdr-whiteboard.dense .mdr-wb-node.node-type-term,
-  .mdr-whiteboard.very-dense .mdr-wb-node.node-type-term {
-    min-width: 54px;
-    max-width: 80px;
-    padding: 4px 7px;
-  }
-  .mdr-wb-node.node-type-term .mdr-wb-node-label {
-    font-size: 10.5px;
-    line-height: 1.18;
-  }
-  .mdr-wb-node.node-type-term .mdr-wb-node-detail {
-    display: none;
-  }
-  .mdr-wb-node.node-type-term:is(:hover, :focus-visible, .is-selected) {
-    max-width: 142px;
-    padding: 7px 9px;
-    border-radius: 8px;
-    opacity: 0.96;
-    z-index: 5;
-  }
-  .mdr-wb-node.node-type-term:is(:hover, :focus-visible, .is-selected) .mdr-wb-node-detail {
-    display: -webkit-box;
-    margin-top: 3px;
-    font-size: 9px;
-    -webkit-line-clamp: 3;
-    line-clamp: 3;
-  }
 
   @media (max-width: 700px) {
     .mdr-wb-canvas { height: 320px; }
-    .mdr-whiteboard.dense .mdr-wb-canvas { height: 400px; }
-    .mdr-whiteboard.very-dense .mdr-wb-canvas { height: 460px; }
     .mdr-wb-node { width: 108px; min-height: 58px; }
-    .mdr-whiteboard.dense .mdr-wb-node { width: 94px; min-height: 50px; }
   }
 </style>
 </head>
@@ -1002,9 +1065,9 @@
           fallbackBoardTitle: '知識整理ボード'
         });
         if (!layout) return;
-        var card = buildWhiteboardCard(layout);
-        card.dataset.whiteboardSource = 'json';
-        pre.replaceWith(card);
+        var block = buildWhiteboardBlock(data, { fallbackBoardTitle: '知識整理ボード' });
+        block.dataset.whiteboardSource = 'json';
+        pre.replaceWith(block);
       });
 
     // Pass 2: bullet-list fallback for legacy saves (no JSON fence). Detect any
@@ -1017,7 +1080,7 @@
       // Already rendered by pass 1?
       var probe = h.nextElementSibling;
       while (probe && !/^H[1-6]$/.test(probe.tagName)) {
-        if (probe.classList && probe.classList.contains('mdr-whiteboard')) return;
+        if (probe.classList && (probe.classList.contains('mdr-whiteboard') || probe.classList.contains('mdr-wb-block'))) return;
         probe = probe.nextElementSibling;
       }
       var board = parseBoardFromBullets(h);
@@ -1026,9 +1089,9 @@
         fallbackBoardTitle: '知識整理ボード'
       });
       if (!layout) return;
-      var card = buildWhiteboardCard(layout);
-      card.dataset.whiteboardSource = 'bullets';
-      h.parentNode.insertBefore(card, h.nextSibling);
+      var block = buildWhiteboardBlock(board, { fallbackBoardTitle: '知識整理ボード' });
+      block.dataset.whiteboardSource = 'bullets';
+      h.parentNode.insertBefore(block, h.nextSibling);
     });
   }
 
@@ -1100,14 +1163,109 @@
   }
 
 
+  // Wraps a whiteboard card with a topic switcher: dense boards carry several
+  // main topics, and the bottom bar shows one (default) or several at a time
+  // instead of cramming every topic onto one canvas. Re-renders on toggle.
+  function buildWhiteboardBlock(rawBoard, computeOpts) {
+    var holder = document.createElement('div');
+    holder.className = 'mdr-wb-block';
+    var WL = window.WhiteboardLayout;
+    if (!WL) return holder;
+    var topicList = WL.topics ? WL.topics(rawBoard) : [];
+    var selected = topicList.length ? [topicList[0].id] : [];
+    var collapsed = false;
+    var ICON = function (w, body) {
+      return '<svg width="' + w + '" height="' + w + '" viewBox="0 0 24 24" fill="none"'
+        + ' stroke="currentColor" stroke-width="2.2" stroke-linecap="round"'
+        + ' stroke-linejoin="round">' + body + '</svg>';
+    };
+    var MENU_ICON = ICON(16, '<line x1="4" y1="7" x2="20" y2="7"/>'
+      + '<line x1="4" y1="12" x2="20" y2="12"/><line x1="4" y1="17" x2="20" y2="17"/>');
+    var FOLD_ICON = ICON(14, '<polyline points="11 7 6 12 11 17"/>'
+      + '<polyline points="18 7 13 12 18 17"/>');
+    var CHECK_ICON = ICON(14, '<rect x="3.5" y="3.5" width="17" height="17" rx="4"/>'
+      + '<path d="M8 12.4l2.9 2.9L16.5 9"/>');
+    var MINUS_ICON = ICON(14, '<rect x="3.5" y="3.5" width="17" height="17" rx="4"/>'
+      + '<path d="M8.2 12h7.6"/>');
+
+    function buildTopicBar() {
+      var bar = document.createElement('div');
+      bar.className = 'mdr-wb-topics' + (collapsed ? ' collapsed' : '');
+
+      var head = document.createElement('div');
+      head.className = 'mdr-wb-topics-head';
+      var allBtn = document.createElement('button');
+      allBtn.type = 'button';
+      allBtn.className = 'mdr-wb-topic-all';
+      var allOn = selected.length >= topicList.length;
+      allBtn.innerHTML = (allOn ? MINUS_ICON : CHECK_ICON)
+        + '<span>' + (allOn ? '選択解除' : 'すべて選択') + '</span>';
+      allBtn.addEventListener('click', function () {
+        var ids = topicList.map(function (t) { return t.id; });
+        selected = selected.length >= ids.length ? ids.slice(0, 1) : ids;
+        render();
+      });
+      var foldBtn = document.createElement('button');
+      foldBtn.type = 'button';
+      foldBtn.className = 'mdr-wb-topic-fold';
+      var foldContent = function () {
+        return collapsed ? MENU_ICON : (FOLD_ICON + '<span>折りたたむ</span>');
+      };
+      foldBtn.setAttribute('aria-label', collapsed ? '展開' : '折りたたむ');
+      foldBtn.innerHTML = foldContent();
+      foldBtn.addEventListener('click', function () {
+        collapsed = !collapsed;
+        bar.classList.toggle('collapsed', collapsed);
+        foldBtn.innerHTML = foldContent();
+        foldBtn.setAttribute('aria-label', collapsed ? '展開' : '折りたたむ');
+      });
+      head.appendChild(foldBtn);
+      head.appendChild(allBtn);
+      bar.appendChild(head);
+
+      var list = document.createElement('div');
+      list.className = 'mdr-wb-topic-list';
+      topicList.forEach(function (t) {
+        var chip = document.createElement('button');
+        chip.type = 'button';
+        chip.className = 'mdr-wb-topic';
+        if (selected.indexOf(t.id) >= 0) chip.classList.add('is-active');
+        chip.textContent = t.label;
+        chip.addEventListener('click', function () {
+          var i = selected.indexOf(t.id);
+          if (i >= 0) {
+            if (selected.length > 1) selected.splice(i, 1); // keep ≥ 1
+          } else {
+            selected.push(t.id);
+          }
+          render();
+        });
+        list.appendChild(chip);
+      });
+      bar.appendChild(list);
+      return bar;
+    }
+
+    function render() {
+      holder.textContent = '';
+      var opts = {};
+      if (computeOpts) { for (var k in computeOpts) opts[k] = computeOpts[k]; }
+      if (topicList.length > 1 && selected.length) opts.topicIds = selected.slice();
+      var layout = WL.compute(rawBoard, opts);
+      if (!layout) return;
+      var card = buildWhiteboardCard(layout);
+      if (topicList.length > 1) card.insertBefore(buildTopicBar(), card.firstChild);
+      holder.appendChild(card);
+    }
+
+    render();
+    return holder;
+  }
+
   function buildWhiteboardCard(layout) {
-    var dense = layout.nodes.length > 8;
-    var veryDense = layout.nodes.length > 14;
-    var stagePreset = whiteboardStagePreset(layout.nodes.length);
+    var stagePreset = whiteboardStagePreset(layout);
     var card = document.createElement('div');
     card.className = 'mdr-whiteboard';
-    if (dense) card.classList.add('dense');
-    if (veryDense) card.classList.add('very-dense');
 
     var canvas = document.createElement('div');
     canvas.className = 'mdr-wb-canvas';
@@ -1122,8 +1280,6 @@
     var edgePathById = {};
     var edgeLabelById = {};
     var nodeElById = {};
-    var edgesById = {};
-    layout.edges.forEach(function (e) { edgesById[e.id] = e; });
 
     function applyHighlight() {
       var hasSel = selectedNodeId != null;
@@ -1153,7 +1309,9 @@
     var svgNS = 'http://www.w3.org/2000/svg';
     var svg = document.createElementNS(svgNS, 'svg');
     svg.setAttribute('class', 'mdr-wb-links');
-    svg.setAttribute('viewBox', '0 0 100 100');
+    svg.setAttribute('viewBox', layout.stage
+      ? ('0 0 ' + layout.stage.width + ' ' + layout.stage.height)
+      : '0 0 100 100');
     svg.setAttribute('preserveAspectRatio', 'none');
     svg.setAttribute('aria-hidden', 'true');
     layout.edges.forEach(function (e) {
@@ -1187,7 +1345,7 @@
     layout.nodes.forEach(function (n) {
       var isExternal = n.sourceType === 'external';
       var node = document.createElement('div');
-      node.className = 'mdr-wb-node kind-' + n.kind + ' role-' + n.role + (n.nodeType === 'term' ? ' node-type-term' : '') + (isExternal ? ' external' : '');
+      node.className = 'mdr-wb-node kind-' + n.kind + ' role-' + n.role + (isExternal ? ' external' : '');
       node.style.left = n.x + '%';
       node.style.top = n.y + '%';
       if (isExternal && n.sourceLabel) {
@@ -1208,6 +1366,18 @@
         det.className = 'mdr-wb-node-detail';
         det.textContent = n.detail;
         node.appendChild(det);
+      }
+      if (n.chips && n.chips.length) {
+        var chipRow = document.createElement('span');
+        chipRow.className = 'mdr-wb-node-chips';
+        n.chips.forEach(function (chip) {
+          var c = document.createElement('span');
+          c.className = 'mdr-wb-chip';
+          c.textContent = chip.label;
+          if (chip.detail) c.title = chip.detail;
+          chipRow.appendChild(c);
+        });
+        node.appendChild(chipRow);
       }
       node.addEventListener('click', function (ev) {
         ev.stopPropagation();
@@ -1249,7 +1419,12 @@
     return card;
   }
 
-  function whiteboardStagePreset(nodeCount) {
+  function whiteboardStagePreset(layout) {
+    // The forest layout reports the exact pixel canvas it was computed for.
+    if (layout && layout.stage) {
+      return { width: layout.stage.width, height: layout.stage.height, zoom: 0.8 };
+    }
+    var nodeCount = layout ? layout.nodes.length : 0;
     if (nodeCount > 14) {
       var extra = nodeCount - 14;
       var spread = Math.sqrt(extra);
