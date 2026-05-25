@@ -154,17 +154,18 @@
     try {
       const detail = await mailFetchMessage(msg.id);
       if (requestId !== detailRequestId) return;
+      const resolvedMessageId = detail.id || msg.id;
       selectedMessage = detail;
       pendingDetailMessage = null;
-      messages = messages.map(m => m.id === msg.id ? { ...m, isRead: true } : m);
+      messages = messages.map(m => (m.id === msg.id || m.id === resolvedMessageId) ? { ...m, isRead: true } : m);
       // Update cache so sidebar badge and notifications view reflect the change
       updateCacheEntry<MailMessage[]>("mail_inbox", (msgs) =>
-        msgs.map(m => m.id === msg.id ? { ...m, isRead: true } : m)
+        msgs.map(m => (m.id === msg.id || m.id === resolvedMessageId) ? { ...m, isRead: true } : m)
       );
       // Fetch attachments in background if any
       if (detail.hasAttachments) {
         attachmentsLoading = true;
-        mailFetchAttachments(msg.id).then(list => {
+        mailFetchAttachments(resolvedMessageId).then(list => {
           if (requestId !== detailRequestId) return;
           attachments = list;
         }).catch(() => {

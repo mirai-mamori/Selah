@@ -157,19 +157,23 @@ pub struct MailClient {
     pub config: MailConfig,
 }
 
-/// Validate a Graph API message ID (alphanumeric, hyphens, underscores, equals, dots).
-/// Real Graph IDs are URL-safe base64 (~150 chars typical) but tenants with long
-/// folder hierarchies can push past 200, so we reserve some headroom.
+/// Validate a Graph API message ID.
+/// Outlook item IDs are base64-like and can include path-sensitive characters,
+/// so callers must URL-encode them before putting them in a Graph path segment.
 pub(crate) fn validate_message_id(id: &str) -> Result<(), String> {
     if id.is_empty()
         || id.len() > 512
         || !id
             .chars()
-            .all(|c| c.is_ascii_alphanumeric() || "-_=.".contains(c))
+            .all(|c| c.is_ascii_alphanumeric() || "-_=.+/".contains(c))
     {
         return Err("無効なメッセージIDです".into());
     }
     Ok(())
+}
+
+fn encode_graph_path_segment(value: &str) -> String {
+    urlencoding::encode(value).into_owned()
 }
 
 /// Validate a Graph API attachment ID.
@@ -475,9 +479,10 @@ impl MailClient {
     /// Fetch a single message detail
     pub async fn fetch_message(&mut self, message_id: &str) -> Result<MailDetail, String> {
         validate_message_id(message_id)?;
+        let encoded_message_id = encode_graph_path_segment(message_id);
         let url = format!(
             "{}/me/messages/{}?$select=id,subject,body,from,receivedDateTime,isRead,hasAttachments,toRecipients,ccRecipients",
-            config::GRAPH_BASE, message_id,
+            config::GRAPH_BASE, encoded_message_id,
         );
         let body = self.graph_get(&url).await?;
         serde_json::from_value(body).map_err(|e| format!("メール詳細解析失敗: {}", e))
@@ -487,7 +492,8 @@ impl MailClient {
     pub async fn mark_as_read(&mut self, message_id: &str) -> Result<(), String> {
         validate_message_id(message_id)?;
         let access_token = self.ensure_token().await?;
-        let url = format!("{}/me/messages/{}", config::GRAPH_BASE, message_id);
+        let encoded_message_id = encode_graph_path_segment(message_id);
+        let url = format!("{}/me/messages/{}", config::GRAPH_BASE, encoded_message_id);
         let body = serde_json::json!({"isRead": true});
         let resp = self
             .http
@@ -558,10 +564,11 @@ impl MailClient {
         message_id: &str,
     ) -> Result<Vec<MailAttachment>, String> {
         validate_message_id(message_id)?;
+        let encoded_message_id = encode_graph_path_segment(message_id);
         let url = format!(
             "{}/me/messages/{}/attachments?$select=id,name,contentType,size",
             config::GRAPH_BASE,
-            message_id,
+            encoded_message_id,
         );
         let body = self.graph_get(&url).await?;
         let resp: GraphListResponse<MailAttachment> =
@@ -579,6 +586,7 @@ impl MailClient {
     ) -> Result<String, String> {
         validate_message_id(message_id)?;
         validate_attachment_id(attachment_id)?;
+        let encoded_message_id = encode_graph_path_segment(message_id);
 
         // Sanitize file name: keep only the basename, replace dangerous chars
         let safe_name: String = std::path::Path::new(file_name)
@@ -603,7 +611,7 @@ impl MailClient {
         let url = format!(
             "{}/me/messages/{}/attachments/{}/$value",
             config::GRAPH_BASE,
-            message_id,
+            encoded_message_id,
             urlencoding::encode(attachment_id),
         );
         let downloads_dir = crate::commands::resolve_download_dir(None);

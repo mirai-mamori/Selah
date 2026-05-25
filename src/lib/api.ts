@@ -2040,6 +2040,72 @@ async function readGeneratedTodos<T>(cacheKey: string): Promise<T[]> {
   }
 }
 
+function commonAsciiSuffixLength(left: string, right: string): number {
+  let count = 0;
+  let i = left.length - 1;
+  let j = right.length - 1;
+  while (i >= 0 && j >= 0 && left.charCodeAt(i) === right.charCodeAt(j)) {
+    count += 1;
+    i -= 1;
+    j -= 1;
+  }
+  return count;
+}
+
+function hasMatchingIdPrefix(partial: string, full: string): boolean {
+  const prefixLength = Math.min(partial.length, 24);
+  return prefixLength >= 8 && full.startsWith(partial.slice(0, prefixLength));
+}
+
+function repairMailSourceUrl(sourceUrl: string, messages: MailMessage[]): string {
+  const trimmed = (sourceUrl || "").trim();
+  if (!trimmed.startsWith("mail://")) return trimmed;
+  const id = trimmed.slice("mail://".length).trim();
+  if (!id || messages.some((msg) => msg.id === id)) return trimmed;
+
+  let bestId = "";
+  let bestScore = 0;
+  let tied = false;
+  for (const msg of messages) {
+    if (!hasMatchingIdPrefix(id, msg.id)) continue;
+    const score = commonAsciiSuffixLength(id, msg.id);
+    if (score < 12) continue;
+    if (score === bestScore) {
+      tied = true;
+    } else if (score > bestScore) {
+      bestId = msg.id;
+      bestScore = score;
+      tied = false;
+    }
+  }
+  return bestId && !tied ? `mail://${bestId}` : trimmed;
+}
+
+async function repairDetailGeneratedTodoSourceUrls(items: DetailGeneratedTodo[]): Promise<DetailGeneratedTodo[]> {
+  const mailTodos = items.filter((item) => item.source_url?.startsWith("mail://"));
+  if (mailTodos.length === 0) return items;
+  const inboxJson = await getDataCache("mail_inbox");
+  if (!inboxJson) return items;
+  let messages: MailMessage[] = [];
+  try {
+    const parsed = JSON.parse(inboxJson);
+    if (Array.isArray(parsed)) messages = parsed;
+  } catch {
+    return items;
+  }
+  if (messages.length === 0) return items;
+
+  let changed = false;
+  const repaired = items.map((item) => {
+    const nextSourceUrl = repairMailSourceUrl(item.source_url || "", messages);
+    if (nextSourceUrl === (item.source_url || "")) return item;
+    changed = true;
+    return { ...item, source_url: nextSourceUrl };
+  });
+  if (changed) await saveDataCache(DETAIL_GENERATED_TODO_KEY, JSON.stringify(repaired));
+  return repaired;
+}
+
 async function writeGeneratedTodos<T>(
   cacheKey: string,
   next: T[],
@@ -2274,7 +2340,8 @@ async function refreshDetailGeneratedTodoCaches(next: DetailGeneratedTodo[]) {
 }
 
 export async function getDetailGeneratedTodos(): Promise<DetailGeneratedTodo[]> {
-  return readGeneratedTodos<DetailGeneratedTodo>(DETAIL_GENERATED_TODO_KEY);
+  const items = await readGeneratedTodos<DetailGeneratedTodo>(DETAIL_GENERATED_TODO_KEY);
+  return repairDetailGeneratedTodoSourceUrls(items);
 }
 
 export async function saveDetailGeneratedTodos(

@@ -377,12 +377,71 @@ pub async fn fetch_message_internal(
     fetch_message_impl(&state, &db, message_id).await
 }
 
+fn common_ascii_suffix_len(a: &str, b: &str) -> usize {
+    a.as_bytes()
+        .iter()
+        .rev()
+        .zip(b.as_bytes().iter().rev())
+        .take_while(|(left, right)| left == right)
+        .count()
+}
+
+fn has_matching_id_prefix(partial: &str, full: &str) -> bool {
+    let prefix_len = partial.len().min(24);
+    prefix_len >= 8 && full.starts_with(&partial[..prefix_len])
+}
+
+fn resolve_cached_message_id(db: &crate::db::Database, message_id: &str) -> String {
+    let trimmed = message_id.trim();
+    let Ok(Some((json, _))) = db.get_data_cache("mail_inbox") else {
+        return trimmed.to_string();
+    };
+    let Ok(messages) = serde_json::from_str::<Vec<MailMessage>>(&json) else {
+        return trimmed.to_string();
+    };
+    if messages.iter().any(|message| message.id == trimmed) {
+        return trimmed.to_string();
+    }
+
+    let mut best: Option<(&str, usize)> = None;
+    let mut tied = false;
+    for message in &messages {
+        if !has_matching_id_prefix(trimmed, &message.id) {
+            continue;
+        }
+        let score = common_ascii_suffix_len(trimmed, &message.id);
+        if score < 12 {
+            continue;
+        }
+        match best {
+            Some((_, best_score)) if score == best_score => tied = true,
+            Some((_, best_score)) if score <= best_score => {}
+            _ => {
+                best = Some((message.id.as_str(), score));
+                tied = false;
+            }
+        }
+    }
+
+    if !tied {
+        if let Some((id, score)) = best {
+            log::info!(
+                "mail_fetch_message: repaired cached message id by suffix match ({} chars)",
+                score
+            );
+            return id.to_string();
+        }
+    }
+    trimmed.to_string()
+}
+
 async fn fetch_message_impl(
     state: &MailState,
     db: &crate::db::Database,
     message_id: &str,
 ) -> Result<MailDetail, String> {
-    mail::validate_message_id(message_id)?;
+    let message_id = resolve_cached_message_id(db, message_id);
+    mail::validate_message_id(&message_id)?;
     let cache_key = format!("mail_msg:{}", message_id);
 
     // Phase 1: short lock – auth check, mark_as_read (fast PATCH), prepare token
@@ -398,7 +457,7 @@ async fn fetch_message_impl(
             return Err(config::MAIL_AUTH_REQUIRED_MSG.into());
         }
         // Mark as read while we hold the lock (best-effort, fast PATCH)
-        if let Err(e) = mail.mark_as_read(message_id).await {
+        if let Err(e) = mail.mark_as_read(&message_id).await {
             log::warn!("Failed to mark message {} as read: {}", message_id, e);
         }
         mail.prepare_http().await
@@ -406,15 +465,16 @@ async fn fetch_message_impl(
     let (http, token) = prep?;
 
     // Phase 2: lock-free fetch message (the heavier GET)
+    let encoded_message_id = urlencoding::encode(&message_id);
     let url = format!(
         "{}/me/messages/{}?$select=id,subject,body,from,receivedDateTime,isRead,hasAttachments,toRecipients,ccRecipients",
-        config::GRAPH_BASE, message_id,
+        config::GRAPH_BASE, encoded_message_id,
     );
     let body = match mail::graph_get_lockfree(&http, &url, &token).await {
         Ok(body) => body,
         Err((_, true)) => {
             let mut mail = state.client.lock().await;
-            match mail.fetch_message(message_id).await {
+            match mail.fetch_message(&message_id).await {
                 Ok(data) => {
                     if let Ok(json) = serde_json::to_string(&data) {
                         let _ = db.save_data_cache(&cache_key, &json);

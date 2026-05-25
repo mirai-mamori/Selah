@@ -521,7 +521,7 @@ Lunaに届いた最新の「お知らせ」「掲示板スレッド（メッセ�
       "course_name": "科目名（course_info そのまま）。メール由来でコース不明なら差出人名を入れる",
       "content_type": "課題|お知らせ|掲示板|テスト|アンケート|メール",
       "deadline": "YYYY-MM-DD HH:MM（時刻不明なら YYYY-MM-DD 23:59）",
-      "source_url": "Luna 由来なら通知の url。メール由来なら 'mail://<mail_id>' 形式",
+      "source_url": "Luna 由来なら通知の url。メール由来ならメール一覧に書かれた 'mail://M数字' をそのまま",
       "source_excerpt": "通知の content や メールの subject/preview から該当箇所を 60〜140 字程度で抜粋",
       "note": "なぜこれをTODOと判断したかを 1 文（学生に提示する補足説明、20〜60字）"
     }
@@ -551,7 +551,7 @@ const LOCAL_DETAIL_TODO_SYSTEM_PROMPT: &str = r#"Lunaの「お知らせ・掲示
       "course_name": "科目名 (メールならコース不明時に差出人名)",
       "content_type": "課題|お知らせ|掲示板|テスト|アンケート|メール",
       "deadline": "YYYY-MM-DD HH:MM",
-      "source_url": "通知のurl または 'mail://<mail_id>'",
+      "source_url": "通知のurl または メール一覧に書かれた 'mail://M数字'",
       "source_excerpt": "原文の60〜140字抜粋",
       "note": "判断理由1文"
     }
@@ -728,11 +728,81 @@ fn build_detail_todo_prompt(
                     }
                 }
             }
-            text.push_str(&format!("mail_id: {}\n\n", m.id));
+            text.push_str(&format!("source_url: mail://M{idx}\n\n", idx = idx));
         }
     }
 
     text
+}
+
+fn common_ascii_suffix_len(a: &str, b: &str) -> usize {
+    a.as_bytes()
+        .iter()
+        .rev()
+        .zip(b.as_bytes().iter().rev())
+        .take_while(|(left, right)| left == right)
+        .count()
+}
+
+fn has_matching_id_prefix(partial: &str, full: &str) -> bool {
+    let prefix_len = partial.len().min(24);
+    prefix_len >= 8 && full.starts_with(&partial[..prefix_len])
+}
+
+fn resolve_mail_source_url(
+    source_url: &str,
+    mails: &[(usize, &crate::mail::MailMessage)],
+) -> String {
+    let trimmed = source_url.trim();
+    let Some(raw) = trimmed.strip_prefix("mail://") else {
+        return trimmed.to_string();
+    };
+    let raw = raw.trim();
+    if let Some(label) = raw.strip_prefix('M') {
+        if let Ok(idx) = label.parse::<usize>() {
+            if let Some((_, mail)) = mails.iter().find(|(mail_idx, _)| *mail_idx == idx) {
+                return format!("mail://{}", mail.id);
+            }
+        }
+    }
+    if mails.iter().any(|(_, mail)| mail.id == raw) {
+        return format!("mail://{}", raw);
+    }
+
+    let mut best: Option<(&str, usize)> = None;
+    let mut tied = false;
+    for (_, mail) in mails {
+        if !has_matching_id_prefix(raw, &mail.id) {
+            continue;
+        }
+        let score = common_ascii_suffix_len(raw, &mail.id);
+        if score < 12 {
+            continue;
+        }
+        match best {
+            Some((_, best_score)) if score == best_score => tied = true,
+            Some((_, best_score)) if score <= best_score => {}
+            _ => {
+                best = Some((mail.id.as_str(), score));
+                tied = false;
+            }
+        }
+    }
+    if !tied {
+        if let Some((id, _)) = best {
+            return format!("mail://{}", id);
+        }
+    }
+    trimmed.to_string()
+}
+
+fn normalize_detail_todo_source_urls(
+    items: &mut [DetailTodoSuggestion],
+    mails: &[(usize, &crate::mail::MailMessage)],
+) {
+    for item in items {
+        item.source_url = resolve_mail_source_url(&item.source_url, mails);
+    }
 }
 
 #[tauri::command]
@@ -782,9 +852,10 @@ pub async fn ai_extract_detail_todos(
                         == Some(fingerprint.as_str())
                     {
                         if let Some(items) = cached.get("items") {
-                            if let Ok(parsed) =
+                            if let Ok(mut parsed) =
                                 serde_json::from_value::<Vec<DetailTodoSuggestion>>(items.clone())
                             {
+                                normalize_detail_todo_source_urls(&mut parsed, &mail_refs);
                                 log::info!(
                                     "ai_extract_detail_todos: cache hit (age={}s, items={})",
                                     now - ts,
@@ -876,6 +947,7 @@ pub async fn ai_extract_detail_todos(
 
     // Drop items without a parseable deadline — the prompt requires one, this enforces it.
     items.retain(|item| !item.deadline.trim().is_empty() && !item.title.trim().is_empty());
+    normalize_detail_todo_source_urls(&mut items, &mail_refs);
 
     let cache_value = serde_json::json!({
         "items": items,
@@ -2415,5 +2487,43 @@ mod tests {
         assert_eq!(normalized["task_guides"][0]["ready_to_use_label"], "提纲");
         assert_eq!(normalized["daily_plan"][0]["free_hours"], 3.5);
         assert_eq!(normalized["advice"], "先に着手する。");
+    }
+
+    #[test]
+    fn resolve_mail_source_url_maps_labels_and_ai_shortened_ids() {
+        let mail_a = crate::mail::MailMessage {
+            id: "AAMkPREFIX0123456789ABCDEFAAAAAAEMAABMIDDLEAAAlqnniAAA=".into(),
+            subject: None,
+            body_preview: None,
+            body: None,
+            from: None,
+            received_date_time: None,
+            is_read: Some(false),
+            has_attachments: None,
+        };
+        let mail_b = crate::mail::MailMessage {
+            id: "AAMkPREFIX0123456789ABCDEFAAAAAAEMAABMIDDLEAAAhuNzfAAA=".into(),
+            subject: None,
+            body_preview: None,
+            body: None,
+            from: None,
+            received_date_time: None,
+            is_read: Some(false),
+            has_attachments: None,
+        };
+        let mails = vec![(2, &mail_a), (18, &mail_b)];
+
+        assert_eq!(
+            resolve_mail_source_url("mail://M18", &mails),
+            "mail://AAMkPREFIX0123456789ABCDEFAAAAAAEMAABMIDDLEAAAhuNzfAAA="
+        );
+        assert_eq!(
+            resolve_mail_source_url("mail://AAMkPREFIX0123456789ABCDEFAAAhuNzfAAA=", &mails),
+            "mail://AAMkPREFIX0123456789ABCDEFAAAAAAEMAABMIDDLEAAAhuNzfAAA="
+        );
+        assert_eq!(
+            resolve_mail_source_url("mail://WRONGPREFIX0123456789ABCDEFAAAhuNzfAAA=", &mails),
+            "mail://WRONGPREFIX0123456789ABCDEFAAAhuNzfAAA="
+        );
     }
 }

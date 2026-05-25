@@ -607,12 +607,83 @@ async function loadLiveGeneratedTodos(): Promise<any[]> {
   }
 }
 
+function commonAsciiSuffixLength(left: string, right: string): number {
+  let count = 0;
+  let i = left.length - 1;
+  let j = right.length - 1;
+  while (i >= 0 && j >= 0 && left.charCodeAt(i) === right.charCodeAt(j)) {
+    count += 1;
+    i -= 1;
+    j -= 1;
+  }
+  return count;
+}
+
+function hasMatchingIdPrefix(partial: string, full: string): boolean {
+  const prefixLength = Math.min(partial.length, 24);
+  return prefixLength >= 8 && full.startsWith(partial.slice(0, prefixLength));
+}
+
+function repairMailSourceUrl(sourceUrl: string, messages: any[]): string {
+  const trimmed = String(sourceUrl || "").trim();
+  if (!trimmed.startsWith("mail://")) return trimmed;
+  const id = trimmed.slice("mail://".length).trim();
+  if (!id || messages.some((msg) => msg?.id === id)) return trimmed;
+
+  let bestId = "";
+  let bestScore = 0;
+  let tied = false;
+  for (const msg of messages) {
+    const candidate = String(msg?.id || "");
+    if (!hasMatchingIdPrefix(id, candidate)) continue;
+    const score = commonAsciiSuffixLength(id, candidate);
+    if (score < 12) continue;
+    if (score === bestScore) {
+      tied = true;
+    } else if (score > bestScore) {
+      bestId = candidate;
+      bestScore = score;
+      tied = false;
+    }
+  }
+  return bestId && !tied ? `mail://${bestId}` : trimmed;
+}
+
+async function repairDetailGeneratedTodoSourceUrls(items: any[]): Promise<any[]> {
+  if (!items.some((item) => String(item?.source_url || "").startsWith("mail://"))) return items;
+  const inboxJson = await invoke<string | null>("get_data_cache", { key: "mail_inbox" });
+  if (!inboxJson) return items;
+  let messages: any[] = [];
+  try {
+    const parsed = JSON.parse(inboxJson);
+    if (Array.isArray(parsed)) messages = parsed;
+  } catch {
+    return items;
+  }
+  if (messages.length === 0) return items;
+
+  let changed = false;
+  const repaired = items.map((item) => {
+    const nextSourceUrl = repairMailSourceUrl(item?.source_url || "", messages);
+    if (nextSourceUrl === (item?.source_url || "")) return item;
+    changed = true;
+    return { ...item, source_url: nextSourceUrl };
+  });
+  if (changed) {
+    await invoke("save_data_cache", {
+      key: DETAIL_GENERATED_TODO_KEY,
+      json: JSON.stringify(repaired),
+    });
+  }
+  return repaired;
+}
+
 async function loadDetailGeneratedTodos(): Promise<any[]> {
   try {
     const json = await invoke<string | null>("get_data_cache", { key: DETAIL_GENERATED_TODO_KEY });
     if (!json) return [];
     const parsed = JSON.parse(json);
-    return Array.isArray(parsed) ? parsed : [];
+    return Array.isArray(parsed) ? await repairDetailGeneratedTodoSourceUrls(parsed) : [];
   } catch {
     return [];
   }

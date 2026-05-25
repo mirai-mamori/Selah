@@ -2362,8 +2362,7 @@ mod tests {
             "lecture",
             "既存の根拠",
         )]);
-        let mut term_node =
-            test_whiteboard_node("term-source", "一次資料", "term", "lecture", "");
+        let mut term_node = test_whiteboard_node("term-source", "一次資料", "term", "lecture", "");
         term_node.parent_id = "old".to_string();
         let mut external_node =
             test_whiteboard_node("external", "外部補足", "structure", "external", "");
@@ -2371,13 +2370,7 @@ mod tests {
         let board = test_whiteboard(vec![
             test_whiteboard_node("old", "既存ノード", "structure", "lecture", ""),
             term_node,
-            test_whiteboard_node(
-                "theme",
-                "個人発表のテーマ選定",
-                "structure",
-                "lecture",
-                "",
-            ),
+            test_whiteboard_node("theme", "個人発表のテーマ選定", "structure", "lecture", ""),
             external_node,
         ]);
         let terms = vec![LiveTermExplanation {
@@ -2388,8 +2381,7 @@ mod tests {
         }];
         let lines = vec![LiveTranscriptLine {
             at: "12:00:00".to_string(),
-            text: "個人発表のテーマ選定では、賛否が分かれる問いを選んでください。"
-                .to_string(),
+            text: "個人発表のテーマ選定では、賛否が分かれる問いを選んでください。".to_string(),
         }];
 
         let enriched =
