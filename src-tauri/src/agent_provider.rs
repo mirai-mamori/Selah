@@ -8,11 +8,14 @@
 //! so switching between local and remote is transparent.
 
 use crate::agent_error::AgentError;
+use crate::agent_text;
 use crate::ai::{AiConfig, ChatMessage};
 use crate::local_ai;
 
 use std::collections::HashSet;
 use std::sync::{Arc, LazyLock, Mutex};
+
+const CANCELLED_MSG: &str = "推論はキャンセルされました";
 
 // ─────────────────────── Cancel registry (remote) ───────────────────────
 
@@ -136,17 +139,26 @@ impl AgentProvider {
                 })
                 .await
                 .map_err(AgentError::task)?
-                .map_err(AgentError::model)
+                .map_err(agent_error_from_model)
             }
             Self::Remote { config } => {
                 let plan_id = plan_gen_id(gen_id);
                 clear_remote_cancel(&plan_id);
-                let result =
-                    remote_chat_completion(config, messages, max_tokens, temperature, &plan_id)
-                        .await
-                        .map_err(AgentError::model);
+                let result = remote_chat_completion(
+                    config,
+                    messages,
+                    max_tokens,
+                    temperature,
+                    &plan_id,
+                    true,
+                )
+                .await;
+                let cancelled = is_remote_cancelled(&plan_id);
                 clear_remote_cancel(&plan_id);
-                result
+                if cancelled {
+                    return Err(AgentError::Cancelled);
+                }
+                result.map_err(agent_error_from_model)
             }
         }
     }
@@ -188,13 +200,19 @@ impl AgentProvider {
                 })
                 .await
                 .map_err(AgentError::task)?
-                .map_err(AgentError::model)
+                .map_err(agent_error_from_model)
             }
             Self::Remote { config } => {
                 let gen_id = gen_id.to_string();
                 remote_stream_answer(config, messages, &gen_id, on_chunk, think_budget_pct)
                     .await
-                    .map_err(AgentError::model)
+                    .map_err(|e| {
+                        if e == CANCELLED_MSG {
+                            AgentError::Cancelled
+                        } else {
+                            AgentError::model(e)
+                        }
+                    })
             }
         }
     }
@@ -216,6 +234,14 @@ impl AgentProvider {
     /// OpenAI/Gemini cannot, so the planner prompt must ask for a full object.
     pub fn supports_prefill(&self) -> bool {
         matches!(self, Self::Local { .. })
+    }
+}
+
+fn agent_error_from_model(e: String) -> AgentError {
+    if e == CANCELLED_MSG {
+        AgentError::Cancelled
+    } else {
+        AgentError::model(e)
     }
 }
 
@@ -242,12 +268,15 @@ async fn remote_chat_completion(
     max_tokens: u32,
     temperature: f32,
     cancel_id: &str,
+    json_mode: bool,
 ) -> Result<String, String> {
     if !cancel_id.is_empty() && is_remote_cancelled(cancel_id) {
         return Err("推論はキャンセルされました".into());
     }
     match config.provider.as_str() {
-        "gemini" => remote_gemini_non_streaming(config, messages, max_tokens, temperature).await,
+        "gemini" => {
+            remote_gemini_non_streaming(config, messages, max_tokens, temperature, json_mode).await
+        }
         _ => remote_openai_non_streaming(config, messages, max_tokens, temperature).await,
     }
 }
@@ -298,6 +327,7 @@ async fn remote_gemini_non_streaming(
     messages: Vec<ChatMessage>,
     max_tokens: u32,
     temperature: f32,
+    json_mode: bool,
 ) -> Result<String, String> {
     let model = urlencoding::encode(&config.model);
     let url = format!(
@@ -307,7 +337,7 @@ async fn remote_gemini_non_streaming(
     let system_text: Vec<String> = messages
         .iter()
         .filter(|m| m.role == "system")
-        .map(|m| m.content.clone())
+        .map(|m| agent_text::neutralize_pseudo_tool_calls(&m.content))
         .collect();
     let system_instruction = if system_text.is_empty() {
         serde_json::Value::Null
@@ -323,7 +353,7 @@ async fn remote_gemini_non_streaming(
         .map(|m| {
             serde_json::json!({
                 "role": if m.role == "assistant" { "model" } else { "user" },
-                "parts": [{ "text": m.content }]
+                "parts": [{ "text": agent_text::neutralize_pseudo_tool_calls(&m.content) }]
             })
         })
         .collect();
@@ -334,6 +364,10 @@ async fn remote_gemini_non_streaming(
             "temperature": temperature,
         },
     });
+    if json_mode {
+        body["generationConfig"]["responseMimeType"] =
+            serde_json::Value::String("application/json".into());
+    }
     if !system_instruction.is_null() {
         body["systemInstruction"] = system_instruction;
     }
@@ -362,6 +396,13 @@ async fn remote_gemini_non_streaming(
             .and_then(|c| c.get("parts")),
     );
     if content.is_empty() {
+        if let Some(call) = gemini_malformed_function_call(&v) {
+            log::warn!(
+                "[agent answer] gemini returned MALFORMED_FUNCTION_CALL; forwarding pseudo call to executor: {}",
+                truncate(&call, 200)
+            );
+            return Ok(call);
+        }
         return Err(format!(
             "AIからの応答がありません: {}",
             truncate(&text, 300)
@@ -398,9 +439,13 @@ where
         _ => remote_openai_stream(config, stream_messages, gen_id, stream_callback).await,
     };
     flush();
+    let cancelled = is_remote_cancelled(gen_id);
     clear_remote_cancel(gen_id);
+    if cancelled {
+        return Err(CANCELLED_MSG.into());
+    }
     let answer = result?;
-    if answer.trim().is_empty() && !is_remote_cancelled(gen_id) {
+    if answer.trim().is_empty() {
         log::warn!(
             "[agent answer] streaming produced empty visible text; falling back to non-streaming provider={}",
             config.provider
@@ -415,8 +460,15 @@ where
             },
             config.temperature,
             gen_id,
+            false,
         )
         .await?;
+        if agent_text::contains_leading_pseudo_tool_call(&fallback) {
+            log::warn!(
+                "[agent answer] non-streaming fallback returned pseudo tool call; returning without emitting"
+            );
+            return Ok(fallback);
+        }
         if !fallback.is_empty() {
             let callback_for_fallback = callback.clone();
             let (mut feed, mut flush_fb) =
@@ -434,7 +486,7 @@ where
     Ok(answer)
 }
 
-/// Stateful `<think>...</think>` splitter: routes content inside the block to
+/// Stateful thinking-tag splitter: routes content inside the block to
 /// `on_chunk(text, true)` and everything else to `on_chunk(text, false)`.
 /// Tolerates tag boundaries that cross chunks.
 struct ThinkFilter<F: FnMut(&str, bool) + Send + 'static> {
@@ -446,7 +498,7 @@ struct ThinkFilter<F: FnMut(&str, bool) + Send + 'static> {
 impl<F: FnMut(&str, bool) + Send + 'static> ThinkFilter<F> {
     /// Returns `(feed, flush)`. `feed(chunk, is_think)` ingests a chunk;
     /// `flush()` drains any buffered tail (call it once the upstream stream
-    /// has ended so a trailing partial `<think>` block is not silently lost).
+    /// has ended so a trailing partial thinking block is not silently lost).
     // The return-tuple type expresses exactly what callers consume; abstracting
     // into a `type` alias would just rename it without simplifying the API.
     #[allow(clippy::type_complexity)]
@@ -481,17 +533,16 @@ impl<F: FnMut(&str, bool) + Send + 'static> ThinkFilter<F> {
     fn drain(&mut self, flush: bool) {
         loop {
             if self.in_think {
-                if let Some(idx) = self.buf.find("</think>") {
+                if let Some((idx, tag_len)) = agent_text::find_thinking_end_tag(&self.buf) {
                     let inside = self.buf[..idx].to_string();
                     if !inside.is_empty() {
                         (self.inner)(&inside, true);
                     }
-                    self.buf.drain(..idx + "</think>".len());
+                    self.buf.drain(..idx + tag_len);
                     self.in_think = false;
                     continue;
                 }
-                // Hold back last 8 chars in case "</think>" straddles chunks.
-                let hold = holdback(&self.buf, 8);
+                let hold = agent_text::holdback(&self.buf, agent_text::THINKING_TAG_HOLDBACK);
                 if hold > 0 {
                     let emit = self.buf[..hold].to_string();
                     (self.inner)(&emit, true);
@@ -503,16 +554,16 @@ impl<F: FnMut(&str, bool) + Send + 'static> ThinkFilter<F> {
                 }
                 return;
             } else {
-                if let Some(idx) = self.buf.find("<think>") {
+                if let Some((idx, tag_len)) = agent_text::find_thinking_start_tag(&self.buf) {
                     let before = self.buf[..idx].to_string();
                     if !before.is_empty() {
                         (self.inner)(&before, false);
                     }
-                    self.buf.drain(..idx + "<think>".len());
+                    self.buf.drain(..idx + tag_len);
                     self.in_think = true;
                     continue;
                 }
-                let hold = holdback(&self.buf, 7);
+                let hold = agent_text::holdback(&self.buf, agent_text::THINKING_TAG_HOLDBACK);
                 if hold > 0 {
                     let emit = self.buf[..hold].to_string();
                     (self.inner)(&emit, false);
@@ -526,20 +577,6 @@ impl<F: FnMut(&str, bool) + Send + 'static> ThinkFilter<F> {
             }
         }
     }
-}
-
-/// Return the byte index up to which it's safe to emit, keeping `keep` bytes
-/// in reserve at the tail (so a partial tag isn't cut in half).
-fn holdback(s: &str, keep: usize) -> usize {
-    if s.len() <= keep {
-        return 0;
-    }
-    let cutoff = s.len() - keep;
-    let mut idx = cutoff;
-    while idx > 0 && !s.is_char_boundary(idx) {
-        idx -= 1;
-    }
-    idx
 }
 
 /// OpenAI-compatible SSE streaming (`stream: true`).
@@ -647,7 +684,7 @@ where
     let system_text: Vec<String> = messages
         .iter()
         .filter(|m| m.role == "system")
-        .map(|m| m.content.clone())
+        .map(|m| agent_text::neutralize_pseudo_tool_calls(&m.content))
         .collect();
     let system_instruction = if system_text.is_empty() {
         serde_json::Value::Null
@@ -663,7 +700,7 @@ where
         .map(|m| {
             serde_json::json!({
                 "role": if m.role == "assistant" { "model" } else { "user" },
-                "parts": [{ "text": m.content }]
+                "parts": [{ "text": agent_text::neutralize_pseudo_tool_calls(&m.content) }]
             })
         })
         .collect();
@@ -695,6 +732,7 @@ where
 
     let mut full_text = String::new();
     let mut buffer = String::new();
+    let mut malformed_call: Option<String> = None;
     let mut byte_stream = resp.bytes_stream();
     use futures_util::StreamExt;
 
@@ -711,6 +749,15 @@ where
 
             if let Some(data) = line.strip_prefix("data: ") {
                 if let Ok(v) = serde_json::from_str::<serde_json::Value>(data) {
+                    if let Some(call) = gemini_malformed_function_call(&v) {
+                        log::warn!(
+                            "[agent answer] gemini stream returned MALFORMED_FUNCTION_CALL; forwarding pseudo call to executor: {}",
+                            truncate(&call, 200)
+                        );
+                        malformed_call = Some(call);
+                        buffer.clear();
+                        break;
+                    }
                     let text = collect_gemini_text_parts(
                         v.get("candidates")
                             .and_then(|c| c.get(0))
@@ -724,8 +771,14 @@ where
                 }
             }
         }
+        if malformed_call.is_some() {
+            break;
+        }
     }
 
+    if let Some(call) = malformed_call {
+        return Ok(call);
+    }
     Ok(full_text)
 }
 
@@ -735,5 +788,159 @@ fn truncate(s: &str, max: usize) -> String {
     match s.char_indices().nth(max) {
         Some((i, _)) => format!("{}...", &s[..i]),
         None => s.to_string(),
+    }
+}
+
+fn gemini_malformed_function_call(v: &serde_json::Value) -> Option<String> {
+    v.get("candidates")?
+        .as_array()?
+        .iter()
+        .find_map(|candidate| {
+            let reason = candidate.get("finishReason")?.as_str()?;
+            if reason != "MALFORMED_FUNCTION_CALL" {
+                return None;
+            }
+            let message = candidate.get("finishMessage")?.as_str()?;
+            extract_pseudo_call_from_finish_message(message)
+        })
+}
+
+fn extract_pseudo_call_from_finish_message(message: &str) -> Option<String> {
+    let message = message
+        .trim()
+        .strip_prefix("Malformed function call:")
+        .unwrap_or(message)
+        .trim();
+    agent_text::extract_pseudo_call_from_text(message)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn extracts_gemini_malformed_call_finish_message() {
+        let payload = serde_json::json!({
+            "candidates": [{
+                "content": {},
+                "finishReason": "MALFORMED_FUNCTION_CALL",
+                "finishMessage": "Malformed function call: call:read_downloaded_file {\"path\":\"/tmp/a.md\"}"
+            }]
+        });
+
+        assert_eq!(
+            gemini_malformed_function_call(&payload).as_deref(),
+            Some("call:read_downloaded_file {\"path\":\"/tmp/a.md\"}")
+        );
+    }
+
+    #[test]
+    fn ignores_non_malformed_gemini_finish_message() {
+        let payload = serde_json::json!({
+            "candidates": [{
+                "finishReason": "STOP",
+                "finishMessage": "call:read_downloaded_file {\"path\":\"/tmp/a.md\"}"
+            }]
+        });
+
+        assert!(gemini_malformed_function_call(&payload).is_none());
+    }
+
+    #[test]
+    fn scans_all_gemini_candidates_for_malformed_call() {
+        let payload = serde_json::json!({
+            "candidates": [
+                {
+                    "finishReason": "STOP",
+                    "finishMessage": "not a call"
+                },
+                {
+                    "finishReason": "MALFORMED_FUNCTION_CALL",
+                    "finishMessage": "Malformed function call: task_call:list_downloaded_files(limit=5)"
+                }
+            ]
+        });
+
+        assert_eq!(
+            gemini_malformed_function_call(&payload).as_deref(),
+            Some("task_call:list_downloaded_files(limit=5)")
+        );
+    }
+
+    #[test]
+    fn extracts_call_space_from_malformed_function_call() {
+        let payload = serde_json::json!({
+            "candidates": [{
+                "content": {},
+                "finishReason": "MALFORMED_FUNCTION_CALL",
+                "finishMessage": "Malformed function call: call get_course_context {luna_id: \"2026341390020201\"}"
+            }]
+        });
+
+        assert_eq!(
+            gemini_malformed_function_call(&payload).as_deref(),
+            Some("call get_course_context {luna_id: \"2026341390020201\"}")
+        );
+    }
+
+    #[test]
+    fn extracts_fullwidth_colon_from_malformed_function_call() {
+        let payload = serde_json::json!({
+            "candidates": [{
+                "content": {},
+                "finishReason": "MALFORMED_FUNCTION_CALL",
+                "finishMessage": "Malformed function call: call：read_file〔path: \"/tmp/a.pdf\"〕"
+            }]
+        });
+
+        assert_eq!(
+            gemini_malformed_function_call(&payload).as_deref(),
+            Some("call：read_file〔path: \"/tmp/a.pdf\"〕")
+        );
+    }
+
+    #[test]
+    fn think_filter_routes_thought_tags_to_thinking_stream() {
+        let chunks = std::sync::Arc::new(std::sync::Mutex::new(Vec::<(String, bool)>::new()));
+        let captured = chunks.clone();
+        let (mut feed, mut flush) = ThinkFilter::wrap_with_flush(move |chunk, is_think| {
+            captured.lock().unwrap().push((chunk.to_string(), is_think));
+        });
+
+        feed("visible <thought>hidden", false);
+        feed("</thought> done", false);
+        flush();
+
+        let actual = chunks.lock().unwrap().clone();
+        assert_eq!(
+            actual,
+            vec![
+                ("visible ".to_string(), false),
+                ("hidden".to_string(), true),
+                (" done".to_string(), false),
+            ]
+        );
+    }
+
+    #[test]
+    fn think_filter_routes_malformed_thought_prefix_to_thinking_stream() {
+        let chunks = std::sync::Arc::new(std::sync::Mutex::new(Vec::<(String, bool)>::new()));
+        let captured = chunks.clone();
+        let (mut feed, mut flush) = ThinkFilter::wrap_with_flush(move |chunk, is_think| {
+            captured.lock().unwrap().push((chunk.to_string(), is_think));
+        });
+
+        feed("<thoughtThe user wants tools", false);
+        flush();
+
+        let actual = chunks.lock().unwrap().clone();
+        assert!(actual.iter().all(|(_, is_think)| *is_think));
+        assert_eq!(
+            actual
+                .iter()
+                .map(|(chunk, _)| chunk.as_str())
+                .collect::<String>(),
+            "The user wants tools"
+        );
     }
 }

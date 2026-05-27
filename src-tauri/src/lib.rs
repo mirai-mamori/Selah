@@ -6,6 +6,8 @@ mod agent_commands;
 mod agent_error;
 mod agent_prompts;
 mod agent_provider;
+mod agent_pseudo_call;
+mod agent_text;
 mod agent_tools;
 pub mod ai;
 mod ai_refresh;

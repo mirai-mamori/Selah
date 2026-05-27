@@ -255,9 +255,10 @@ pub(super) async fn get_luna_activity_detail(
         .and_then(|v| v.as_str())
         .unwrap_or("")
         .trim();
-    if title.is_empty() {
-        return Err("titleを指定してください".into());
-    }
+    let luna_id_arg = args
+        .get("luna_id")
+        .and_then(|v| v.as_str())
+        .map(|s| s.trim());
 
     let db = app.state::<Database>();
     let acts = db.get_all_luna_activities().unwrap_or_default();
@@ -265,17 +266,69 @@ pub(super) async fn get_luna_activity_detail(
         return Err("Luna活動データがまだ同期されていません".into());
     }
 
+    // Filter acts by luna_id if it's explicitly specified in arguments (helps matching identical titles across courses)
+    let filtered_acts: Vec<_> = if let Some(lid) = luna_id_arg {
+        if !lid.is_empty() {
+            acts.into_iter().filter(|a| a.luna_id == lid).collect()
+        } else {
+            acts
+        }
+    } else {
+        acts
+    };
+
+    if filtered_acts.is_empty() {
+        return Err("指定されたluna_idに一致するLuna活動データが存在しません".into());
+    }
+
+    // We can also have an optional activity_type arg if specified
+    let activity_type_arg = args
+        .get("activity_type")
+        .and_then(|v| v.as_str())
+        .map(|s| s.trim());
+
+    let final_acts: Vec<_> = if let Some(atype) = activity_type_arg {
+        if !atype.is_empty() {
+            filtered_acts
+                .into_iter()
+                .filter(|a| a.activity_type == atype)
+                .collect()
+        } else {
+            filtered_acts
+        }
+    } else {
+        filtered_acts
+    };
+
+    if final_acts.is_empty() {
+        return Err("指定されたactivity_typeに一致するLuna活動データが存在しません".into());
+    }
+
+    if title.is_empty() {
+        // If title is empty but we have unique luna_id + activity_type, we can fall back to the first one
+        if final_acts.len() == 1 {
+            let row = &final_acts[0];
+            if row.detail_path.is_empty() {
+                return Err("詳細ページのパスが記録されていません".into());
+            }
+            return fetch_and_parse_detail(app, row, db).await;
+        }
+        return Err("titleを指定してください".into());
+    }
+
     // Find best match: exact -> contains(title) -> contains(fragment).
     let needle = title.to_lowercase();
-    let best = acts
+    let best = final_acts
         .iter()
         .find(|a| a.title == title)
         .or_else(|| {
-            acts.iter()
+            final_acts
+                .iter()
                 .find(|a| a.title.to_lowercase().contains(&needle))
         })
         .or_else(|| {
-            acts.iter()
+            final_acts
+                .iter()
                 .find(|a| needle.contains(&a.title.to_lowercase()) && !a.title.is_empty())
         });
 
@@ -288,7 +341,11 @@ pub(super) async fn get_luna_activity_detail(
             ));
         }
         None => {
-            let candidates: Vec<&str> = acts.iter().take(10).map(|a| a.title.as_str()).collect();
+            let candidates: Vec<&str> = final_acts
+                .iter()
+                .take(10)
+                .map(|a| a.title.as_str())
+                .collect();
             return Err(format!(
                 "「{}」に一致する活動が見つかりませんでした。候補: {}",
                 title,
@@ -297,6 +354,14 @@ pub(super) async fn get_luna_activity_detail(
         }
     };
 
+    fetch_and_parse_detail(app, row, db).await
+}
+
+async fn fetch_and_parse_detail(
+    app: &tauri::AppHandle,
+    row: &crate::db::LunaActivityRow,
+    db: tauri::State<'_, Database>,
+) -> Result<Value, String> {
     let luna_courses = db.get_luna_courses().unwrap_or_default();
     let course_name = luna_courses
         .iter()
@@ -304,30 +369,35 @@ pub(super) async fn get_luna_activity_detail(
         .map(|c| c.name.clone())
         .unwrap_or_default();
 
-    let luna_state = app.state::<crate::LunaState>();
-    let http = {
-        let luna = luna_state.client.lock().await;
-        if !luna.authenticated {
-            return Err(crate::luna_client::LUNA_AUTH_REQUIRED_MSG.into());
-        }
-        luna.http.clone()
-    };
+    let (html, cache_age) =
+        super::files_browser::fetch_luna_detail_html_with_age(app, &row.detail_path).await?;
     let url = format!("{}{}", crate::config::LUNA_BASE, row.detail_path);
-    let html = crate::client::fetch_with_redirect(
-        &http,
-        &url,
-        crate::config::LUNA_BASE,
-        crate::luna_client::LUNA_SESSION_EXPIRED_MSG,
-        crate::luna_client::is_luna_session_expired,
-    )
-    .await
-    .map_err(|e| format!("Luna取得失敗: {}", e))?;
 
-    let detail = if row.activity_type == "announcement" {
-        crate::luna_parser::parse_luna_announcement_detail(&html)
-    } else {
-        crate::luna_parser::parse_luna_detail_page(&html)
+    let parse_detail = |h: &str| -> crate::luna_parser::LunaDetailPage {
+        if row.activity_type == "announcement" {
+            crate::luna_parser::parse_luna_announcement_detail(h)
+        } else {
+            crate::luna_parser::parse_luna_detail_page(h)
+        }
     };
+
+    let mut detail = parse_detail(&html);
+
+    // Only force a fresh fetch when the cache is not brand-new (> 60 s old).
+    // Pages that were just refreshed and have no attachments are trusted as-is.
+    if detail.attachments.is_empty() && cache_age > 60 {
+        log::debug!(
+            "[get_luna_activity_detail] no attachments in cache (age={}s) for '{}', forcing fresh fetch",
+            cache_age,
+            row.detail_path
+        );
+        let cache_key = format!("luna_detail_html:{}", row.detail_path);
+        let _ = db.delete_data_cache(&cache_key);
+        match super::files_browser::fetch_luna_detail_html_cached(app, &row.detail_path).await {
+            Ok(fresh_html) => detail = parse_detail(&fresh_html),
+            Err(e) => log::warn!("Fresh fetch failed for '{}': {}", row.detail_path, e),
+        }
+    }
 
     const SECTION_CAP: usize = 1200;
     let sections: Vec<Value> = detail

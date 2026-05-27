@@ -51,6 +51,7 @@
   let unlistenSttError: UnlistenFn | null = null;
   let msgListEl: HTMLElement | null = null;
   let thinkTraceEl = $state<HTMLElement | null>(null);
+  let composerTextarea = $state<HTMLTextAreaElement | null>(null);
   let autoFollow = $state(true);
   let aiCfg = $state<AiConfig | null>(null);
   let historyOpen = $state(false);
@@ -76,8 +77,15 @@
   const renderCache = new Map<string, string>();
   const RENDER_CACHE_MAX = 256;
   const STREAM_FLUSH_MS = 48;
+  const TURN_STALL_MS = 240_000;
+  const CANCEL_TIMEOUT_MS = 2_000;
+  const TOOL_CALL_LEAK_FALLBACK =
+    "内部ツール呼び出しの形式が崩れたため、そのまま表示せずに止めました。もう一度、必要な資料名や操作を指定してください。";
   let streamTokenBuffer = "";
   let streamFlushTimer: ReturnType<typeof setTimeout> | null = null;
+  let turnStallTimer: ReturnType<typeof setTimeout> | null = null;
+  let turnSeq = 0;
+  let terminalTurnSeq = 0;
 
   function render(md: string): string {
     const cached = renderCache.get(md);
@@ -90,6 +98,18 @@
     }
     renderCache.set(md, out);
     return out;
+  }
+
+  function looksLikePseudoToolCallLeak(text: string): boolean {
+    return /(^|[\s`<‹〈「『({\[])(task_call|tool_call|function_call|call)([:：]|\s+[A-Za-z_])/i.test(text)
+      || text.includes("MALFORMED_FUNCTION_CALL");
+  }
+
+  function displayContent(m: UIMessage): string {
+    if (m.role === "assistant" && !m._streaming && looksLikePseudoToolCallLeak(m.content)) {
+      return TOOL_CALL_LEAK_FALLBACK;
+    }
+    return m.content;
   }
 
   function appendAssistantText(text: string) {
@@ -137,6 +157,33 @@
     streamTokenBuffer = "";
   }
 
+  function clearTurnWatchdog() {
+    if (turnStallTimer) {
+      clearTimeout(turnStallTimer);
+      turnStallTimer = null;
+    }
+  }
+
+  function armTurnWatchdog(seq: number) {
+    clearTurnWatchdog();
+    turnStallTimer = setTimeout(() => {
+      if (!sending || seq !== turnSeq) return;
+      console.warn("agent turn stalled without terminal stream event");
+      finalizeTurn(false);
+      messages = [
+        ...messages,
+        {
+          id: -Date.now(),
+          conv_id: activeConvId ?? "",
+          role: "assistant",
+          content: "……応答が止まったみたい。もう一度送ってください。",
+          created_at: Math.floor(Date.now() / 1000),
+        },
+      ];
+      scheduleScroll();
+    }, TURN_STALL_MS);
+  }
+
   async function refreshConfig() {
     try {
       aiCfg = await getAiConfig();
@@ -157,6 +204,9 @@
   async function selectConversation(id: string) {
     historyOpen = false;
     if (activeConvId === id) return;
+    if (sending && activeConvId) {
+      await stopActiveTurn(false);
+    }
     clearStreamBuffer();
     activeConvId = id;
     agentActiveConvId.set(id);
@@ -177,6 +227,9 @@
 
   async function newConversation() {
     historyOpen = false;
+    if (sending && activeConvId) {
+      await stopActiveTurn(false);
+    }
     try {
       const id = await agentCreateConversation();
       await refreshConversations();
@@ -276,6 +329,8 @@
   }
 
   function handleStream(ev: AgentStreamEvent) {
+    if (!sending) return;
+    armTurnWatchdog(turnSeq);
     switch (ev.type) {
       case "phase":
         currentPhase = ev.stage;
@@ -308,10 +363,12 @@
         break;
       }
       case "done":
+        terminalTurnSeq = turnSeq;
         flushStreamTokens();
         finalizeTurn();
         break;
       case "error":
+        terminalTurnSeq = turnSeq;
         flushStreamTokens();
         finalizeTurn();
         messages = [
@@ -329,14 +386,34 @@
     }
   }
 
-  function finalizeTurn() {
+  function finalizeTurn(refresh = true) {
     sending = false;
     currentPhase = "idle";
     toolChips = [];
     thinkBuffer = "";
+    clearTurnWatchdog();
     clearStreamBuffer();
     messages = messages.map((m) => (m._streaming ? { ...m, _streaming: false } : m));
-    refreshConversations();
+    if (refresh) refreshConversations();
+  }
+
+  async function reloadConversationMessages(convId: string) {
+    if (activeConvId !== convId) return;
+    try {
+      messages = await agentLoadMessages(convId);
+      await tick();
+      scheduleScroll();
+    } catch (e) {
+      console.warn("reload messages", e);
+    }
+  }
+
+  async function recoverCompletedTurnWithoutDone(convId: string, seq: number) {
+    if (seq !== turnSeq || !sending) return;
+    console.warn("agent send completed without done stream event; finalizing locally");
+    flushStreamTokens();
+    finalizeTurn();
+    await reloadConversationMessages(convId);
   }
 
   async function send() {
@@ -351,6 +428,7 @@
       await newConversation();
       if (!activeConvId) return;
     }
+    const convId = activeConvId;
     if (!await isAiReady()) {
       if (confirm("Agent を使うには AI 設定が必要です。初期設定を開きますか？")) {
         reopenOnboarding();
@@ -358,7 +436,8 @@
       return;
     }
     if (quotedMessage) {
-      const qText = quotedMessage.role === "assistant" ? stripHtml(render(quotedMessage.content)) : quotedMessage.content;
+      const quotedContent = displayContent(quotedMessage);
+      const qText = quotedMessage.role === "assistant" ? stripHtml(render(quotedContent)) : quotedContent;
       const lines = qText.trim().split("\n").filter(Boolean);
       const short = lines.length > 3 ? lines.slice(0, 3).join("\n") + "..." : lines.join("\n");
       text = `「${short}」について：\n${text}`;
@@ -370,7 +449,7 @@
       ...messages,
       {
         id: -now,
-        conv_id: activeConvId,
+        conv_id: convId,
         role: "user",
         content: text,
         created_at: now,
@@ -382,22 +461,28 @@
     sttPartialText = "";
     sttStopRequested = false;
     sending = true;
+    const seq = ++turnSeq;
     toolChips = [];
     thinkBuffer = "";
     currentPhase = "planning";
     autoFollow = true;
+    armTurnWatchdog(seq);
     scheduleScroll();
 
     try {
-      await agentSend(activeConvId, text);
+      await agentSend(convId, text);
+      await recoverCompletedTurnWithoutDone(convId, seq);
     } catch (e) {
+      if (seq !== turnSeq) return;
+      await tick();
+      if (terminalTurnSeq === seq || !sending) return;
       console.warn("agent send", e);
-      sending = false;
+      finalizeTurn(false);
       messages = [
         ...messages,
         {
           id: -Date.now(),
-          conv_id: activeConvId,
+          conv_id: convId,
           role: "assistant",
           content: `……送信に失敗したみたい。\n\n> ${e}`,
           created_at: Math.floor(Date.now() / 1000),
@@ -408,11 +493,18 @@
 
   async function cancel() {
     if (!activeConvId || !sending) return;
-    try {
-      await agentCancel(activeConvId);
-    } catch (e) {
-      console.warn("cancel", e);
-    }
+    await stopActiveTurn();
+  }
+
+  async function stopActiveTurn(refresh = true) {
+    const id = activeConvId;
+    turnSeq++;
+    finalizeTurn(refresh);
+    if (!id) return;
+    void Promise.race([
+      agentCancel(id),
+      new Promise<void>((resolve) => setTimeout(resolve, CANCEL_TIMEOUT_MS)),
+    ]).catch((e) => console.warn("cancel", e));
   }
 
   function onKeydown(e: KeyboardEvent) {
@@ -421,6 +513,21 @@
       send();
     }
   }
+
+  function resizeComposer() {
+    const ta = composerTextarea;
+    if (!ta) return;
+    ta.style.height = "auto";
+    const max = 180;
+    const next = Math.min(ta.scrollHeight, max);
+    ta.style.height = `${next}px`;
+    ta.style.overflowY = ta.scrollHeight > max ? "auto" : "hidden";
+  }
+
+  $effect(() => {
+    inputText;
+    tick().then(() => requestAnimationFrame(resizeComposer));
+  });
 
   function mergeSttText(base: string, committed: string, partial: string): string {
     const spoken = [committed.trim(), partial.trim()].filter(Boolean).join(" ").trim();
@@ -604,57 +711,62 @@
 
   function toolLabel(n: string): string {
     const map: Record<string, string> = {
-      list_today_classes: "今日の授業を確認中…",
-      list_week_classes: "週の時間割を確認中…",
-      search_courses: "科目候補を探しています…",
-      get_course_context: "科目の文脈を整理しています…",
-      list_luna_todos: "提出物を確認中…",
-      list_recent_notifications: "お知らせを確認中…",
-      search_notifications: "お知らせを検索中…",
-      get_course_detail: "科目の詳細を確認中…",
-      list_recent_mail: "メールを確認中…",
-      read_mail: "メールを読んでいます…",
-      search_mail: "メールを検索中…",
-      list_luna_announcements: "Luna科目の掲示を確認中…",
-      get_student_profile: "学生情報を確認中…",
-      get_mail_profile: "メールアカウントを確認中…",
-      list_syllabus_favorites: "お気に入りシラバスを確認中…",
-      get_grades: "成績を確認中…",
-      get_cancellations: "休講情報を確認中…",
-      get_makeup_classes: "補講情報を確認中…",
-      get_room_changes: "教室変更を確認中…",
-      get_registration: "履修情報を確認中…",
-      get_exam_timetable: "試験時間割を確認中…",
-      get_weather: "天気を確認中…",
-      get_weekly_summary: "週間サマリーを確認中…",
-      get_upcoming_deadlines: "締め切りを確認中…",
-      get_todo_guide: "タスクガイドを作成中…",
-      get_luna_activity_detail: "課題の詳細を確認中…",
-      refresh_data: "データを更新中…",
-      list_downloaded_files: "ダウンロード済みファイルを探しています…",
-      read_downloaded_file: "ファイルの内容を読んでいます…",
-      inspect_file: "ファイルの内容を読んでいます…",
-      write_downloaded_text_file: "ファイルを書き換えています…",
-      open_downloaded_file: "ファイルを開いています…",
-      delete_downloaded_file: "ファイルを削除しています…",
-      download_url: "URLからファイルを保存しています…",
-      open_luna_attachment: "添付ファイルを開いています…",
-      download_luna_attachment: "添付ファイルをダウンロードしています…",
-      list_browser_windows: "開いているブラウザを確認中…",
-      open_browser_url: "ページを開いています…",
-      read_browser_page: "ページ内容を整理して読んでいます…",
-      browser_back: "ページを戻しています…",
-      browser_forward: "ページを進めています…",
-      browser_reload_page: "ページを再読み込みしています…",
-      browser_click: "ページ内の対象を押しています…",
-      browser_fill: "フォームに入力しています…",
-      browser_select_option: "選択肢を選んでいます…",
-      browser_press: "キー操作を送っています…",
-      browser_scroll: "ページを移動しています…",
-      browser_wait_for: "ページの変化を待っています…",
-      browser_close: "ブラウザを閉じています…",
-      get_today_brief: "今日のまとめを作成中…",
-      get_notification_detail: "お知らせ本文を取得中…",
+      list_today_classes: "今日の授業",
+      list_week_classes: "週間時間割",
+      search_courses: "科目検索",
+      get_course_context: "科目情報",
+      list_luna_todos: "提出物",
+      list_recent_notifications: "お知らせ",
+      search_notifications: "お知らせ検索",
+      get_course_detail: "科目詳細",
+      list_recent_mail: "メール",
+      read_mail: "メール本文",
+      search_mail: "メール検索",
+      list_luna_announcements: "Luna掲示",
+      get_student_profile: "学生情報",
+      get_mail_profile: "メール設定",
+      list_syllabus_favorites: "シラバス",
+      get_grades: "成績",
+      get_cancellations: "休講",
+      get_makeup_classes: "補講",
+      get_room_changes: "教室変更",
+      get_registration: "履修",
+      get_exam_timetable: "試験時間割",
+      get_weather: "天気",
+      get_weekly_summary: "週間まとめ",
+      get_upcoming_deadlines: "締切",
+      get_todo_guide: "タスク案内",
+      get_luna_activity_detail: "Luna詳細",
+      refresh_data: "更新",
+      list_downloaded_files: "ファイル検索",
+      read_downloaded_file: "ファイル読込",
+      inspect_file: "ファイル確認",
+      write_downloaded_text_file: "ファイル保存",
+      open_downloaded_file: "ファイルを開く",
+      delete_downloaded_file: "ファイル削除",
+      download_url: "URL保存",
+      open_luna_attachment: "添付を開く",
+      download_luna_attachment: "添付保存",
+      download_course_material: "資料保存",
+      list_browser_windows: "ブラウザ一覧",
+      open_browser_url: "ページを開く",
+      read_browser_page: "ページ読取",
+      browser_back: "戻る",
+      browser_forward: "進む",
+      browser_reload_page: "再読込",
+      browser_click: "クリック",
+      browser_fill: "入力",
+      browser_select_option: "選択",
+      browser_press: "キー入力",
+      browser_scroll: "スクロール",
+      browser_wait_for: "待機",
+      browser_close: "閉じる",
+      get_today_brief: "今日のまとめ",
+      get_notification_detail: "本文確認",
+      create_google_calendar_event: "予定作成",
+      list_google_calendar_events: "予定一覧",
+      delete_google_calendar_event: "予定削除",
+      update_google_calendar_event: "予定更新",
     };
     return map[n] ?? n;
   }
@@ -670,7 +782,8 @@
   }
 
   async function copyMessage(m: UIMessage) {
-    const text = m.role === "assistant" && !m._streaming ? stripHtml(render(m.content)) : m.content;
+    const content = displayContent(m);
+    const text = m.role === "assistant" && !m._streaming ? stripHtml(render(content)) : content;
     await navigator.clipboard.writeText(text);
     copiedId = m.id;
     if (copiedIdTimer) clearTimeout(copiedIdTimer);
@@ -683,8 +796,7 @@
   function quoteReply(m: UIMessage) {
     quotedMessage = m;
     tick().then(() => {
-      const ta = document.querySelector<HTMLTextAreaElement>(".composer-row textarea");
-      if (ta) ta.focus();
+      composerTextarea?.focus();
     });
   }
 
@@ -831,7 +943,7 @@
             <div class="row user">
               <div class="bubble user-bubble">
                 {#if m.content}
-                  <div class="text">{m.content}</div>
+                  <div class="text">{displayContent(m)}</div>
                 {/if}
                 <div class="msg-actions">
                   <button class="msg-act-btn" title="コピー" onclick={() => copyMessage(m)}>
@@ -851,9 +963,9 @@
               <img src={selahLogoUrl} alt="" class="avatar" />
               <div class="bubble assistant-bubble">
                 {#if m._streaming}
-                  <div class="md streaming-md">{m.content}</div>
+                  <div class="md streaming-md">{displayContent(m)}</div>
                 {:else}
-                  <div class="md">{@html render(m.content)}</div>
+                  <div class="md">{@html render(displayContent(m))}</div>
                 {/if}
                 <div class="msg-actions">
                   <button class="msg-act-btn" title="コピー" onclick={() => copyMessage(m)}>
@@ -883,7 +995,12 @@
             {#if toolChips.length}
               <div class="tool-steps">
                 {#each toolChips as chip (chip.id)}
-                  <div class="tool-step" class:ok={chip.state === "ok"} class:err={chip.state === "err"}>
+                  <div
+                    class="tool-step"
+                    class:ok={chip.state === "ok"}
+                    class:err={chip.state === "err"}
+                    title={chip.preview ? `${toolLabel(chip.name)} ${chip.preview}` : toolLabel(chip.name)}
+                  >
                     {#if chip.state === "running"}
                       <span class="spin"></span>
                     {:else if chip.state === "ok"}
@@ -891,7 +1008,7 @@
                     {:else}
                       <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
                     {/if}
-                    <span>{toolLabel(chip.name)}</span>
+                    <span class="tool-step-label">{toolLabel(chip.name)}</span>
                   </div>
                 {/each}
               </div>
@@ -913,7 +1030,7 @@
       {#if quotedMessage}
         <div class="quote-bar">
           <span class="quote-label">返信：</span>
-          <span class="quote-text">{quotedMessage.role === "assistant" ? stripHtml(render(quotedMessage.content)) : quotedMessage.content}</span>
+          <span class="quote-text">{quotedMessage.role === "assistant" ? stripHtml(render(displayContent(quotedMessage))) : displayContent(quotedMessage)}</span>
           <button class="quote-dismiss" onclick={dismissQuote} title="キャンセル">
             <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
           </button>
@@ -924,6 +1041,8 @@
           <div class="composer-row">
             <textarea
               bind:value={inputText}
+              bind:this={composerTextarea}
+              oninput={resizeComposer}
               onkeydown={onKeydown}
               placeholder={sending ? "返事を書いている途中……" : "なにか書いてみて。"}
               rows="1"
@@ -1319,9 +1438,9 @@
 
   /* ── Spinner ── */
   .spin {
-    width: 10px;
-    height: 10px;
-    border: 1.5px solid var(--glass-border);
+    width: 8px;
+    height: 8px;
+    border: 1.25px solid var(--glass-border);
     border-top-color: var(--accent);
     border-radius: 50%;
     animation: spin 0.8s linear infinite;
@@ -1346,19 +1465,46 @@
 
   .tool-steps {
     display: flex;
-    flex-direction: column;
+    flex-direction: row;
+    flex-wrap: wrap;
+    align-items: center;
     gap: 5px;
+    max-width: 100%;
   }
   .tool-step {
     display: inline-flex;
     align-items: center;
-    gap: 8px;
-    font-size: 12.5px;
+    justify-content: center;
+    gap: 4px;
+    min-width: 0;
+    max-width: min(100%, 190px);
+    min-height: 22px;
+    padding: 3px 8px;
+    border-radius: 999px;
+    border: 0.5px solid color-mix(in srgb, var(--accent) 24%, var(--glass-border));
+    background: color-mix(in srgb, var(--accent) 8%, var(--glass-bg, rgba(255, 255, 255, 0.58)));
+    box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.22);
+    font-size: 11px;
     color: var(--text-secondary);
-    line-height: 1.4;
+    line-height: 1.25;
+    white-space: nowrap;
+    overflow: hidden;
   }
-  .tool-step.ok { color: var(--green); }
-  .tool-step.err { color: var(--red); }
+  .tool-step-label {
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  .tool-step.ok {
+    color: var(--green);
+    border-color: color-mix(in srgb, var(--green) 38%, var(--glass-border));
+    background: color-mix(in srgb, var(--green) 9%, var(--glass-bg, rgba(255, 255, 255, 0.58)));
+  }
+  .tool-step.err {
+    color: var(--red);
+    border-color: color-mix(in srgb, var(--red) 40%, var(--glass-border));
+    background: color-mix(in srgb, var(--red) 8%, var(--glass-bg, rgba(255, 255, 255, 0.58)));
+  }
 
   .wait-dots {
     display: inline-flex;
@@ -1533,7 +1679,7 @@
   .composer-row {
     display: flex;
     flex: 1;
-    align-items: center;
+    align-items: flex-start;
   }
 
   textarea {
@@ -1550,6 +1696,7 @@
     line-height: 1.58;
     letter-spacing: -0.012em;
     outline: none;
+    overflow-y: hidden;
   }
   textarea::placeholder { color: var(--text-tertiary); }
 

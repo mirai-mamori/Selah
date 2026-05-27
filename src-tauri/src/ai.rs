@@ -341,6 +341,23 @@ async fn call_openai(config: &AiConfig, messages: Vec<ChatMessage>) -> Result<St
         .ok_or_else(|| "AIからの応答がありません".into())
 }
 
+fn sanitize_for_gemini(text: &str) -> String {
+    let mut cleaned = text.replace("<call:", "[call:");
+    cleaned = cleaned.replace("</call:", "[/call:");
+    cleaned = cleaned.replace("<call ", "[call ");
+    cleaned = cleaned.replace("task_call:", "task-call:");
+    cleaned = cleaned.replace("tool_call:", "tool-call:");
+    cleaned = cleaned.replace("function_call:", "function-call:");
+    cleaned = cleaned.replace("call:", "c-all:");
+    cleaned = cleaned.replace('(', "（");
+    cleaned = cleaned.replace(')', "）");
+    cleaned = cleaned.replace('<', "＜");
+    cleaned = cleaned.replace('>', "＞");
+    cleaned = cleaned.replace('‹', "〈");
+    cleaned = cleaned.replace('›', "〉");
+    cleaned
+}
+
 async fn call_gemini(config: &AiConfig, messages: Vec<ChatMessage>) -> Result<String, String> {
     let model = urlencoding::encode(&config.model);
     let url = format!(
@@ -352,7 +369,7 @@ async fn call_gemini(config: &AiConfig, messages: Vec<ChatMessage>) -> Result<St
     let system_instruction = messages
         .iter()
         .filter(|m| m.role == "system")
-        .map(|m| m.content.clone())
+        .map(|m| sanitize_for_gemini(&m.content))
         .collect::<Vec<_>>();
 
     let system_instruction = if system_instruction.is_empty() {
@@ -375,7 +392,9 @@ async fn call_gemini(config: &AiConfig, messages: Vec<ChatMessage>) -> Result<St
             } else {
                 "user".into()
             },
-            parts: vec![GeminiPart { text: m.content }],
+            parts: vec![GeminiPart {
+                text: sanitize_for_gemini(&m.content),
+            }],
         })
         .collect();
 

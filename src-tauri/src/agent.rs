@@ -15,6 +15,12 @@ use tauri::{AppHandle, Emitter, Manager};
 use crate::agent_error::AgentError;
 use crate::agent_prompts;
 use crate::agent_provider::AgentProvider;
+use crate::agent_pseudo_call::{
+    fallback_answer as pseudo_tool_call_fallback_answer, find_start as find_pseudo_tool_call_start,
+    has_any as has_any_pseudo_tool_call, parse_any as parse_any_visible_tool_call,
+    parse_leading as parse_visible_tool_call, ToolCall,
+};
+use crate::agent_text;
 use crate::agent_tools;
 use crate::ai::{ChatMessage, ImagePart};
 use crate::db::Database;
@@ -96,6 +102,8 @@ struct AgentConfig {
     tool_timeout_secs: u64,
     /// Extended timeout for slow refresh-style tools.
     slow_tool_timeout_secs: u64,
+    /// Hard timeout for answer generation so the UI cannot stay in thinking forever.
+    answer_timeout_secs: u64,
 }
 
 /// Tools that are known to take much longer than `tool_timeout_secs` because
@@ -130,6 +138,7 @@ const CFG: AgentConfig = AgentConfig {
     preview_bytes: 180,
     tool_timeout_secs: 35,
     slow_tool_timeout_secs: 120,
+    answer_timeout_secs: 90,
 };
 
 // ─────────────────────── Stream Events ───────────────────────
@@ -177,12 +186,19 @@ pub async fn agent_send(
     let result = run_turn(&app, &conv_id, user_text, user_images).await;
     match &result {
         Ok(()) => emit(&app, &conv_id, &StreamEvent::Done),
+        Err(AgentError::Cancelled) => {
+            log::info!("[agent] turn cancelled conv_id={}", conv_id);
+            emit(&app, &conv_id, &StreamEvent::Done);
+        }
         Err(e) => {
             let msg = e.to_string();
             emit(&app, &conv_id, &StreamEvent::Error { message: &msg });
         }
     }
-    result.map_err(|e| e.to_string())
+    match result {
+        Ok(()) | Err(AgentError::Cancelled) => Ok(()),
+        Err(e) => Err(e.to_string()),
+    }
 }
 
 /// Exposed for the cancel command.
@@ -217,13 +233,13 @@ async fn run_turn(
         &user_text,
         &user_images,
     )
-    .await;
+    .await?;
 
     // 4. Execute tools.
-    let tool_results = execute_tools(app, conv_id, &db, &plan, &user_text).await;
+    let mut tool_results = execute_tools(app, conv_id, &db, &plan, &user_text).await;
 
     // 5. Phase 2 — stream answer.
-    let answer = answer_phase(
+    let mut answer = answer_phase(
         app,
         conv_id,
         &provider,
@@ -233,6 +249,59 @@ async fn run_turn(
         &tool_results,
     )
     .await?;
+
+    let mut handled_visible_tool_calls = HashSet::new();
+    loop {
+        let Some(call) = parse_any_visible_tool_call(&answer) else {
+            if has_any_pseudo_tool_call(&answer) {
+                log::warn!(
+                    "[agent answer] suppressed unrecognized visible pseudo tool call before persistence"
+                );
+                answer = pseudo_tool_call_fallback_answer();
+                emit(app, conv_id, &StreamEvent::Token { text: &answer });
+            }
+            break;
+        };
+        let key = format!(
+            "{}:{}",
+            call.name,
+            serde_json::to_string(&call.args).unwrap_or_default()
+        );
+        if !handled_visible_tool_calls.insert(key) {
+            log::warn!(
+                "[agent answer] repeated visible pseudo tool call suppressed: {}",
+                call.name
+            );
+            answer = "さっきの操作をうまく実行形式に直せませんでした。もう一度、必要な資料名か課題名を指定してくれる？"
+                .to_string();
+            emit(app, conv_id, &StreamEvent::Token { text: &answer });
+            break;
+        }
+        log::warn!(
+            "[agent answer] intercepted visible pseudo tool call; executing real tool name={} args={}",
+            call.name,
+            serde_json::to_string(&call.args).unwrap_or_default()
+        );
+        let follow_plan = Plan {
+            tools: vec![call],
+            image_only: false,
+        };
+        let follow_results = execute_tools(app, conv_id, &db, &follow_plan, &user_text).await;
+        if follow_results.is_empty() {
+            break;
+        }
+        tool_results.extend(follow_results);
+        answer = answer_phase(
+            app,
+            conv_id,
+            &provider,
+            &history_slice,
+            &user_text,
+            &user_images,
+            &tool_results,
+        )
+        .await?;
+    }
 
     // 6. Persist assistant response.
     db.agent_append_message(conv_id, "assistant", &answer, None, None, None)
@@ -276,13 +345,6 @@ struct Plan {
     image_only: bool,
 }
 
-#[derive(Debug, Clone, Deserialize)]
-struct ToolCall {
-    name: String,
-    #[serde(default)]
-    args: Value,
-}
-
 async fn plan_phase(
     app: &AppHandle,
     conv_id: &str,
@@ -290,12 +352,12 @@ async fn plan_phase(
     history: &[crate::db::AgentMessageRow],
     user_text: &str,
     user_images: &[ImagePart],
-) -> Plan {
+) -> Result<Plan, AgentError> {
     if !user_images.is_empty() {
-        return Plan {
+        return Ok(Plan {
             tools: vec![],
             image_only: true,
-        };
+        });
     }
     emit(app, conv_id, &StreamEvent::Phase { stage: "planning" });
     choose_plan(provider, history, user_text, conv_id).await
@@ -306,17 +368,18 @@ async fn choose_plan(
     history: &[crate::db::AgentMessageRow],
     user_text: &str,
     conv_id: &str,
-) -> Plan {
+) -> Result<Plan, AgentError> {
     // Fast path: heuristic covers unambiguous keywords.
     if let Some(plan) = heuristic_plan(history, user_text) {
-        return finalize_plan(plan, history, user_text);
+        return Ok(finalize_plan(plan, history, user_text));
     }
     // Slow path: ask model.
     match run_plan_inference(provider, history, user_text, conv_id).await {
-        Ok(plan) => finalize_plan(plan, history, user_text),
+        Ok(plan) => Ok(finalize_plan(plan, history, user_text)),
+        Err(AgentError::Cancelled) => Err(AgentError::Cancelled),
         Err(e) => {
             log::warn!("agent plan phase failed: {} — proceeding with no tools", e);
-            Plan::default()
+            Ok(Plan::default())
         }
     }
 }
@@ -998,25 +1061,29 @@ fn finalize_plan(plan: Plan, history: &[crate::db::AgentMessageRow], user_text: 
         .tools
         .into_iter()
         .filter_map(|call| {
-            let sanitized = agent_tools::sanitize_tool_args(&call.name, &call.args);
+            let Some(name) = agent_tools::canonical_tool_name(&call.name) else {
+                log::warn!("[agent plan] unknown tool dropped: {}", call.name);
+                return None;
+            };
+            let sanitized = agent_tools::sanitize_tool_args(name, &call.args);
             if sanitized.is_none() {
                 log::warn!(
                     "[agent plan] tool dropped by sanitize: name={} args={}",
-                    call.name,
+                    name,
                     call.args
                 );
             }
             let args = sanitized?;
             let key = format!(
                 "{}:{}",
-                call.name,
+                name,
                 serde_json::to_string(&args).unwrap_or_default()
             );
             if !seen.insert(key) {
                 return None;
             }
             Some(ToolCall {
-                name: call.name,
+                name: name.to_string(),
                 args,
             })
         })
@@ -1181,40 +1248,59 @@ async fn answer_phase(
         tool_results.len()
     );
 
-    let app_for_cb = app.clone();
-    let conv_for_cb = conv_id.to_string();
     let gen_id = conv_id.to_string();
     let visible_chars = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    let visible_chars_for_cb = visible_chars.clone();
+    let visible_guard = std::sync::Arc::new(std::sync::Mutex::new(VisibleAnswerGuard::new(
+        app.clone(),
+        conv_id.to_string(),
+        visible_chars.clone(),
+    )));
+    let visible_guard_for_cb = visible_guard.clone();
 
-    let answer = provider
-        .answer(
-            messages,
-            &gen_id,
-            CFG.answer_think_budget_pct,
-            move |chunk: &str, is_think: bool| {
-                if !is_think && !chunk.is_empty() {
-                    visible_chars_for_cb
-                        .fetch_add(chunk.chars().count(), std::sync::atomic::Ordering::Relaxed);
-                }
-                let topic = format!("agent_stream:{}", conv_for_cb);
-                let ev = if is_think {
-                    StreamEvent::Think { text: chunk }
-                } else {
-                    StreamEvent::Token { text: chunk }
-                };
-                let _ = app_for_cb.emit(&topic, &ev);
-            },
-        )
-        .await?;
+    let answer_future = provider.answer(
+        messages,
+        &gen_id,
+        CFG.answer_think_budget_pct,
+        move |chunk: &str, is_think: bool| {
+            if let Ok(mut guard) = visible_guard_for_cb.lock() {
+                guard.feed(chunk, is_think);
+            }
+        },
+    );
+    let answer = match tokio::time::timeout(
+        std::time::Duration::from_secs(CFG.answer_timeout_secs),
+        answer_future,
+    )
+    .await
+    {
+        Ok(result) => result?,
+        Err(_) => {
+            if let Ok(mut guard) = visible_guard.lock() {
+                guard.flush();
+            }
+            return Err(AgentError::model(format!(
+                "AI応答が{}秒でタイムアウトしました。もう一度送信してください。",
+                CFG.answer_timeout_secs
+            )));
+        }
+    };
+    if let Ok(mut guard) = visible_guard.lock() {
+        guard.flush();
+    }
     if visible_chars.load(std::sync::atomic::Ordering::Relaxed) == 0 {
-        let cleaned = strip_think(&answer).trim().to_string();
+        let cleaned = agent_text::strip_think(&answer).trim().to_string();
         if !cleaned.is_empty() {
-            log::warn!(
-                "[agent answer] no visible token was streamed; emitting cleaned final answer chars={}",
-                cleaned.len()
-            );
-            emit(app, conv_id, &StreamEvent::Token { text: &cleaned });
+            if has_any_pseudo_tool_call(&cleaned) {
+                log::warn!(
+                    "[agent answer] no visible token was streamed; deferring/suppressing pseudo tool call"
+                );
+            } else {
+                log::warn!(
+                    "[agent answer] no visible token was streamed; emitting cleaned final answer chars={}",
+                    cleaned.len()
+                );
+                emit(app, conv_id, &StreamEvent::Token { text: &cleaned });
+            }
         }
     }
     log::debug!(
@@ -1224,6 +1310,132 @@ async fn answer_phase(
         answer.trim().is_empty()
     );
     Ok(answer)
+}
+
+enum VisibleStreamMode {
+    Pass,
+    SuppressPseudoCall,
+}
+
+const VISIBLE_PSEUDO_HOLD_CHARS: usize = 64;
+
+struct VisibleAnswerGuard {
+    app: AppHandle,
+    conv_id: String,
+    visible_chars: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    mode: VisibleStreamMode,
+    buffer: String,
+}
+
+impl VisibleAnswerGuard {
+    fn new(
+        app: AppHandle,
+        conv_id: String,
+        visible_chars: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    ) -> Self {
+        Self {
+            app,
+            conv_id,
+            visible_chars,
+            mode: VisibleStreamMode::Pass,
+            buffer: String::new(),
+        }
+    }
+
+    fn feed(&mut self, chunk: &str, is_think: bool) {
+        if chunk.is_empty() {
+            return;
+        }
+        if is_think {
+            self.emit(StreamEvent::Think { text: chunk });
+            return;
+        }
+        if matches!(self.mode, VisibleStreamMode::SuppressPseudoCall) {
+            return;
+        }
+        self.buffer.push_str(chunk);
+        self.drain_visible_buffer(false);
+    }
+
+    fn flush(&mut self) {
+        self.drain_visible_buffer(true);
+    }
+
+    fn drain_visible_buffer(&mut self, complete: bool) {
+        if matches!(self.mode, VisibleStreamMode::SuppressPseudoCall) {
+            self.buffer.clear();
+            return;
+        }
+
+        if let Some(idx) = find_pseudo_tool_call_start(&self.buffer) {
+            if idx > 0 {
+                let safe_prefix = self.buffer[..idx].trim_end().to_string();
+                if !safe_prefix.is_empty() {
+                    self.emit_visible(&safe_prefix);
+                }
+            }
+            log::warn!("[agent answer] suppressing streamed pseudo tool call before UI emission");
+            self.buffer.clear();
+            self.mode = VisibleStreamMode::SuppressPseudoCall;
+            return;
+        }
+
+        let emit_len = if complete {
+            self.buffer.len()
+        } else {
+            safe_visible_emit_len(&self.buffer, VISIBLE_PSEUDO_HOLD_CHARS)
+        };
+        if emit_len == 0 {
+            return;
+        }
+        let visible = self.buffer[..emit_len].to_string();
+        self.buffer.drain(..emit_len);
+        self.emit_visible(&visible);
+    }
+
+    fn emit_visible(&mut self, text: &str) {
+        self.visible_chars
+            .fetch_add(text.chars().count(), std::sync::atomic::Ordering::Relaxed);
+        self.emit(StreamEvent::Token { text });
+    }
+
+    fn emit(&self, ev: StreamEvent<'_>) {
+        let topic = format!("agent_stream:{}", self.conv_id);
+        let _ = self.app.emit(&topic, &ev);
+    }
+}
+
+fn safe_visible_emit_len(s: &str, hold_chars: usize) -> usize {
+    let char_count = s.chars().count();
+    if char_count <= hold_chars {
+        return 0;
+    }
+    s.char_indices()
+        .nth(char_count - hold_chars)
+        .map(|(idx, _)| idx)
+        .unwrap_or(0)
+}
+
+#[cfg(test)]
+enum VisibleStart {
+    Normal,
+    MaybePseudoCall,
+    PseudoCall,
+}
+
+#[cfg(test)]
+fn classify_visible_stream_start(buffer: &str) -> VisibleStart {
+    let trimmed = buffer.trim_start();
+    if trimmed.is_empty() {
+        return VisibleStart::MaybePseudoCall;
+    }
+    if crate::agent_pseudo_call::starts_with(trimmed) {
+        return VisibleStart::PseudoCall;
+    }
+    if crate::agent_pseudo_call::maybe_starts_with_prefix(trimmed) {
+        return VisibleStart::MaybePseudoCall;
+    }
+    VisibleStart::Normal
 }
 
 fn build_answer_messages(
@@ -1374,8 +1586,13 @@ fn sanitize_answer_tool_result(value: &Value) -> Value {
                 .map(sanitize_answer_tool_result)
                 .collect::<Vec<_>>(),
         ),
+        Value::String(s) => Value::String(neutralize_tool_call_syntax(s)),
         _ => value.clone(),
     }
+}
+
+fn neutralize_tool_call_syntax(s: &str) -> String {
+    agent_text::neutralize_pseudo_tool_calls(s)
 }
 
 // ─────────────────────── Heuristic Planner ───────────────────────
@@ -1520,7 +1737,19 @@ const HEURISTIC_RULES: &[HeuristicRule] = &[
         args: || json!({ "limit": 10 }),
     },
     HeuristicRule {
-        keywords: &["pdf", "docx", "ファイル", "附件", "添付", "ダウンロード"],
+        keywords: &[
+            "pdf",
+            "docx",
+            "ファイル",
+            "附件",
+            "添付",
+            "ダウンロード",
+            "文件",
+            "笔记",
+            "ノート",
+            "live",
+            "ライブ",
+        ],
         requires: &[],
         tool: "list_downloaded_files",
         args: || json!({ "limit": 10 }),
@@ -2058,12 +2287,23 @@ fn is_follow_up_with_context(history: &[crate::db::AgentMessageRow], norm: &str)
 // ─────────────────────── Plan Parsing ───────────────────────
 
 fn parse_plan(raw: &str) -> Result<Plan, String> {
-    let cleaned = strip_think(raw);
+    let cleaned = agent_text::strip_think(raw);
     let trimmed = cleaned.trim();
 
     // Fast path: try parsing the entire string as JSON first (works with prefill).
     if let Ok(plan) = serde_json::from_str::<Plan>(trimmed) {
         return Ok(plan);
+    }
+
+    if let Some(call) = parse_visible_tool_call(trimmed) {
+        log::warn!(
+            "[agent plan] recovered visible pseudo tool call from planner output: {}",
+            call.name
+        );
+        return Ok(Plan {
+            tools: vec![call],
+            image_only: false,
+        });
     }
 
     // Fallback: find the first JSON object in the string.
@@ -2080,23 +2320,6 @@ fn parse_plan(raw: &str) -> Result<Plan, String> {
         );
     }
     Ok(Plan::default())
-}
-
-fn strip_think(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    let mut rest = s;
-    while let Some(start) = rest.find("<think>") {
-        out.push_str(&rest[..start]);
-        match rest[start..].find("</think>") {
-            Some(end_rel) => rest = &rest[start + end_rel + "</think>".len()..],
-            None => {
-                rest = "";
-                break;
-            }
-        }
-    }
-    out.push_str(rest);
-    out
 }
 
 fn first_json_object(s: &str) -> Option<&str> {
@@ -2352,15 +2575,6 @@ mod tests {
     }
 
     #[test]
-    fn strip_think_blocks() {
-        assert_eq!(
-            strip_think("<think>reasoning</think>{\"tools\":[]}"),
-            "{\"tools\":[]}"
-        );
-        assert_eq!(strip_think("no tags here"), "no tags here");
-    }
-
-    #[test]
     fn parse_plan_from_json() {
         let plan = parse_plan("{\"tools\":[{\"name\":\"get_weather\",\"args\":{}}]}").unwrap();
         assert_eq!(plan.tools.len(), 1);
@@ -2454,6 +2668,351 @@ mod tests {
     }
 
     #[test]
+    fn sanitize_tool_results_neutralizes_pseudo_calls() {
+        let value = serde_json::json!({
+            "body": "call:kg_canvas:download_luna_file({}) <call:tool /> MALFORMED_FUNCTION_CALL",
+            "download_action": "/hidden",
+        });
+        let sanitized = sanitize_answer_tool_result(&value);
+        let body = sanitized.get("body").and_then(|v| v.as_str()).unwrap();
+        assert!(body.contains("call：kg_canvas"));
+        assert!(!body.contains("call:kg_canvas"));
+        assert!(sanitized.get("download_action").is_none());
+    }
+
+    #[test]
+    fn canonical_tool_aliases_are_accepted() {
+        assert_eq!(
+            agent_tools::canonical_tool_name("browser_reload"),
+            Some("browser_reload_page")
+        );
+        assert_eq!(
+            agent_tools::canonical_tool_name("read_file"),
+            Some("read_downloaded_file")
+        );
+        assert_eq!(
+            agent_tools::canonical_tool_name("view_file"),
+            Some("read_downloaded_file")
+        );
+        assert_eq!(
+            agent_tools::canonical_tool_name("kg_canvas:download_luna_file"),
+            Some("download_course_material")
+        );
+        assert_eq!(
+            agent_tools::canonical_tool_name("download_luna_file"),
+            Some("download_course_material")
+        );
+        assert_eq!(
+            agent_tools::canonical_tool_name("download_material_file"),
+            Some("download_course_material")
+        );
+        assert_eq!(
+            agent_tools::canonical_tool_name("fetch_lms_course_resources"),
+            Some("list_luna_announcements")
+        );
+        assert!(agent_tools::is_known_tool("read_file"));
+    }
+
+    #[test]
+    fn lms_resource_alias_preserves_course_keyword() {
+        let args = serde_json::json!({ "course_name": "政治学基礎 ２" });
+        let sanitized = agent_tools::sanitize_tool_args("fetch_lms_course_resources", &args)
+            .expect("sanitized");
+        assert_eq!(
+            sanitized.get("keyword").and_then(|v| v.as_str()),
+            Some("政治学基礎 ２")
+        );
+    }
+
+    #[test]
+    fn parses_visible_task_call_for_real_execution() {
+        let answer = "‹task_call:download_course_material(luna_id=\"2026341390020201\",filename=\"2026年度春中間試験の実施要項.pdf\")›";
+        let call = parse_visible_tool_call(answer).expect("tool call");
+        assert_eq!(call.name, "download_course_material");
+        assert_eq!(
+            call.args.get("luna_id").and_then(|v| v.as_str()),
+            Some("2026341390020201")
+        );
+        assert_eq!(
+            call.args.get("filename").and_then(|v| v.as_str()),
+            Some("2026年度春中間試験の実施要項.pdf")
+        );
+    }
+
+    #[test]
+    fn parses_visible_json_style_tool_call() {
+        let answer = r#"task_call:download_course_material{"luna_id":"2026341390020201","filename":"midterm.pdf"}"#;
+        let call = parse_visible_tool_call(answer).expect("tool call");
+        assert_eq!(call.name, "download_course_material");
+        assert_eq!(
+            call.args.get("filename").and_then(|v| v.as_str()),
+            Some("midterm.pdf")
+        );
+    }
+
+    #[test]
+    fn parses_visible_download_luna_file_alias_for_real_execution() {
+        let answer =
+            r#"call:download_luna_file{"course_name":"政治学基礎 ２","filename":"midterm.pdf"}"#;
+        let call = parse_visible_tool_call(answer).expect("tool call");
+        assert_eq!(call.name, "download_course_material");
+        assert_eq!(
+            call.args.get("filename").and_then(|v| v.as_str()),
+            Some("midterm.pdf")
+        );
+    }
+
+    #[test]
+    fn parses_visible_download_luna_file_js_style_args() {
+        let answer = r#"call:download_luna_file {luna_id: "2026341390020201", file_name: "2026年度春中間試験の実施要項.pdf"}"#;
+        let call = parse_visible_tool_call(answer).expect("tool call");
+        assert_eq!(call.name, "download_course_material");
+        assert_eq!(
+            call.args.get("luna_id").and_then(|v| v.as_str()),
+            Some("2026341390020201")
+        );
+        assert_eq!(
+            call.args.get("filename").and_then(|v| v.as_str()),
+            Some("2026年度春中間試験の実施要項.pdf")
+        );
+    }
+
+    #[test]
+    fn parses_glued_download_material_file_call() {
+        let answer = "call:download_material_fileluna_id=2026341390020201file_name=2026年度春中間試験の実施要項.pdf";
+        let call = parse_visible_tool_call(answer).expect("tool call");
+        assert_eq!(call.name, "download_course_material");
+        assert_eq!(
+            call.args.get("luna_id").and_then(|v| v.as_str()),
+            Some("2026341390020201")
+        );
+        assert_eq!(
+            call.args.get("filename").and_then(|v| v.as_str()),
+            Some("2026年度春中間試験の実施要項.pdf")
+        );
+    }
+
+    #[test]
+    fn parses_gemini_finish_message_call_for_real_execution() {
+        let answer = r#"call:read_downloaded_file {"path":"/Users/haru/Documents/Selah/政治学基礎 ２/20260525_政治学基礎　２_live.md"}"#;
+        let call = parse_visible_tool_call(answer).expect("tool call");
+        assert_eq!(call.name, "read_downloaded_file");
+        assert_eq!(
+            call.args.get("path").and_then(|v| v.as_str()),
+            Some("/Users/haru/Documents/Selah/政治学基礎 ２/20260525_政治学基礎　２_live.md")
+        );
+    }
+
+    #[test]
+    fn parses_view_file_alias_for_real_execution() {
+        let answer = r#"call:view_file {"path":"/Users/haru/Documents/Selah/キリスト教学Ａ １/20260519_キリスト教学Ａ　１_live.md"}"#;
+        let call = parse_visible_tool_call(answer).expect("tool call");
+        assert_eq!(call.name, "read_downloaded_file");
+        assert_eq!(
+            call.args.get("path").and_then(|v| v.as_str()),
+            Some(
+                "/Users/haru/Documents/Selah/キリスト教学Ａ １/20260519_キリスト教学Ａ　１_live.md"
+            )
+        );
+    }
+
+    #[test]
+    fn detects_unknown_leading_pseudo_call_without_leaking_it() {
+        let answer = r#"call:imaginary_file_tool {"path":"/tmp/a.md"}"#;
+        assert!(parse_visible_tool_call(answer).is_none());
+        assert!(has_any_pseudo_tool_call(answer));
+        let fallback = pseudo_tool_call_fallback_answer();
+        assert!(!fallback.contains("call:"));
+        assert!(!fallback.contains("imaginary_file_tool"));
+    }
+
+    #[test]
+    fn parses_neutralized_fullwidth_call_for_real_execution() {
+        let answer = r#"call：read_file〔path: "/Users/haru/Documents/Selah/政治学基礎 ２/2026年度春中間試験の実施要項.pdf"〕"#;
+        let call = parse_visible_tool_call(answer).expect("tool call");
+        assert_eq!(call.name, "read_downloaded_file");
+        assert_eq!(
+            call.args.get("path").and_then(|v| v.as_str()),
+            Some("/Users/haru/Documents/Selah/政治学基礎 ２/2026年度春中間試験の実施要項.pdf")
+        );
+    }
+
+    #[test]
+    fn parses_fullwidth_arg_delimiter_in_neutralized_call() {
+        let answer = r#"call：read_file〔path： "/tmp/midterm.pdf"〕"#;
+        let call = parse_visible_tool_call(answer).expect("tool call");
+        assert_eq!(call.name, "read_downloaded_file");
+        assert_eq!(
+            call.args.get("path").and_then(|v| v.as_str()),
+            Some("/tmp/midterm.pdf")
+        );
+    }
+
+    #[test]
+    fn parses_read_downloaded_file_filename_only_call() {
+        let answer = r#"call:read_downloaded_file {"filename":"20260525_政治学基礎　２_live.md","course_name":"政治学基礎 ２"}"#;
+        let call = parse_visible_tool_call(answer).expect("tool call");
+        assert_eq!(call.name, "read_downloaded_file");
+        assert_eq!(
+            call.args.get("filename").and_then(|v| v.as_str()),
+            Some("20260525_政治学基礎　２_live.md")
+        );
+        assert_eq!(
+            call.args.get("course_name").and_then(|v| v.as_str()),
+            Some("政治学基礎 ２")
+        );
+    }
+
+    #[test]
+    fn parses_fullwidth_bracket_course_context_call() {
+        let answer = r#"call:get_course_context〔kgc_code: "34139002"〕"#;
+        let call = parse_visible_tool_call(answer).expect("tool call");
+        assert_eq!(call.name, "get_course_context");
+        assert_eq!(
+            call.args.get("query").and_then(|v| v.as_str()),
+            Some("34139002")
+        );
+    }
+
+    #[test]
+    fn parses_call_space_course_context_call() {
+        let answer = r#"call get_course_context {luna_id: "2026341390020201"}"#;
+        let call = parse_visible_tool_call(answer).expect("tool call");
+        assert_eq!(call.name, "get_course_context");
+        assert_eq!(
+            call.args.get("query").and_then(|v| v.as_str()),
+            Some("2026341390020201")
+        );
+    }
+
+    #[test]
+    fn parses_activity_title_alias_for_luna_detail_call() {
+        let answer = r#"call:get_luna_activity_detail{activity_title:"第7回復習課題（5/29 23:59締め切り）",luna_id:"2026341390020201"}"#;
+        let call = parse_visible_tool_call(answer).expect("tool call");
+        assert_eq!(call.name, "get_luna_activity_detail");
+        assert_eq!(
+            call.args.get("title").and_then(|v| v.as_str()),
+            Some("第7回復習課題（5/29 23:59締め切り）")
+        );
+        assert_eq!(
+            call.args.get("luna_id").and_then(|v| v.as_str()),
+            Some("2026341390020201")
+        );
+    }
+
+    #[test]
+    fn sanitizer_accepts_common_tool_arg_aliases() {
+        let course_args = serde_json::json!({ "course_code": "34139002" });
+        let course = agent_tools::sanitize_tool_args("get_course_context", &course_args)
+            .expect("course context args");
+        assert_eq!(
+            course.get("query").and_then(|v| v.as_str()),
+            Some("34139002")
+        );
+
+        let detail_args = serde_json::json!({ "activityTitle": "中間試験", "type": "material" });
+        let detail = agent_tools::sanitize_tool_args("get_luna_activity_detail", &detail_args)
+            .expect("luna detail args");
+        assert_eq!(
+            detail.get("title").and_then(|v| v.as_str()),
+            Some("中間試験")
+        );
+        assert_eq!(
+            detail.get("activity_type").and_then(|v| v.as_str()),
+            Some("material")
+        );
+
+        let material_args =
+            serde_json::json!({ "attachment_name": "2026年度春中間試験の実施要項.pdf" });
+        let material = agent_tools::sanitize_tool_args("download_course_material", &material_args)
+            .expect("download material args");
+        assert_eq!(
+            material.get("filename").and_then(|v| v.as_str()),
+            Some("2026年度春中間試験の実施要項.pdf")
+        );
+    }
+
+    #[test]
+    fn parse_plan_recovers_visible_tool_call() {
+        let plan = parse_plan(r#"call:read_downloaded_file {"path":"/tmp/a.md"}"#).expect("plan");
+        assert!(!plan.image_only);
+        assert_eq!(plan.tools.len(), 1);
+        assert_eq!(plan.tools[0].name, "read_downloaded_file");
+        assert_eq!(
+            plan.tools[0].args.get("path").and_then(|v| v.as_str()),
+            Some("/tmp/a.md")
+        );
+    }
+
+    #[test]
+    fn visible_tool_call_parser_requires_leading_call() {
+        let answer = "これは説明です。task_call:download_course_material(filename=\"midterm.pdf\")";
+        assert!(parse_visible_tool_call(answer).is_none());
+    }
+
+    #[test]
+    fn any_visible_tool_call_parser_handles_nonleading_call() {
+        let answer = r#"確認します。 call:view_file {"path":"/Users/haru/Documents/Selah/キリスト教学Ａ １/20260519_キリスト教学Ａ　１_live.md"}"#;
+        assert!(parse_visible_tool_call(answer).is_none());
+        let call = parse_any_visible_tool_call(answer).expect("tool call");
+        assert_eq!(call.name, "read_downloaded_file");
+        assert_eq!(
+            call.args.get("path").and_then(|v| v.as_str()),
+            Some(
+                "/Users/haru/Documents/Selah/キリスト教学Ａ １/20260519_キリスト教学Ａ　１_live.md"
+            )
+        );
+        assert!(has_any_pseudo_tool_call(answer));
+    }
+
+    #[test]
+    fn pseudo_call_scan_ignores_normal_words() {
+        assert!(find_pseudo_tool_call_start("callback: done").is_none());
+        assert!(find_pseudo_tool_call_start("recall the file later").is_none());
+        assert!(find_pseudo_tool_call_start(
+            "確認: call:get_course_context〔kgc_code: \"34139002\"〕"
+        )
+        .is_some());
+    }
+
+    #[test]
+    fn safe_visible_emit_len_holds_tail_for_split_detection() {
+        assert_eq!(safe_visible_emit_len("短い call", 16), 0);
+        let long = "これは普通の説明です。あとで call";
+        let emit_len = safe_visible_emit_len(long, 8);
+        assert!(emit_len > 0);
+        assert!(long[emit_len..].contains("call"));
+    }
+
+    #[test]
+    fn visible_stream_start_detects_split_pseudo_call() {
+        assert!(matches!(
+            classify_visible_stream_start("‹task_"),
+            VisibleStart::MaybePseudoCall
+        ));
+        assert!(matches!(
+            classify_visible_stream_start("‹task_call:download_course_material("),
+            VisibleStart::PseudoCall
+        ));
+        assert!(matches!(
+            classify_visible_stream_start("call "),
+            VisibleStart::PseudoCall
+        ));
+        assert!(matches!(
+            classify_visible_stream_start("call：read_file〔"),
+            VisibleStart::PseudoCall
+        ));
+        assert!(matches!(
+            classify_visible_stream_start("call get_course_context {"),
+            VisibleStart::PseudoCall
+        ));
+        assert!(matches!(
+            classify_visible_stream_start("我看了一下資料"),
+            VisibleStart::Normal
+        ));
+    }
+
+    #[test]
     fn estimate_tokens_sanity() {
         // Short ASCII text
         assert!(estimate_tokens("hello") > 0);
@@ -2527,68 +3086,16 @@ mod tests {
 
     #[test]
     fn all_registered_tools_have_dispatch_arms() {
-        // Smoke check: every name we expose in TOOL_SPECS must come back is_known.
-        // Catches the inverse of the panic we removed — a tool listed but not
-        // wired (or vice versa).
-        for name in [
-            "list_today_classes",
-            "list_week_classes",
-            "search_courses",
-            "get_course_context",
-            "get_course_detail",
-            "get_cancellations",
-            "get_makeup_classes",
-            "get_room_changes",
-            "get_exam_timetable",
-            "list_luna_todos",
-            "get_grades",
-            "get_registration",
-            "list_syllabus_favorites",
-            "list_recent_notifications",
-            "search_notifications",
-            "get_notification_detail",
-            "list_recent_mail",
-            "read_mail",
-            "search_mail",
-            "list_luna_announcements",
-            "get_mail_profile",
-            "get_student_profile",
-            "get_weather",
-            "get_weekly_summary",
-            "get_todo_guide",
-            "get_upcoming_deadlines",
-            "get_luna_activity_detail",
-            "refresh_data",
-            "list_downloaded_files",
-            "read_downloaded_file",
-            "inspect_file",
-            "write_downloaded_text_file",
-            "open_downloaded_file",
-            "delete_downloaded_file",
-            "download_url",
-            "open_luna_attachment",
-            "download_luna_attachment",
-            "list_browser_windows",
-            "open_browser_url",
-            "read_browser_page",
-            "browser_back",
-            "browser_forward",
-            "browser_reload_page",
-            "browser_click",
-            "browser_fill",
-            "browser_select_option",
-            "browser_press",
-            "browser_scroll",
-            "browser_wait_for",
-            "browser_close",
-            "get_today_brief",
-        ] {
-            assert!(
-                agent_tools::is_known_tool(name),
-                "tool {} missing from TOOL_SPECS",
-                name
-            );
-        }
+        let registered =
+            agent_tools::registered_tool_names().collect::<std::collections::BTreeSet<_>>();
+        let dispatched = agent_tools::dispatched_tool_names()
+            .iter()
+            .copied()
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(
+            registered, dispatched,
+            "TOOL_SPECS and dispatch arms drifted apart"
+        );
     }
 
     #[test]

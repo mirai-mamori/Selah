@@ -407,9 +407,11 @@ fn run_local_inference<F: FnMut(&str, bool)>(
     let mut n_cur = n_tokens;
     let mut output_tokens = Vec::with_capacity(max_gen);
     let mut batch = LlamaBatch::new(PREFILL_CHUNK, 1);
+    let mut cancelled = false;
 
     for _ in 0..max_gen {
-        if streaming && !req.gen_id.is_empty() && is_cancelled(&req.gen_id) {
+        if !req.gen_id.is_empty() && is_cancelled(&req.gen_id) {
+            cancelled = true;
             break;
         }
 
@@ -448,6 +450,10 @@ fn run_local_inference<F: FnMut(&str, bool)>(
         if streaming {
             emit_piece(model, token, &mut stream, on_token.as_mut());
         }
+    }
+
+    if cancelled {
+        return Err("推論はキャンセルされました".into());
     }
 
     if streaming {
@@ -671,7 +677,9 @@ impl StreamState {
     }
 }
 
-const GUARD_WINDOW: usize = 7; // shorter than "<think>" / "</think>"
+const THINKING_START_TAGS: &[&str] = &["<think>", "<thought>", "<thinking>"];
+const THINKING_END_TAGS: &[&str] = &["</think>", "</thought>", "</thinking>"];
+const GUARD_WINDOW: usize = 10; // shorter than the longest supported thinking tag.
 
 fn emit_piece<F: FnMut(&str, bool)>(
     model: &LlamaModel,
@@ -694,14 +702,14 @@ fn process_stream_piece<F: FnMut(&str, bool)>(
     stream.pending.push_str(piece);
     loop {
         if stream.in_think {
-            if let Some(pos) = stream.pending.find("</think>") {
+            if let Some((pos, tag_len)) = find_thinking_end_tag(&stream.pending) {
                 if pos > 0 {
                     let to_emit: String = stream.pending.drain(..pos).collect();
                     if let Some(cb) = on_chunk.as_deref_mut() {
                         cb(&to_emit, true);
                     }
                 }
-                stream.pending.drain(..("</think>".len()));
+                stream.pending.drain(..tag_len);
                 stream.in_think = false;
                 continue;
             }
@@ -713,7 +721,7 @@ fn process_stream_piece<F: FnMut(&str, bool)>(
             );
             break;
         } else {
-            if let Some(pos) = stream.pending.find("<think>") {
+            if let Some((pos, tag_len)) = find_thinking_start_tag(&stream.pending) {
                 if pos > 0 {
                     let to_emit: String = stream.pending.drain(..pos).collect();
                     stream.visible.push_str(&to_emit);
@@ -721,7 +729,7 @@ fn process_stream_piece<F: FnMut(&str, bool)>(
                         cb(&to_emit, false);
                     }
                 }
-                stream.pending.drain(..("<think>".len()));
+                stream.pending.drain(..tag_len);
                 stream.in_think = true;
                 continue;
             }
@@ -734,6 +742,20 @@ fn process_stream_piece<F: FnMut(&str, bool)>(
             break;
         }
     }
+}
+
+fn find_thinking_start_tag(s: &str) -> Option<(usize, usize)> {
+    find_earliest_tag(s, THINKING_START_TAGS)
+}
+
+fn find_thinking_end_tag(s: &str) -> Option<(usize, usize)> {
+    find_earliest_tag(s, THINKING_END_TAGS)
+}
+
+fn find_earliest_tag(s: &str, tags: &[&str]) -> Option<(usize, usize)> {
+    tags.iter()
+        .filter_map(|tag| s.find(tag).map(|idx| (idx, tag.len())))
+        .min_by_key(|(idx, _)| *idx)
 }
 
 /// Emit pending text up to the guard window.
@@ -765,4 +787,33 @@ fn floor_char_boundary(s: &str, idx: usize) -> usize {
         i -= 1;
     }
     i
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn process_stream_piece_routes_thought_tags_to_thinking_stream() {
+        let mut stream = StreamState::default();
+        let mut chunks: Vec<(String, bool)> = Vec::new();
+        {
+            let mut cb = |chunk: &str, is_think: bool| {
+                chunks.push((chunk.to_string(), is_think));
+            };
+            process_stream_piece("visible <thought>hidden", &mut stream, Some(&mut cb));
+            process_stream_piece("</thought> done", &mut stream, Some(&mut cb));
+            stream.flush(Some(&mut cb));
+        }
+
+        assert_eq!(stream.visible, "visible  done");
+        assert_eq!(
+            chunks,
+            vec![
+                ("visible ".to_string(), false),
+                ("hidden".to_string(), true),
+                (" done".to_string(), false),
+            ]
+        );
+    }
 }

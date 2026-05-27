@@ -562,12 +562,58 @@ pub fn parse_luna_announcement_detail(html: &str) -> LunaDetailPage {
         }
     }
 
-    // Fallback: some layouts may keep .downloadFile blocks outside the
+    // Fallback 1: some layouts may keep .downloadFile blocks outside the
     // .contents-detail rows. Sweep the whole fragment only if nothing was found.
     if attachments.is_empty() {
         for file_el in doc.select(&SEL_DOWNLOAD_FILE) {
             if let Some(att) = build_announcement_attachment(file_el) {
                 attachments.push(att);
+            }
+        }
+    }
+
+    // Fallback 2: tempfile / download href links (e.g. coursetop/information/listdetail
+    // pages sometimes embed attachments as <a href="…/tempfile/…"> or <a href="…/down…">).
+    if attachments.is_empty() {
+        let file_selectors: &[&Selector] = &[&SEL_TEMPFILE_LINK, &SEL_DOWNLOAD_LINK];
+        for file_sel in file_selectors {
+            for a in doc.select(file_sel) {
+                let name = a.text().collect::<String>().trim().to_string();
+                let url = a.value().attr("href").unwrap_or_default().to_string();
+                if !name.is_empty() && !url.is_empty() && !url.contains("javascript:") {
+                    let link_type = classify_link(&url, &name);
+                    attachments.push(LunaAttachment {
+                        name,
+                        url,
+                        link_type,
+                        object_name: String::new(),
+                        download_action: String::new(),
+                        download_params: Vec::new(),
+                    });
+                }
+            }
+        }
+    }
+
+    // Fallback 3: body-area links (.contents-input-area, .ql-editor) —
+    // picks up files embedded directly in the announcement body text.
+    if attachments.is_empty() {
+        for a in doc.select(&SEL_BODY_LINK) {
+            let url = a.value().attr("href").unwrap_or_default().to_string();
+            let name = a.text().collect::<String>().trim().to_string();
+            if !url.is_empty() && url.starts_with("http") {
+                let display = if name.is_empty() { url.clone() } else { name };
+                let link_type = classify_link(&url, &display);
+                if !attachments.iter().any(|att| att.url == url) {
+                    attachments.push(LunaAttachment {
+                        name: display,
+                        url,
+                        link_type,
+                        object_name: String::new(),
+                        download_action: String::new(),
+                        download_params: Vec::new(),
+                    });
+                }
             }
         }
     }

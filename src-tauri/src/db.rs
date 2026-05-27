@@ -890,6 +890,14 @@ impl Database {
         }
     }
 
+    /// Delete a cached entry by key (used to invalidate stale HTML cache).
+    pub fn delete_data_cache(&self, key: &str) -> Result<(), String> {
+        let conn = self.conn.lock().map_err(|e| format!("DB lock: {}", e))?;
+        conn.execute("DELETE FROM data_cache WHERE cache_key = ?1", params![key])
+            .map_err(|e| format!("DB delete cache: {}", e))?;
+        Ok(())
+    }
+
     // ── Agent conversations / messages ──
 
     pub fn agent_create_conversation(&self, id: &str, title: &str) -> Result<(), String> {

@@ -57,6 +57,12 @@ enum ArgSchema {
     FileWrite,
     /// Luna title + optional attachment name.
     TitleAttachment,
+    /// Luna activity detail options (all optional, but should have title/luna_id).
+    LunaActivityDetail,
+    /// Luna explicit attachment download options.
+    DownloadLunaAttachment,
+    /// Luna course material explicit download by filename.
+    DownloadCourseMaterial,
     /// Optional text arg, omitted when empty.
     OptionalText { key: &'static str, max_len: usize },
     /// URL arg.
@@ -292,12 +298,9 @@ const TOOL_SPECS: &[ToolSpec] = &[
     ToolSpec {
         name: "get_luna_activity_detail",
         category: "課題・成績・履修",
-        signature: "get_luna_activity_detail(title: string)",
-        purpose: "タイトルでレポート/テスト/掲示/お知らせの本文・提出要件・添付を取得",
-        schema: ArgSchema::Text {
-            key: "title",
-            max_len: 120,
-        },
+        signature: "get_luna_activity_detail(title: string, activity_type?: string, luna_id?: string)",
+        purpose: "タイトル、種別、luna_id等でレポート/テスト/掲示/お知らせの本文・提出要件・添付を取得",
+        schema: ArgSchema::LunaActivityDetail,
     },
     ToolSpec {
         name: "refresh_data",
@@ -316,8 +319,8 @@ const TOOL_SPECS: &[ToolSpec] = &[
     ToolSpec {
         name: "read_downloaded_file",
         category: "ダウンロードファイル",
-        signature: "read_downloaded_file(path: string)",
-        purpose: "ダウンロード済み PDF / DOCX / TXT / MD / JSON / CSV / HTML の本文を抽出して読む",
+        signature: "read_downloaded_file(path?: string, filename?: string)",
+        purpose: "ダウンロード済み PDF / DOCX / TXT / MD / JSON / CSV / HTML の本文を抽出して読む。path が不明な場合は filename で検索できる",
         schema: ArgSchema::FilePath,
     },
     ToolSpec {
@@ -365,9 +368,16 @@ const TOOL_SPECS: &[ToolSpec] = &[
     ToolSpec {
         name: "download_luna_attachment",
         category: "ダウンロードファイル",
-        signature: "download_luna_attachment(title: string, attachment_name?: string)",
+        signature: "download_luna_attachment(title: string, attachment_name?: string, luna_id?: string)",
         purpose: "Luna 詳細から添付ファイル/資料を探してダウンロードする",
-        schema: ArgSchema::TitleAttachment,
+        schema: ArgSchema::DownloadLunaAttachment,
+    },
+    ToolSpec {
+        name: "download_course_material",
+        category: "ダウンロードファイル",
+        signature: "download_course_material(filename: string, title?: string, luna_id?: string)",
+        purpose: "指定されたファイル名の授業資料などを自動検索しダウンロードする",
+        schema: ArgSchema::DownloadCourseMaterial,
     },
     ToolSpec {
         name: "list_browser_windows",
@@ -512,17 +522,155 @@ const TOOL_SPECS: &[ToolSpec] = &[
     },
 ];
 
+#[cfg(test)]
+const DISPATCH_TOOL_NAMES: &[&str] = &[
+    "list_today_classes",
+    "list_week_classes",
+    "search_courses",
+    "get_course_context",
+    "get_course_detail",
+    "get_cancellations",
+    "get_makeup_classes",
+    "get_room_changes",
+    "get_exam_timetable",
+    "list_luna_todos",
+    "get_grades",
+    "get_registration",
+    "list_syllabus_favorites",
+    "list_recent_notifications",
+    "search_notifications",
+    "get_notification_detail",
+    "list_recent_mail",
+    "read_mail",
+    "search_mail",
+    "list_luna_announcements",
+    "get_mail_profile",
+    "get_student_profile",
+    "get_weather",
+    "get_weekly_summary",
+    "get_todo_guide",
+    "get_upcoming_deadlines",
+    "get_luna_activity_detail",
+    "refresh_data",
+    "list_downloaded_files",
+    "read_downloaded_file",
+    "inspect_file",
+    "write_downloaded_text_file",
+    "open_downloaded_file",
+    "delete_downloaded_file",
+    "download_url",
+    "open_luna_attachment",
+    "download_luna_attachment",
+    "download_course_material",
+    "list_browser_windows",
+    "open_browser_url",
+    "read_browser_page",
+    "browser_back",
+    "browser_forward",
+    "browser_reload_page",
+    "browser_click",
+    "browser_fill",
+    "browser_select_option",
+    "browser_press",
+    "browser_scroll",
+    "browser_wait_for",
+    "browser_close",
+    "get_today_brief",
+    "create_google_calendar_event",
+    "list_google_calendar_events",
+    "delete_google_calendar_event",
+    "update_google_calendar_event",
+];
+
 /// Check if a tool name is in the registry.
+#[cfg(test)]
 pub fn is_known_tool(name: &str) -> bool {
-    TOOL_SPECS.iter().any(|s| s.name == name)
+    canonical_tool_name(name).is_some()
+}
+
+#[cfg(test)]
+pub fn registered_tool_names() -> impl Iterator<Item = &'static str> {
+    TOOL_SPECS.iter().map(|spec| spec.name)
+}
+
+#[cfg(test)]
+pub fn dispatched_tool_names() -> &'static [&'static str] {
+    DISPATCH_TOOL_NAMES
+}
+
+pub fn canonical_tool_name(name: &str) -> Option<&'static str> {
+    let trimmed = name
+        .trim()
+        .trim_matches('`')
+        .trim_matches('"')
+        .trim_matches('\'');
+    if let Some(spec) = TOOL_SPECS.iter().find(|s| s.name == trimmed) {
+        return Some(spec.name);
+    }
+    let trimmed = trimmed
+        .rsplit([':', '.', '/'])
+        .next()
+        .unwrap_or(trimmed)
+        .trim();
+    if let Some(spec) = TOOL_SPECS.iter().find(|s| s.name == trimmed) {
+        return Some(spec.name);
+    }
+    match trimmed {
+        "read_file"
+        | "view_file"
+        | "view_downloaded_file"
+        | "view_downloaded"
+        | "show_file"
+        | "display_file"
+        | "get_file"
+        | "get_file_content"
+        | "read_file_content"
+        | "read_downloaded"
+        | "read_downloaded_files"
+        | "inspect_downloaded_file" => Some("read_downloaded_file"),
+        "open_file" | "open_downloaded" | "open_downloaded_files" => Some("open_downloaded_file"),
+        "list_files" | "list_downloads" | "search_downloaded_files" => {
+            Some("list_downloaded_files")
+        }
+        "fetch_lms_course_resources"
+        | "get_lms_course_resources"
+        | "list_lms_course_resources"
+        | "fetch_lms_resources"
+        | "get_lms_resources"
+        | "list_lms_resources"
+        | "fetch_luna_course_resources"
+        | "get_luna_course_resources"
+        | "list_luna_course_resources"
+        | "list_course_resources"
+        | "get_course_resources" => Some("list_luna_announcements"),
+        "get_luna_detail" | "read_luna_activity" | "get_activity_detail" => {
+            Some("get_luna_activity_detail")
+        }
+        "download_attachment" | "download_material" => Some("download_luna_attachment"),
+        "download_file_by_name"
+        | "download_material_file"
+        | "download_course_material_file"
+        | "download_luna_material"
+        | "download_luna_file"
+        | "kg_canvas_download_luna_file" => Some("download_course_material"),
+        "browser_reload" | "reload_browser" => Some("browser_reload_page"),
+        "select_browser_option" => Some("browser_select_option"),
+        "browser_wait" | "wait_for_browser" => Some("browser_wait_for"),
+        "close_browser" => Some("browser_close"),
+        "calendar_list_events" => Some("list_google_calendar_events"),
+        "calendar_create_event" => Some("create_google_calendar_event"),
+        "calendar_delete_event" => Some("delete_google_calendar_event"),
+        "calendar_update_event" => Some("update_google_calendar_event"),
+        _ => None,
+    }
 }
 
 /// Dispatch a single tool call.  Returns a JSON value even on failure so the
 /// agent can still surface the error to the user.
 pub async fn dispatch(app: &tauri::AppHandle, name: &str, args: &Value) -> Value {
-    if !is_known_tool(name) {
+    let Some(name) = canonical_tool_name(name) else {
         return json!({ "error": format!("unknown tool: {}", name) });
-    }
+    };
     let result: Result<Value, String> = match name {
         "list_today_classes" => list_today_classes(app).await,
         "list_week_classes" => list_week_classes(app, args).await,
@@ -553,13 +701,14 @@ pub async fn dispatch(app: &tauri::AppHandle, name: &str, args: &Value) -> Value
         "get_luna_activity_detail" => get_luna_activity_detail(app, args).await,
         "refresh_data" => refresh_data(app).await,
         "list_downloaded_files" => list_downloaded_files(args).await,
-        "read_downloaded_file" | "inspect_file" => read_downloaded_file(args).await,
+        "read_downloaded_file" | "inspect_file" => read_downloaded_file(app, args).await,
         "write_downloaded_text_file" => write_downloaded_text_file(args).await,
         "open_downloaded_file" => open_downloaded_file(app, args).await,
         "delete_downloaded_file" => delete_downloaded_file(args).await,
         "download_url" => download_url(args).await,
         "open_luna_attachment" => open_luna_attachment(app, args).await,
         "download_luna_attachment" => download_luna_attachment(app, args).await,
+        "download_course_material" => download_course_material(app, args).await,
         "list_browser_windows" => list_browser_windows(app).await,
         "open_browser_url" => open_browser_url(app, args).await,
         "read_browser_page" => read_browser_page(app, args).await,
@@ -612,6 +761,7 @@ pub fn tool_catalog_prompt() -> String {
 }
 
 pub fn sanitize_tool_args(name: &str, args: &Value) -> Option<Value> {
+    let name = canonical_tool_name(name)?;
     let spec = TOOL_SPECS.iter().find(|s| s.name == name)?;
     sanitize_by_schema(spec.schema, args)
 }
@@ -628,30 +778,64 @@ fn sanitize_by_schema(schema: ArgSchema, args: &Value) -> Option<Value> {
             Some(json!({ key: val }))
         }
         ArgSchema::Text { key, max_len } => {
-            sanitize_text_arg(args, key, max_len).map(|v| json!({ key: v }))
+            let value = sanitize_text_arg(args, key, max_len).or_else(|| {
+                if key == "query" {
+                    sanitize_text_arg(args, "kgc_code", max_len)
+                        .or_else(|| sanitize_text_arg(args, "course_code", max_len))
+                        .or_else(|| sanitize_text_arg(args, "code", max_len))
+                        .or_else(|| sanitize_text_arg(args, "idnumber", max_len))
+                        .or_else(|| sanitize_text_arg(args, "luna_id", max_len))
+                        .or_else(|| sanitize_text_arg(args, "course_name", max_len))
+                        .or_else(|| sanitize_text_arg(args, "course", max_len))
+                        .or_else(|| sanitize_text_arg(args, "keyword", max_len))
+                } else {
+                    None
+                }
+            });
+            value.map(|v| json!({ key: v }))
         }
-        ArgSchema::CourseCode { key } => sanitize_course_code(args, key).map(|v| json!({ key: v })),
+        ArgSchema::CourseCode { key } => sanitize_course_code(args, key)
+            .or_else(|| sanitize_course_code(args, "course_code"))
+            .or_else(|| sanitize_course_code(args, "code"))
+            .or_else(|| sanitize_course_code(args, "query"))
+            .map(|v| json!({ key: v })),
         ArgSchema::LimitKeyword => {
             let limit = args
                 .get("limit")
                 .and_then(|v| v.as_u64())
                 .unwrap_or(10)
                 .min(LIST_CAP as u64);
-            let keyword = sanitize_text_arg(args, "keyword", 80);
+            let keyword = sanitize_text_arg(args, "keyword", 80)
+                .or_else(|| sanitize_text_arg(args, "course_name", 80))
+                .or_else(|| sanitize_text_arg(args, "course", 80))
+                .or_else(|| sanitize_text_arg(args, "query", 80));
             let mut out = json!({ "limit": limit });
             if let Some(keyword) = keyword {
                 out["keyword"] = Value::String(keyword);
             }
             Some(out)
         }
-        ArgSchema::MailMessageId => {
-            sanitize_text_arg(args, "message_id", 200).and_then(|message_id| {
+        ArgSchema::MailMessageId => sanitize_text_arg(args, "message_id", 200)
+            .or_else(|| sanitize_text_arg(args, "id", 200))
+            .and_then(|message_id| {
                 crate::mail::validate_message_id(&message_id).ok()?;
                 Some(json!({ "message_id": message_id }))
-            })
-        }
+            }),
         ArgSchema::FilePath => {
-            sanitize_file_path_arg(args, "path").map(|path| json!({ "path": path }))
+            if let Some(path) = sanitize_file_path_arg(args, "path") {
+                Some(json!({ "path": path }))
+            } else {
+                let filename = sanitize_filename_arg(args, "filename", 240)
+                    .or_else(|| sanitize_filename_arg(args, "file_name", 240))?;
+                let mut out = serde_json::Map::new();
+                out.insert("filename".to_string(), Value::String(filename));
+                if let Some(course) = sanitize_text_arg(args, "course_name", 120)
+                    .or_else(|| sanitize_text_arg(args, "course", 120))
+                {
+                    out.insert("course_name".to_string(), Value::String(course));
+                }
+                Some(Value::Object(out))
+            }
         }
         ArgSchema::FileWrite => {
             let path = sanitize_file_path_arg(args, "path")?;
@@ -659,12 +843,79 @@ fn sanitize_by_schema(schema: ArgSchema, args: &Value) -> Option<Value> {
             Some(json!({ "path": path, "content": content }))
         }
         ArgSchema::TitleAttachment => {
-            let title = sanitize_text_arg(args, "title", 120)?;
-            let attachment_name = sanitize_text_arg(args, "attachment_name", 160);
+            let title = sanitize_text_arg(args, "title", 120)
+                .or_else(|| sanitize_text_arg(args, "activity_title", 120))
+                .or_else(|| sanitize_text_arg(args, "activityTitle", 120))
+                .or_else(|| sanitize_text_arg(args, "name", 120))?;
+            let attachment_name = sanitize_text_arg(args, "attachment_name", 160)
+                .or_else(|| sanitize_text_arg(args, "filename", 160))
+                .or_else(|| sanitize_text_arg(args, "file_name", 160));
             let mut out = serde_json::Map::new();
             out.insert("title".to_string(), Value::String(title));
             if let Some(name) = attachment_name {
                 out.insert("attachment_name".to_string(), Value::String(name));
+            }
+            Some(Value::Object(out))
+        }
+        ArgSchema::LunaActivityDetail => {
+            let title = sanitize_text_arg(args, "title", 120)
+                .or_else(|| sanitize_text_arg(args, "activity_title", 120))
+                .or_else(|| sanitize_text_arg(args, "activityTitle", 120))
+                .or_else(|| sanitize_text_arg(args, "name", 120));
+            let activity_type = sanitize_text_arg(args, "activity_type", 80)
+                .or_else(|| sanitize_text_arg(args, "type", 80));
+            let luna_id = sanitize_text_arg(args, "luna_id", 80);
+            // Require at least one meaningful field; reject fully-empty calls.
+            if title.is_none() && activity_type.is_none() && luna_id.is_none() {
+                return None;
+            }
+            let mut out = serde_json::Map::new();
+            if let Some(t) = title {
+                out.insert("title".to_string(), Value::String(t));
+            }
+            if let Some(atype) = activity_type {
+                out.insert("activity_type".to_string(), Value::String(atype));
+            }
+            if let Some(id) = luna_id {
+                out.insert("luna_id".to_string(), Value::String(id));
+            }
+            Some(Value::Object(out))
+        }
+        ArgSchema::DownloadLunaAttachment => {
+            let title = sanitize_text_arg(args, "title", 120)
+                .or_else(|| sanitize_text_arg(args, "activity_title", 120))
+                .or_else(|| sanitize_text_arg(args, "activityTitle", 120))
+                .or_else(|| sanitize_text_arg(args, "name", 120))?;
+            let attachment_name = sanitize_text_arg(args, "attachment_name", 160)
+                .or_else(|| sanitize_text_arg(args, "filename", 160))
+                .or_else(|| sanitize_text_arg(args, "file_name", 160));
+            let luna_id = sanitize_text_arg(args, "luna_id", 80);
+            let mut out = serde_json::Map::new();
+            out.insert("title".to_string(), Value::String(title));
+            if let Some(name) = attachment_name {
+                out.insert("attachment_name".to_string(), Value::String(name));
+            }
+            if let Some(id) = luna_id {
+                out.insert("luna_id".to_string(), Value::String(id));
+            }
+            Some(Value::Object(out))
+        }
+        ArgSchema::DownloadCourseMaterial => {
+            let filename = sanitize_text_arg(args, "filename", 160)
+                .or_else(|| sanitize_text_arg(args, "file_name", 160))
+                .or_else(|| sanitize_text_arg(args, "attachment_name", 160))
+                .or_else(|| sanitize_text_arg(args, "name", 160))?;
+            let title = sanitize_text_arg(args, "title", 120)
+                .or_else(|| sanitize_text_arg(args, "activity_title", 120))
+                .or_else(|| sanitize_text_arg(args, "activityTitle", 120));
+            let luna_id = sanitize_text_arg(args, "luna_id", 80);
+            let mut out = serde_json::Map::new();
+            out.insert("filename".to_string(), Value::String(filename));
+            if let Some(t) = title {
+                out.insert("title".to_string(), Value::String(t));
+            }
+            if let Some(id) = luna_id {
+                out.insert("luna_id".to_string(), Value::String(id));
             }
             Some(Value::Object(out))
         }
@@ -710,6 +961,22 @@ fn sanitize_text_arg(args: &Value, key: &str, max_len: usize) -> Option<String> 
     out = out.replace(['\n', '\r'], " ");
     let out = out.split_whitespace().collect::<Vec<_>>().join(" ");
     if out.is_empty() {
+        None
+    } else {
+        Some(out)
+    }
+}
+
+fn sanitize_filename_arg(args: &Value, key: &str, max_len: usize) -> Option<String> {
+    let value = args.get(key).and_then(|v| v.as_str())?.trim();
+    if value.is_empty() || value.chars().count() > max_len {
+        return None;
+    }
+    if value.contains('\0') || value.contains('/') || value.contains('\\') {
+        return None;
+    }
+    let out = value.replace(['\n', '\r'], " ");
+    if out.trim().is_empty() {
         None
     } else {
         Some(out)
