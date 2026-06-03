@@ -1815,7 +1815,13 @@ fn install_click_monitor(ui: &mut CapsuleViews, app: AppHandle) {
                 });
 
                 if should_open {
-                    let _ = crate::agent_commands::open_agent_popup(app.clone(), None, None);
+                    let _ = crate::agent_commands::open_agent_popup(
+                        app.clone(),
+                        None,
+                        None,
+                        None,
+                        None,
+                    );
                 }
 
                 event.as_ptr()

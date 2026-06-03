@@ -205,6 +205,8 @@ fn emit(app: &AppHandle, conv_id: &str, ev: &StreamEvent) {
 pub struct AgentTurnContext {
     pub browser_target: Option<String>,
     pub browser_click_labels: Vec<String>,
+    pub page_title: Option<String>,
+    pub page_kind: Option<String>,
 }
 
 /// Called from the Tauri command layer.
@@ -722,7 +724,7 @@ fn build_plan_messages_with_note(
     turn_context: &AgentTurnContext,
 ) -> Vec<ChatMessage> {
     let mut system = agent_prompts::plan_system_prompt(&datetime_context(), supports_prefill);
-    append_browser_context(&mut system, app, turn_context.browser_target.as_deref());
+    append_browser_context(&mut system, app, turn_context);
     if let Some(note) = repair_note {
         system.push_str("\n\n=== INVALID PREVIOUS PLAN ===\n");
         system.push_str(note);
@@ -890,8 +892,10 @@ fn summarize_plan_tool_result(name: &str, json: &str) -> String {
                     .take(3)
                     .map(|w| {
                         format!(
-                            "browser[target={}, url={}]",
+                            "browser[target={}, type={}, title={}, url={}]",
                             w.get("target").and_then(|v| v.as_str()).unwrap_or(""),
+                            w.get("type").and_then(|v| v.as_str()).unwrap_or(""),
+                            w.get("title").and_then(|v| v.as_str()).unwrap_or(""),
                             w.get("url").and_then(|v| v.as_str()).unwrap_or("")
                         )
                     })
@@ -1348,16 +1352,21 @@ fn summarize_plan_tool_result(name: &str, json: &str) -> String {
 fn append_browser_context(
     system: &mut String,
     app: Option<&AppHandle>,
-    active_target: Option<&str>,
+    turn_context: &AgentTurnContext,
 ) {
     let Some(app) = app else {
         return;
     };
+    let active_target = turn_context.browser_target.as_deref();
     let windows = crate::webview_toolbar::list_browser_windows(app);
     system.push_str("\n\n=== CURRENT BROWSER WINDOWS ===\n");
     if let Some(active) = active_target {
+        let title = turn_context.page_title.as_deref().unwrap_or("");
+        let kind = turn_context.page_kind.as_deref().unwrap_or("");
         system.push_str(&format!(
             "ACTIVE ATTACHED TARGET: {active}\n\
+             ACTIVE PAGE TITLE: {title}\n\
+             ACTIVE PAGE TYPE: {kind}\n\
              The current Agent panel is attached to this exact webview. For references like \
              \"this page\", \"current page\", \"这里\", \"这个页面\", \"このページ\", or \
              \"今見ている内容\", use target=\"{active}\" exactly. Do not use another window \
@@ -1376,10 +1385,12 @@ fn append_browser_context(
             .map(|target| target == window.target || target == window.label)
             .unwrap_or(false);
         system.push_str(&format!(
-            "- label={} target={} active={} url={}\n",
+            "- label={} target={} active={} type={} title={} url={}\n",
             window.label,
             window.target,
             active,
+            window.kind,
+            trim_to(&window.title, 120),
             trim_to(&window.url, 240)
         ));
     }
@@ -2908,7 +2919,7 @@ fn build_answer_messages(
          Use this only to avoid inventing capabilities or fake tool names.\n",
     );
     system.push_str(agent_tools::tool_catalog_prompt());
-    append_browser_context(&mut system, app, turn_context.browser_target.as_deref());
+    append_browser_context(&mut system, app, turn_context);
 
     if !tool_results.is_empty() {
         system.push_str("\n\n<tool_results>\n");
@@ -4247,6 +4258,7 @@ mod tests {
         let ctx = AgentTurnContext {
             browser_target: Some("ext-a-ct".into()),
             browser_click_labels: Vec::new(),
+            ..Default::default()
         };
         let plan = attached_browser_control_plan(&normalize_planner_text("回到首页"), &ctx)
             .expect("attached browser plan");
@@ -4259,6 +4271,7 @@ mod tests {
         let ctx = AgentTurnContext {
             browser_target: Some("ext-a-ct".into()),
             browser_click_labels: vec!["home".into()],
+            ..Default::default()
         };
         let plan = attached_browser_control_plan(&normalize_planner_text("点啊"), &ctx)
             .expect("attached browser click plan");
@@ -4411,6 +4424,7 @@ mod tests {
         let ctx = AgentTurnContext {
             browser_target: Some("ext-a-ct".into()),
             browser_click_labels: vec!["ボランティア集まれ".into()],
+            ..Default::default()
         };
         let args = infer_mouse_click_from_observation("点击", &page, &ctx).expect("mouse args");
         assert_eq!(args.get("x").and_then(|v| v.as_i64()), Some(640));
@@ -4577,6 +4591,7 @@ mod tests {
             &AgentTurnContext {
                 browser_target: Some("kwic-detail-0-ct".into()),
                 browser_click_labels: Vec::new(),
+                ..Default::default()
             },
         )
         .expect("mouse args");
@@ -4597,6 +4612,7 @@ mod tests {
             &AgentTurnContext {
                 browser_target: Some("kwic-detail-0-ct".into()),
                 browser_click_labels: Vec::new(),
+                ..Default::default()
             },
         )
         .expect("local browser action answer");
@@ -5231,6 +5247,7 @@ mod tests {
         let ctx = AgentTurnContext {
             browser_target: Some("ext-a-ct".into()),
             browser_click_labels: Vec::new(),
+            ..Default::default()
         };
         let finalized = finalize_plan_with_diagnostics(plan, &[], "这个页面看看", &ctx);
         assert_eq!(finalized.plan.tools.len(), 3);

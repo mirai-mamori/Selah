@@ -16,6 +16,8 @@
     --border: rgba(0, 0, 0, 0.08);
     --accent: #002855;
     --accent-hover: #003d80;
+    --agent-accent: #173b68;
+    --agent-accent-bg: color-mix(in srgb, #173b68 10%, transparent);
     --blue: #007aff;
     --green: #34c759;
     --orange: #ff9500;
@@ -39,6 +41,8 @@
       --border: rgba(255, 255, 255, 0.08);
       --accent: #4a90d9;
       --accent-hover: #6aa8f0;
+      --agent-accent: #fbbf24;
+      --agent-accent-bg: color-mix(in srgb, #fbbf24 14%, transparent);
       --blue: #0a84ff;
       --green: #30d158;
       --orange: #ff9f0a;
@@ -61,6 +65,8 @@
     --border: rgba(255, 255, 255, 0.08);
     --accent: #4a90d9;
     --accent-hover: #6aa8f0;
+    --agent-accent: #fbbf24;
+    --agent-accent-bg: color-mix(in srgb, #fbbf24 14%, transparent);
     --blue: #0a84ff;
     --green: #30d158;
     --orange: #ff9f0a;
@@ -137,6 +143,28 @@
   .tb-btn.primary:hover:not(:disabled) { background: var(--accent-hover); color: #fff; }
   .tb-btn.primary:disabled { background: var(--text-tertiary); border-color: var(--text-tertiary); color: #fff; opacity: 0.5; }
   .tb-btn.active { color: var(--accent); background: color-mix(in srgb, var(--accent) 10%, transparent); }
+  .tb-btn.agent-reader-btn {
+    gap: 4px;
+    padding: 5px 10px;
+    border-radius: 6px;
+    font-size: 11px;
+    font-weight: 600;
+    color: var(--agent-accent);
+    background: var(--bg-secondary);
+    border-color: var(--border);
+    box-shadow: none;
+  }
+  .tb-btn.agent-reader-btn:hover:not(:disabled) {
+    color: var(--agent-accent);
+    background: var(--border);
+    border-color: var(--border);
+  }
+  .agent-reader-logo {
+    width: 12px;
+    height: 12px;
+    object-fit: contain;
+    flex: 0 0 auto;
+  }
   .tb-btn .dot {
     display: inline-block;
     width: 6px; height: 6px;
@@ -749,6 +777,11 @@
   <button class="tb-btn" id="tocToggleBtn" type="button" title="目次の表示/非表示">目次を表示</button>
 
   <div class="tb-spacer"></div>
+
+  <button class="tb-btn agent-reader-btn" id="agentBtn" type="button" title="エージェント">
+    <img class="agent-reader-logo" src="logo.png" alt="" aria-hidden="true">
+    <span>エージェント</span>
+  </button>
 
   <div class="tb-group" title="本文の文字サイズを変更">
     <button class="tb-btn" id="fontDownBtn" type="button">文字を縮小</button>
@@ -1689,6 +1722,21 @@
     if (!invoke || !currentPath) return;
     invoke('luna_reveal_file', { path: currentPath }).catch(function (e) {
       console.error('[md-reader] reveal failed:', e);
+    });
+  });
+  $('agentBtn').addEventListener('click', function () {
+    if (!invoke) return;
+    var label = '';
+    try {
+      label = (tauri.window && tauri.window.getCurrentWindow && tauri.window.getCurrentWindow().label) || '';
+    } catch (_) {}
+    invoke('open_agent_popup', {
+      ownerLabel: label || null,
+      target: label || null,
+      title: document.title || 'Markdown',
+      kind: 'reader'
+    }).catch(function (e) {
+      console.error('[md-reader] open agent failed:', e);
     });
   });
   $('externalBtn').addEventListener('click', function () {

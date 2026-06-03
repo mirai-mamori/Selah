@@ -597,6 +597,7 @@ pub fn run() {
             webview_toolbar::browser_go_forward,
             webview_toolbar::browser_reload,
             webview_toolbar::browser_get_url,
+            webview_toolbar::browser_get_page_title,
             webview_toolbar::browser_report_page_text,
             webview_toolbar::browser_report_action_result,
             webview_toolbar::debug_browser_mouse_selftest_report,

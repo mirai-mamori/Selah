@@ -59,8 +59,8 @@ function installAgentTitlebarButton() {
   btn.type = 'button';
   btn.className = 'luna-open-btn agent-open-btn';
   btn.dataset.openAgent = '1';
-  btn.title = 'Agent';
-  btn.innerHTML = '<svg width="12" height="12" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M12 3a4 4 0 014 4v1h1.5A2.5 2.5 0 0120 10.5v5A4.5 4.5 0 0115.5 20h-7A4.5 4.5 0 014 15.5v-5A2.5 2.5 0 016.5 8H8V7a4 4 0 014-4zm-2 5h4V7a2 2 0 10-4 0v1zm-3.5 2a.5.5 0 00-.5.5v5A2.5 2.5 0 008.5 18h7a2.5 2.5 0 002.5-2.5v-5a.5.5 0 00-.5-.5h-11zM9 13a1 1 0 110-2 1 1 0 010 2zm6 0a1 1 0 110-2 1 1 0 010 2z"/></svg>Agent';
+  btn.title = 'エージェント';
+  btn.innerHTML = '<img class="agent-open-logo" src="logo.png" alt="" aria-hidden="true"><span>エージェント</span>';
   btn.addEventListener('click', function(e) {
     e.preventDefault();
     e.stopPropagation();
@@ -70,9 +70,37 @@ function installAgentTitlebarButton() {
     try {
       label = getCurrentWindow ? getCurrentWindow().label : '';
     } catch (_) {}
-    invoke?.('open_agent_popup', { ownerLabel: label || null, target: label || null }).catch(function(){});
+    var meta = currentAgentPageMeta();
+    invoke?.('open_agent_popup', {
+      ownerLabel: label || null,
+      target: label || null,
+      title: meta.title || null,
+      kind: meta.kind || 'detail'
+    }).catch(function(){});
   });
   titlebar.appendChild(btn);
+}
+
+function cleanAgentTitle(value) {
+  return String(value || '').replace(/\s+/g, ' ').trim();
+}
+
+function currentAgentPageMeta() {
+  var params = new URLSearchParams(window.location.search);
+  var title = cleanAgentTitle(
+    _currentDetailTitle ||
+    _currentCourseName ||
+    params.get('title') ||
+    params.get('name') ||
+    document.querySelector('.page-title')?.textContent ||
+    document.querySelector('.hero-title')?.textContent ||
+    ''
+  );
+  return {
+    title: title,
+    kind: 'detail',
+    mode: params.get('mode') || ''
+  };
 }
 
 // Router

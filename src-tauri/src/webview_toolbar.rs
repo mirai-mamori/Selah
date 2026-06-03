@@ -5,7 +5,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{LazyLock, Mutex};
 use tauri::{Emitter, Manager};
 
-const TOOLBAR_HEIGHT: f64 = 38.0;
+const TOOLBAR_HEIGHT: f64 = 46.0;
 const AGENT_PANEL_WIDTH: f64 = 360.0;
 const BROWSER_BRIDGE_SCRIPT: &str = r#"
 (function () {
@@ -958,6 +958,10 @@ static BROWSER_WINDOW_LABELS: LazyLock<Mutex<HashSet<String>>> =
     LazyLock::new(|| Mutex::new(HashSet::new()));
 static BROWSER_WINDOW_TARGETS: LazyLock<Mutex<HashMap<String, String>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
+static BROWSER_WINDOW_TITLES: LazyLock<Mutex<HashMap<String, String>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+static BROWSER_WINDOW_KINDS: LazyLock<Mutex<HashMap<String, String>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
 static BROWSER_AGENT_PANELS: LazyLock<Mutex<HashSet<String>>> =
     LazyLock::new(|| Mutex::new(HashSet::new()));
 static BROWSER_NEW_WINDOW_COUNTER: AtomicU32 = AtomicU32::new(0);
@@ -967,6 +971,10 @@ pub struct BrowserWindowInfo {
     pub label: String,
     pub target: String,
     pub url: String,
+    #[serde(default)]
+    pub title: String,
+    #[serde(default, rename = "type")]
+    pub kind: String,
 }
 
 pub fn browser_bridge_script() -> &'static str {
@@ -1014,6 +1022,17 @@ pub fn register_readable_window(app: &tauri::AppHandle, label: &str, target: &st
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .insert(label.to_string(), target.to_string());
+    BROWSER_WINDOW_KINDS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .entry(label.to_string())
+        .or_insert_with(|| {
+            if label.contains("detail") || target.contains("detail") {
+                "detail".to_string()
+            } else {
+                "browser".to_string()
+            }
+        });
     let app_resize = app.clone();
     let owner_label_resize = label.to_string();
     let win_for_scale = window.clone();
@@ -1136,6 +1155,8 @@ pub fn open_agent_side_panel(
     app: &tauri::AppHandle,
     owner_label: Option<&str>,
     target: Option<&str>,
+    title: Option<&str>,
+    kind: Option<&str>,
 ) -> Result<(), String> {
     let target = target.unwrap_or("").trim();
     let owner = owner_label
@@ -1156,13 +1177,33 @@ pub fn open_agent_side_panel(
     let window = app
         .get_window(&owner)
         .ok_or_else(|| format!("ウィンドウが見つかりません: {}", owner))?;
+    if let Some(title) = title.map(str::trim).filter(|s| !s.is_empty()) {
+        BROWSER_WINDOW_TITLES
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(owner.clone(), title.to_string());
+    }
+    if let Some(kind) = kind.map(str::trim).filter(|s| !s.is_empty()) {
+        BROWSER_WINDOW_KINDS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(owner.clone(), kind.to_string());
+    }
     let panel_label = browser_agent_panel_label(&owner);
     if app.get_webview(&panel_label).is_none() {
-        let panel_url = format!(
+        let mut panel_url = format!(
             "agent-popup.html?embedded=1&owner={}&target={}",
             urlencoding::encode(&owner),
             urlencoding::encode(&target)
         );
+        if let Some(title) = title.map(str::trim).filter(|s| !s.is_empty()) {
+            panel_url.push_str("&title=");
+            panel_url.push_str(&urlencoding::encode(title));
+        }
+        if let Some(kind) = kind.map(str::trim).filter(|s| !s.is_empty()) {
+            panel_url.push_str("&kind=");
+            panel_url.push_str(&urlencoding::encode(kind));
+        }
         let panel_builder = tauri::webview::WebviewBuilder::new(
             &panel_label,
             tauri::WebviewUrl::App(panel_url.into()),
@@ -1508,6 +1549,8 @@ pub fn create_browser_window(
         label: label.to_string(),
         target: content_label,
         url: String::new(),
+        title: title.to_string(),
+        kind: "browser".to_string(),
     })
 }
 
@@ -1535,6 +1578,52 @@ pub async fn browser_reload(app: tauri::AppHandle, target: String) -> Result<(),
 pub async fn browser_get_url(app: tauri::AppHandle, target: String) -> Result<String, String> {
     let wv = app.get_webview(&target).ok_or("Webview not found")?;
     wv.url().map(|u| u.to_string()).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub async fn browser_get_page_title(
+    app: tauri::AppHandle,
+    target: String,
+) -> Result<String, String> {
+    let wv = app.get_webview(&target).ok_or("Webview not found")?;
+    let request_id = uuid::Uuid::new_v4().to_string();
+    let (tx, rx) = tokio::sync::oneshot::channel::<Value>();
+    BROWSER_ACTION_WAITERS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(request_id.clone(), tx);
+    let script = format!(
+        r#"(function() {{
+          var invoke = window.__TAURI__?.core?.invoke || window.__TAURI_INTERNALS__?.invoke;
+          if (!invoke) return;
+          invoke('browser_report_action_result', {{
+            report: {{
+              requestId: {request_id:?},
+              payload: {{
+                title: String(document.title || '').trim()
+              }}
+            }}
+          }}).catch(function(){{}});
+        }})();"#
+    );
+    if let Err(e) = wv.eval(&script) {
+        BROWSER_ACTION_WAITERS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&request_id);
+        return Err(e.to_string());
+    }
+    let value = tokio::time::timeout(std::time::Duration::from_millis(900), rx)
+        .await
+        .ok()
+        .and_then(Result::ok)
+        .unwrap_or(Value::Null);
+    Ok(value
+        .get("title")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim()
+        .to_string())
 }
 
 /// Close the browser window that owns `target` (which may be either the window
@@ -1635,7 +1724,31 @@ pub fn list_browser_windows(app: &tauri::AppHandle) -> Vec<BrowserWindowInfo> {
                 .and_then(|wv| wv.url().ok())
                 .map(|u| u.to_string())
                 .unwrap_or_default();
-            Some(BrowserWindowInfo { label, target, url })
+            let title = BROWSER_WINDOW_TITLES
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get(&label)
+                .cloned()
+                .unwrap_or_default();
+            let kind = BROWSER_WINDOW_KINDS
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get(&label)
+                .cloned()
+                .unwrap_or_else(|| {
+                    if label.contains("detail") || target.contains("detail") {
+                        "detail".to_string()
+                    } else {
+                        "browser".to_string()
+                    }
+                });
+            Some(BrowserWindowInfo {
+                label,
+                target,
+                url,
+                title,
+                kind,
+            })
         })
         .collect();
     items.sort_by(|a, b| a.label.cmp(&b.label));

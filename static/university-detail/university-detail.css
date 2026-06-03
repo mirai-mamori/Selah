@@ -9,6 +9,8 @@
     --border-strong: rgba(0,0,0,0.10);
     --accent: #007aff;
     --accent-bg: rgba(0,122,255,0.08);
+    --agent-accent: #173b68;
+    --agent-accent-bg: color-mix(in srgb, #173b68 10%, transparent);
     --red: #ff3b30;
     --red-bg: rgba(255,59,48,0.08);
     --orange: #ff9500;
@@ -42,6 +44,8 @@
       --border-strong: rgba(255,255,255,0.14);
       --accent: #0a84ff;
       --accent-bg: rgba(10,132,255,0.15);
+      --agent-accent: #fbbf24;
+      --agent-accent-bg: color-mix(in srgb, #fbbf24 14%, transparent);
       --red: #ff453a;
       --red-bg: rgba(255,69,58,0.15);
       --orange: #ff9f0a;
@@ -72,6 +76,8 @@
     --border-strong: rgba(255,255,255,0.14);
     --accent: #0a84ff;
     --accent-bg: rgba(10,132,255,0.15);
+    --agent-accent: #fbbf24;
+    --agent-accent-bg: color-mix(in srgb, #fbbf24 14%, transparent);
     --red: #ff453a;
     --red-bg: rgba(255,69,58,0.15);
     --orange: #ff9f0a;
@@ -133,7 +139,25 @@
   }
   .window-titlebar .luna-open-btn svg { opacity:0.55; }
   .window-titlebar .agent-open-btn {
-    color:var(--accent);
+    gap:5px;
+    padding:4px 10px;
+    border-radius:6px;
+    font-size:11px;
+    font-weight:600;
+    color:var(--agent-accent);
+    background:transparent;
+    border:none;
+    box-shadow:none;
+  }
+  .window-titlebar .agent-open-btn:hover {
+    color:var(--agent-accent);
+    background:var(--border);
+  }
+  .window-titlebar .agent-open-logo {
+    width:12px;
+    height:12px;
+    object-fit:contain;
+    flex:0 0 auto;
   }
 
   /* Loading / Error */

@@ -117,6 +117,8 @@ pub async fn agent_send_with_context(
     content: String,
     images: Option<Vec<ImagePart>>,
     browser_target: Option<String>,
+    page_title: Option<String>,
+    page_kind: Option<String>,
 ) -> Result<(), String> {
     let content = content.trim().to_string();
     let imgs = images.unwrap_or_default();
@@ -139,6 +141,12 @@ pub async fn agent_send_with_context(
         agent::AgentTurnContext {
             browser_target,
             browser_click_labels: Vec::new(),
+            page_title: page_title
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty()),
+            page_kind: page_kind
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty()),
         },
     )
     .await
@@ -159,12 +167,16 @@ pub fn open_agent_popup(
     app: AppHandle,
     owner_label: Option<String>,
     target: Option<String>,
+    title: Option<String>,
+    kind: Option<String>,
 ) -> Result<(), String> {
     if owner_label.as_deref().is_some() || target.as_deref().is_some() {
         return crate::webview_toolbar::open_agent_side_panel(
             &app,
             owner_label.as_deref(),
             target.as_deref(),
+            title.as_deref(),
+            kind.as_deref(),
         );
     }
 

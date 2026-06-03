@@ -2,7 +2,10 @@
 function renderDetail(data) {
   _detailAttachments = data.attachments || [];
   if (data.course_name) _currentCourseName = data.course_name;
-  if (data.title) _currentDetailTitle = data.title;
+  if (data.title) {
+    _currentDetailTitle = data.title;
+    document.title = data.title;
+  }
   var c = document.getElementById('content');
   if (data.error) { c.innerHTML = '<div class="error">' + escapeHtml(data.error) + '</div>'; return; }
   var h = '<div class="detail-wrap">';

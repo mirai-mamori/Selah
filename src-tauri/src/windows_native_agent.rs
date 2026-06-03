@@ -1055,7 +1055,7 @@ fn cancel_auto_close() {
 // ─ Navigation ─────────────────────────────────────────────────────────────────
 fn bring_main_window_to_front() {
     let Some(app) = APP_HANDLE.get() else { return };
-    let _ = crate::agent_commands::open_agent_popup(app.clone(), None, None);
+    let _ = crate::agent_commands::open_agent_popup(app.clone(), None, None, None, None);
 }
 
 // ─ Mode transitions ───────────────────────────────────────────────────────────

@@ -563,6 +563,41 @@ impl Database {
         Ok(map.into_iter().collect())
     }
 
+    /// The full 授業計画 per course name: `(name, [(session_num, topic,
+    /// delivery_mode)])`, session-ordered. Used to align a Live note to its
+    /// 真の第N回 by content, and to tell offline (Live-bearing) 回 from online
+    /// ones that never produce a recording.
+    pub fn get_planned_sessions_by_name(
+        &self,
+    ) -> Result<Vec<(String, Vec<(i32, String, String)>)>, String> {
+        let conn = self.conn.lock().map_err(|e| format!("DB lock: {}", e))?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT c.name, sp.session_num, sp.topic, sp.delivery_mode
+                 FROM session_plans sp
+                 JOIN (SELECT DISTINCT kgc_code, name FROM kgc_courses) c
+                   ON c.kgc_code = sp.kgc_code
+                 ORDER BY c.name, sp.session_num",
+            )
+            .map_err(|e| format!("DB query: {}", e))?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i32>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                ))
+            })
+            .map_err(|e| format!("DB map: {}", e))?;
+        let mut map: std::collections::HashMap<String, Vec<(i32, String, String)>> =
+            Default::default();
+        for (name, num, topic, mode) in rows.flatten() {
+            map.entry(name).or_default().push((num, topic, mode));
+        }
+        Ok(map.into_iter().collect())
+    }
+
     // ── KGC course details ──
 
     pub fn upsert_kgc_course_detail(&self, detail: &KgcCourseDetailRow) -> Result<(), String> {
