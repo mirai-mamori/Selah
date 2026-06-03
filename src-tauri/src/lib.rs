@@ -16,6 +16,7 @@ mod auth;
 mod background_refresh;
 mod client;
 mod commands;
+mod computer_control;
 pub(crate) mod config;
 mod cookie_bridge;
 mod db;
@@ -61,6 +62,18 @@ pub fn run_stt_decode_helper_from_args() -> Option<i32> {
 #[cfg(debug_assertions)]
 pub(crate) fn should_dump_debug_html() -> bool {
     std::env::var("SELAH_DUMP_HTML")
+        .map(|value| {
+            matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+        .unwrap_or(false)
+}
+
+#[cfg(debug_assertions)]
+fn should_run_browser_mouse_selftest() -> bool {
+    std::env::var("SELAH_BROWSER_MOUSE_SELFTEST")
         .map(|value| {
             matches!(
                 value.trim().to_ascii_lowercase().as_str(),
@@ -240,6 +253,15 @@ pub fn run() {
 
     builder
         .setup(|app| {
+            #[cfg(debug_assertions)]
+            let browser_mouse_selftest = should_run_browser_mouse_selftest();
+            #[cfg(not(debug_assertions))]
+            let browser_mouse_selftest = false;
+            #[cfg(debug_assertions)]
+            if browser_mouse_selftest {
+                eprintln!("SELAH_BROWSER_MOUSE_SELFTEST_REQUESTED");
+            }
+
             #[cfg(not(target_os = "macos"))]
             app.handle().plugin(tauri_plugin_notification::init())?;
             app.handle().plugin(tauri_plugin_opener::init())?;
@@ -309,10 +331,12 @@ pub fn run() {
             let tray_status = std::sync::Arc::new(tray::TrayStatusState::new());
             app.manage(tray_status.clone());
             tray::setup_tray(app.handle())?;
-            tray::start_tray_cycle(app.handle(), tray_status);
-            background_refresh::start_background_refresh_loop(app.handle());
-            ai_refresh::start_ai_refresh_loop(app.handle());
-            notifier::start_notification_loop(app.handle());
+            if !browser_mouse_selftest {
+                tray::start_tray_cycle(app.handle(), tray_status);
+                background_refresh::start_background_refresh_loop(app.handle());
+                ai_refresh::start_ai_refresh_loop(app.handle());
+                notifier::start_notification_loop(app.handle());
+            }
             commands::migrate_uncategorized_to_other();
             commands::migrate_rename_course_folders();
             commands::migrate_normalize_course_names();
@@ -362,6 +386,30 @@ pub fn run() {
                 });
             }
 
+            #[cfg(debug_assertions)]
+            if browser_mouse_selftest {
+                if let Some(win) = app.get_webview_window("main") {
+                    let _ = win.hide();
+                }
+                let app_handle = app.handle().clone();
+                tauri::async_runtime::spawn(async move {
+                    eprintln!("SELAH_BROWSER_MOUSE_SELFTEST_START");
+                    tokio::time::sleep(std::time::Duration::from_millis(900)).await;
+                    match webview_toolbar::debug_browser_mouse_click_selftest(app_handle.clone())
+                        .await
+                    {
+                        Ok(result) => {
+                            eprintln!("SELAH_BROWSER_MOUSE_SELFTEST_PASS {result}");
+                            app_handle.exit(0);
+                        }
+                        Err(err) => {
+                            eprintln!("SELAH_BROWSER_MOUSE_SELFTEST_FAIL {err}");
+                            app_handle.exit(1);
+                        }
+                    }
+                });
+            }
+
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -396,6 +444,8 @@ pub fn run() {
             commands::fetch_student_profile,
             commands::debug_info,
             commands::debug_ping,
+            commands::debug_computer_mouse_click,
+            commands::debug_browser_mouse_click_selftest,
             commands::search_syllabus,
             commands::fetch_syllabus_favorites,
             commands::toggle_syllabus_bookmark,
@@ -437,7 +487,9 @@ pub fn run() {
             kwic_commands::kwic_fetch_home,
             kwic_commands::kwic_fetch_detail,
             kwic_commands::kwic_fetch_subportal,
+            kwic_commands::kwic_fetch_cabinet_reference,
             kwic_commands::kwic_open_detail_window,
+            kwic_commands::kwic_open_cabinet_window,
             kwic_commands::kwic_open_link,
             mail_commands::mail_check_session,
             mail_commands::mail_open_login,
@@ -547,11 +599,16 @@ pub fn run() {
             webview_toolbar::browser_get_url,
             webview_toolbar::browser_report_page_text,
             webview_toolbar::browser_report_action_result,
+            webview_toolbar::debug_browser_mouse_selftest_report,
             agent_commands::agent_list_conversations,
             agent_commands::agent_create_conversation,
             agent_commands::agent_load_messages,
             agent_commands::agent_send,
+            agent_commands::agent_send_with_context,
             agent_commands::agent_cancel,
+            agent_commands::agent_cancel_active,
+            agent_commands::open_agent_popup,
+            agent_commands::close_agent_popup,
             agent_commands::agent_delete_conversation,
             agent_commands::agent_rename_conversation,
             commands::open_subtitle_overlay,

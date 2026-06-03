@@ -1055,12 +1055,7 @@ fn cancel_auto_close() {
 // ─ Navigation ─────────────────────────────────────────────────────────────────
 fn bring_main_window_to_front() {
     let Some(app) = APP_HANDLE.get() else { return };
-    if let Some(win) = app.get_webview_window("main") {
-        let _ = win.unminimize();
-        let _ = win.show();
-        let _ = win.set_focus();
-    }
-    let _ = app.emit("tray-open-tab", "agent");
+    let _ = crate::agent_commands::open_agent_popup(app.clone(), None, None);
 }
 
 // ─ Mode transitions ───────────────────────────────────────────────────────────

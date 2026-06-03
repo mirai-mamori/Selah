@@ -105,6 +105,8 @@
 
   let notifTestMsg = $state("Selah テスト通知");
   let notifSyncing = $state(false);
+  let mouseSelfTest = $state<"idle" | "running" | "passed" | "failed">("idle");
+  let mouseSelfTestDetail = $state("");
   let unlistenSttState: (() => void) | null = null;
   let unlistenSttConfigChanged: (() => void) | null = null;
   let unlistenSttInfo: (() => void) | null = null;
@@ -266,6 +268,65 @@
       addLog("error", `通知同期失敗: ${e}`);
     } finally {
       notifSyncing = false;
+    }
+  }
+
+  async function runMouseSelfTest() {
+    mouseSelfTest = "running";
+    mouseSelfTestDetail = "";
+    addLog("info", "マウス操作セルフテストを開始");
+
+    let hit = false;
+    const target = document.createElement("button");
+    target.type = "button";
+    target.textContent = "Mouse target";
+    target.setAttribute("aria-label", "Mouse self test target");
+    Object.assign(target.style, {
+      position: "fixed",
+      left: "360px",
+      top: "172px",
+      width: "156px",
+      height: "46px",
+      zIndex: "2147483647",
+      border: "2px solid #0a84ff",
+      borderRadius: "7px",
+      background: "#ffffff",
+      color: "#0a1f44",
+      font: "600 13px system-ui, -apple-system, BlinkMacSystemFont, sans-serif",
+      boxShadow: "0 10px 24px rgba(0,0,0,0.22)",
+      cursor: "pointer",
+    });
+    target.onclick = () => {
+      hit = true;
+      target.textContent = "Clicked";
+    };
+    document.body.appendChild(target);
+
+    try {
+      await new Promise<void>((resolve) => requestAnimationFrame(() => resolve()));
+      const rect = target.getBoundingClientRect();
+      const result = await invoke<any>("debug_computer_mouse_click", {
+        target: "main",
+        x: rect.left + rect.width / 2,
+        y: rect.top + rect.height / 2,
+        coordinateSpace: "webview",
+      });
+      await new Promise((resolve) => setTimeout(resolve, 650));
+      if (!hit) {
+        mouseSelfTest = "failed";
+        mouseSelfTestDetail = `click returned but target did not receive event (${JSON.stringify(result)})`;
+        addLog("error", `マウス操作セルフテスト失敗: ${mouseSelfTestDetail}`);
+        return;
+      }
+      mouseSelfTest = "passed";
+      mouseSelfTestDetail = `received click at screen (${Math.round(result?.screen_x ?? 0)}, ${Math.round(result?.screen_y ?? 0)})`;
+      addLog("info", `マウス操作セルフテスト成功: ${mouseSelfTestDetail}`);
+    } catch (e: any) {
+      mouseSelfTest = "failed";
+      mouseSelfTestDetail = e?.message || String(e);
+      addLog("error", `マウス操作セルフテスト失敗: ${mouseSelfTestDetail}`);
+    } finally {
+      setTimeout(() => target.remove(), 500);
     }
   }
 
@@ -450,8 +511,19 @@
     <button class="tool-btn" onclick={openOnboardingNow}>初期設定を開く</button>
     <button class="tool-btn" onclick={resetOnboardingNow}>状態をリセット</button>
     <button class="tool-btn" onclick={clearTipsNow}>ヒントを全消去</button>
+    <button class="tool-btn primary-soft" onclick={runMouseSelfTest} disabled={mouseSelfTest === "running"}>
+      {mouseSelfTest === "running" ? "マウステスト中..." : "マウス操作セルフテスト"}
+    </button>
   </div>
-  <div class="ob-hint">「リセット」で次回起動時に自動表示されるようになります。</div>
+  <div class="ob-hint">
+    「リセット」で次回起動時に自動表示されるようになります。
+    <span class="selftest-state" class:ok={mouseSelfTest === "passed"} class:ng={mouseSelfTest === "failed"}>
+      Mouse: {mouseSelfTest === "idle" ? "未実行" : mouseSelfTest === "running" ? "実行中" : mouseSelfTest === "passed" ? "成功" : "失敗"}
+    </span>
+    {#if mouseSelfTestDetail}
+      <span class="selftest-detail mono truncate">{mouseSelfTestDetail}</span>
+    {/if}
+  </div>
 </div>
 
 <div class="tab-bar">
@@ -496,6 +568,20 @@
               class:ng={(typeof window !== "undefined") && !(window as any).__TAURI_INTERNALS__}
             ></span>
             {(typeof window !== "undefined") && (window as any).__TAURI_INTERNALS__ ? "接続済" : "未接続"}
+          </span>
+        </div>
+        <div class="info-row">
+          <span class="info-key">Mouse Events</span>
+          <span class="info-val selftest-control">
+            <button class="tool-btn" onclick={runMouseSelfTest} disabled={mouseSelfTest === "running"}>
+              {mouseSelfTest === "running" ? "テスト中..." : "セルフテスト"}
+            </button>
+            <span class="selftest-state" class:ok={mouseSelfTest === "passed"} class:ng={mouseSelfTest === "failed"}>
+              {mouseSelfTest === "idle" ? "未実行" : mouseSelfTest === "running" ? "実行中" : mouseSelfTest === "passed" ? "成功" : "失敗"}
+            </span>
+            {#if mouseSelfTestDetail}
+              <span class="selftest-detail mono truncate">{mouseSelfTestDetail}</span>
+            {/if}
           </span>
         </div>
       </div>
@@ -869,6 +955,28 @@
   }
   .info-row:last-child {
     border-bottom: none;
+  }
+  .selftest-control {
+    min-width: 0;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    flex-wrap: wrap;
+  }
+  .selftest-state {
+    font-size: 11px;
+    color: var(--text-tertiary);
+  }
+  .selftest-state.ok {
+    color: var(--green);
+  }
+  .selftest-state.ng {
+    color: var(--red);
+  }
+  .selftest-detail {
+    flex: 1 1 180px;
+    min-width: 0;
+    color: var(--text-tertiary);
   }
   .info-key {
     color: var(--text-secondary);

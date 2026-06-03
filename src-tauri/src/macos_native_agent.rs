@@ -107,6 +107,7 @@ const FN_POLL_IDLE_MS: u64 = 100;
 // before the timer reads it. 25ms preserves the original safety margin.
 const FN_POLL_HELD_MS: u64 = 25;
 const SHORTCUT_HOLD_MS: u64 = 140;
+const RELEASE_FINALIZE_DELAY_MS: u64 = 180;
 
 // Border
 const BORDER_IDLE_W: f64 = 1.0;
@@ -124,6 +125,7 @@ static FN_PRESSED: AtomicBool = AtomicBool::new(false);
 static FN_POLL_TOKEN: AtomicU64 = AtomicU64::new(0);
 static SHORTCUT_DOWN: AtomicBool = AtomicBool::new(false);
 static SHORTCUT_ARM_TOKEN: AtomicU64 = AtomicU64::new(0);
+static RELEASE_FINALIZE_TOKEN: AtomicU64 = AtomicU64::new(0);
 static DOTS_TOKEN: AtomicU64 = AtomicU64::new(0);
 static LISTEN_PULSE_TOKEN: AtomicU64 = AtomicU64::new(0);
 static SHORTCUT_REGISTERED: std::sync::LazyLock<Mutex<Option<String>>> =
@@ -410,6 +412,9 @@ pub fn setup(app: &AppHandle) {
 
         let (display, pending_submit) = {
             let mut sh = SHARED.lock().unwrap();
+            if sh.mode != Some(CapsuleMode::Listening) {
+                return;
+            }
             append_final_segment(&mut sh, &text);
             let display = listening_display_text(&sh);
             let pending = if sh.stop_requested {
@@ -482,6 +487,14 @@ pub fn setup(app: &AppHandle) {
                 sh.finals_accumulated.clear();
                 sh.current_speech.clear();
                 None
+            } else if sh.stop_requested {
+                let text = consume_all_speech(&mut sh);
+                if text.is_empty() {
+                    None
+                } else {
+                    sh.stop_requested = false;
+                    Some(text)
+                }
             } else {
                 sh.stop_requested = false;
                 Some(consume_all_speech(&mut sh))
@@ -494,6 +507,8 @@ pub fn setup(app: &AppHandle) {
             } else {
                 submit_to_agent(app_state.clone(), text);
             }
+        } else {
+            schedule_release_finalize(app_state.clone(), RELEASE_FINALIZE_DELAY_MS);
         }
     });
 
@@ -557,6 +572,7 @@ pub fn apply_config(app: &AppHandle, config: &NativeAgentConfig) -> Result<(), S
         clear_agent_listener(app);
         SHORTCUT_DOWN.store(false, Ordering::Relaxed);
         SHORTCUT_ARM_TOKEN.fetch_add(1, Ordering::Relaxed);
+        RELEASE_FINALIZE_TOKEN.fetch_add(1, Ordering::Relaxed);
         FN_PRESSED.store(false, Ordering::Relaxed);
         if stt::stt_get_active_caller().as_deref() == Some("native_agent") {
             let _ = stt::stt_stop_stream();
@@ -570,7 +586,7 @@ pub fn apply_config(app: &AppHandle, config: &NativeAgentConfig) -> Result<(), S
 fn handle_shortcut_event(app: AppHandle, _shortcut: String, state: ShortcutState) {
     match state {
         ShortcutState::Pressed => handle_shortcut_pressed(app),
-        ShortcutState::Released => handle_shortcut_released(),
+        ShortcutState::Released => handle_shortcut_released(app),
     }
 }
 
@@ -579,7 +595,7 @@ fn handle_fn_state(app: AppHandle, has_fn: bool) {
     if has_fn && !was_pressed {
         handle_shortcut_pressed(app);
     } else if !has_fn && was_pressed {
-        handle_shortcut_released();
+        handle_shortcut_released(app);
     }
 }
 
@@ -613,6 +629,33 @@ fn stop_fn_polling() {
     FN_POLL_TOKEN.fetch_add(1, Ordering::Relaxed);
 }
 
+fn schedule_release_finalize(app: AppHandle, delay_ms: u64) {
+    let token = RELEASE_FINALIZE_TOKEN
+        .fetch_add(1, Ordering::Relaxed)
+        .wrapping_add(1);
+    tauri::async_runtime::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+        if RELEASE_FINALIZE_TOKEN.load(Ordering::Relaxed) != token {
+            return;
+        }
+
+        let pending = {
+            let mut sh = SHARED.lock().unwrap();
+            if sh.mode != Some(CapsuleMode::Listening) || !sh.stop_requested {
+                return;
+            }
+            sh.stop_requested = false;
+            consume_all_speech(&mut sh)
+        };
+
+        if pending.is_empty() {
+            close_panel(&app, false);
+        } else {
+            submit_to_agent(app, pending);
+        }
+    });
+}
+
 fn handle_shortcut_pressed(app: AppHandle) {
     SHORTCUT_DOWN.store(true, Ordering::Relaxed);
     let token = SHORTCUT_ARM_TOKEN
@@ -629,17 +672,30 @@ fn handle_shortcut_pressed(app: AppHandle) {
     });
 }
 
-fn handle_shortcut_released() {
+fn handle_shortcut_released(app: AppHandle) {
     SHORTCUT_DOWN.store(false, Ordering::Relaxed);
     SHORTCUT_ARM_TOKEN.fetch_add(1, Ordering::Relaxed);
+    let was_listening = {
+        let mut sh = SHARED.lock().unwrap();
+        if sh.mode == Some(CapsuleMode::Listening) {
+            sh.stop_requested = true;
+            true
+        } else {
+            false
+        }
+    };
     if stt::stt_get_active_caller().as_deref() != Some("native_agent") {
+        if was_listening {
+            schedule_release_finalize(app, RELEASE_FINALIZE_DELAY_MS);
+        }
         return;
     }
-    SHARED.lock().unwrap().stop_requested = true;
     let _ = stt::stt_stop_stream();
+    schedule_release_finalize(app, RELEASE_FINALIZE_DELAY_MS);
 }
 
 fn start_agent_capture(app: AppHandle) {
+    RELEASE_FINALIZE_TOKEN.fetch_add(1, Ordering::Relaxed);
     cancel_auto_close();
     clear_agent_listener(&app);
 
@@ -665,8 +721,15 @@ fn start_agent_capture(app: AppHandle) {
 
     transition_to_listening(&app, Some("話してください"));
 
-    if let Err(err) = stt::stt_start_stream(app.clone(), "native_agent".to_string(), Some(false)) {
-        transition_to_notice(&app, &err);
+    match stt::stt_start_stream(app.clone(), "native_agent".to_string(), Some(false)) {
+        Ok(_) => {
+            if !SHORTCUT_DOWN.load(Ordering::Relaxed) {
+                SHARED.lock().unwrap().stop_requested = true;
+                let _ = stt::stt_stop_stream();
+                schedule_release_finalize(app, RELEASE_FINALIZE_DELAY_MS);
+            }
+        }
+        Err(err) => transition_to_notice(&app, &err),
     }
 }
 
@@ -1752,12 +1815,7 @@ fn install_click_monitor(ui: &mut CapsuleViews, app: AppHandle) {
                 });
 
                 if should_open {
-                    if let Some(w) = app.get_webview_window("main") {
-                        let _ = w.unminimize();
-                        let _ = w.show();
-                        let _ = w.set_focus();
-                    }
-                    let _ = app.emit("tray-open-tab", "agent");
+                    let _ = crate::agent_commands::open_agent_popup(app.clone(), None, None);
                 }
 
                 event.as_ptr()

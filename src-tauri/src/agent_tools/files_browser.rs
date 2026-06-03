@@ -1376,6 +1376,73 @@ pub(super) async fn browser_close_tool(
     }))
 }
 
+pub(super) async fn computer_screenshot(
+    app: &tauri::AppHandle,
+    args: &Value,
+) -> Result<Value, String> {
+    let target = args.get("target").and_then(|v| v.as_str());
+    crate::computer_control::screenshot(app, target).await
+}
+
+pub(super) async fn computer_mouse_click(
+    app: &tauri::AppHandle,
+    args: &Value,
+) -> Result<Value, String> {
+    let target = args.get("target").and_then(|v| v.as_str());
+    let x = args.get("x").and_then(|v| v.as_f64()).unwrap_or(0.0);
+    let y = args.get("y").and_then(|v| v.as_f64()).unwrap_or(0.0);
+    let coordinate_space = args.get("coordinate_space").and_then(|v| v.as_str());
+    let result = crate::computer_control::mouse_click(app, target, x, y, coordinate_space).await?;
+    tokio::time::sleep(std::time::Duration::from_millis(450)).await;
+    let mut out = match result {
+        Value::Object(map) => map,
+        other => {
+            let mut map = serde_json::Map::new();
+            map.insert("result".into(), other);
+            map
+        }
+    };
+    insert_browser_window_snapshot(app, &mut out);
+    Ok(Value::Object(out))
+}
+
+pub(super) async fn computer_mouse_drag(
+    app: &tauri::AppHandle,
+    args: &Value,
+) -> Result<Value, String> {
+    let target = args.get("target").and_then(|v| v.as_str());
+    let from_x = args.get("from_x").and_then(|v| v.as_f64()).unwrap_or(0.0);
+    let from_y = args.get("from_y").and_then(|v| v.as_f64()).unwrap_or(0.0);
+    let to_x = args.get("to_x").and_then(|v| v.as_f64()).unwrap_or(0.0);
+    let to_y = args.get("to_y").and_then(|v| v.as_f64()).unwrap_or(0.0);
+    let steps = args.get("steps").and_then(|v| v.as_u64()).unwrap_or(8);
+    let coordinate_space = args.get("coordinate_space").and_then(|v| v.as_str());
+    crate::computer_control::mouse_drag(
+        app,
+        target,
+        from_x,
+        from_y,
+        to_x,
+        to_y,
+        steps,
+        coordinate_space,
+    )
+    .await
+}
+
+pub(super) async fn computer_scroll(app: &tauri::AppHandle, args: &Value) -> Result<Value, String> {
+    let target = args.get("target").and_then(|v| v.as_str());
+    let delta_y = args
+        .get("delta_y")
+        .and_then(|v| v.as_i64())
+        .unwrap_or(-700)
+        .clamp(i32::MIN as i64, i32::MAX as i64) as i32;
+    let x = args.get("x").and_then(|v| v.as_f64());
+    let y = args.get("y").and_then(|v| v.as_f64());
+    let coordinate_space = args.get("coordinate_space").and_then(|v| v.as_str());
+    crate::computer_control::scroll(app, target, delta_y, x, y, coordinate_space).await
+}
+
 pub(super) async fn list_browser_windows(app: &tauri::AppHandle) -> Result<Value, String> {
     let items = crate::webview_toolbar::list_browser_windows(app);
     Ok(json!({
@@ -1400,10 +1467,12 @@ pub(super) async fn open_browser_url(
     if url.is_empty() {
         return Err("urlを指定してください".into());
     }
-    crate::commands::open_external_url(app.clone(), url.clone(), None).await?;
+    let info = crate::commands::open_external_url(app.clone(), url.clone(), None).await?;
     Ok(json!({
         "status": "opened",
-        "url": url,
+        "label": info.label,
+        "target": info.target,
+        "url": if info.url.is_empty() { url } else { info.url },
     }))
 }
 
@@ -1427,6 +1496,71 @@ fn browser_action_failed_message(result: &Value, fallback: &str) -> Option<Strin
     }
 }
 
+fn browser_action_label(action: &Value) -> String {
+    action
+        .get("kind")
+        .or_else(|| action.get("action"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("browser_action")
+        .to_string()
+}
+
+fn browser_rect_value<T: serde::Serialize>(rect: &Option<T>) -> Option<Value> {
+    rect.as_ref()
+        .and_then(|rect| serde_json::to_value(rect).ok())
+}
+
+fn compact_browser_observation(payload: &crate::webview_toolbar::PageTextPayload) -> Value {
+    let buttons: Vec<Value> = payload
+        .buttons
+        .iter()
+        .filter_map(|button| {
+            let text = compact_text(&button.text, 80)?;
+            let mut item = serde_json::Map::new();
+            item.insert("text".into(), Value::String(text));
+            item.insert(
+                "type".into(),
+                Value::String(compact_text(&button.kind, 32).unwrap_or_default()),
+            );
+            if let Some(rect) = browser_rect_value(&button.rect) {
+                item.insert("rect".into(), rect);
+            }
+            Some(Value::Object(item))
+        })
+        .take(6)
+        .collect();
+    let inputs: Vec<Value> = payload
+        .inputs
+        .iter()
+        .filter_map(|input| {
+            let label = compact_text(&input.label, 80)
+                .or_else(|| compact_text(&input.name, 60))
+                .or_else(|| compact_text(&input.placeholder, 80))?;
+            let mut item = serde_json::Map::new();
+            item.insert("label".into(), Value::String(label));
+            item.insert(
+                "type".into(),
+                Value::String(compact_text(&input.kind, 32).unwrap_or_default()),
+            );
+            if let Some(rect) = browser_rect_value(&input.rect) {
+                item.insert("rect".into(), rect);
+            }
+            Some(Value::Object(item))
+        })
+        .take(6)
+        .collect();
+    json!({
+        "title": compact_text(&payload.title, 160).unwrap_or_default(),
+        "url": payload.url,
+        "viewport": payload.viewport,
+        "headings": compact_string_list(&payload.headings, 5, 120),
+        "interactive_elements": {
+            "buttons": buttons,
+            "inputs": inputs,
+        },
+    })
+}
+
 async fn run_browser_action_tool(
     app: &tauri::AppHandle,
     target: &str,
@@ -1435,8 +1569,12 @@ async fn run_browser_action_tool(
     settle_ms: u64,
     fallback_error: &str,
 ) -> Result<Value, String> {
-    let result =
-        crate::webview_toolbar::run_browser_action(app, target, &action, timeout_ms).await?;
+    let action_label = browser_action_label(&action);
+    let status_guard =
+        crate::webview_toolbar::BrowserAgentStatusGuard::start(app, target, &action_label);
+    let action_result =
+        crate::webview_toolbar::run_browser_action(app, target, &action, timeout_ms).await;
+    let result = action_result?;
     if let Some(message) = browser_action_failed_message(&result, fallback_error) {
         return Err(message);
     }
@@ -1458,7 +1596,31 @@ async fn run_browser_action_tool(
     if !current_url.is_empty() {
         out.insert("current_url".into(), Value::String(current_url));
     }
+    if let Ok(payload) = crate::webview_toolbar::extract_page_text(app, target).await {
+        out.insert("observation".into(), compact_browser_observation(&payload));
+    }
+    insert_browser_window_snapshot(app, &mut out);
+    status_guard.finish();
     Ok(Value::Object(out))
+}
+
+fn insert_browser_window_snapshot(
+    app: &tauri::AppHandle,
+    out: &mut serde_json::Map<String, Value>,
+) {
+    let windows = crate::webview_toolbar::list_browser_windows(app)
+        .into_iter()
+        .map(|w| {
+            json!({
+                "label": w.label,
+                "target": w.target,
+                "url": w.url,
+            })
+        })
+        .collect::<Vec<_>>();
+    if !windows.is_empty() {
+        out.insert("browser_windows".into(), Value::Array(windows));
+    }
 }
 
 pub(super) async fn read_browser_page(
@@ -1466,7 +1628,10 @@ pub(super) async fn read_browser_page(
     args: &Value,
 ) -> Result<Value, String> {
     let target = resolve_browser_target_from_args(app, args)?;
-    let payload = crate::webview_toolbar::extract_page_text(app, &target).await?;
+    let status_guard =
+        crate::webview_toolbar::BrowserAgentStatusGuard::start(app, &target, "read_page");
+    let payload_result = crate::webview_toolbar::extract_page_text(app, &target).await;
+    let payload = payload_result?;
     let headings = compact_string_list(&payload.headings, 10, 140);
     let links: Vec<Value> = payload
         .links
@@ -1484,9 +1649,12 @@ pub(super) async fn read_browser_page(
             if let Some(url) = url {
                 item.insert("url".into(), Value::String(url));
             }
+            if let Some(rect) = browser_rect_value(&link.rect) {
+                item.insert("rect".into(), rect);
+            }
             Some(Value::Object(item))
         })
-        .take(8)
+        .take(24)
         .collect();
     let buttons: Vec<Value> = payload
         .buttons
@@ -1497,6 +1665,9 @@ pub(super) async fn read_browser_page(
             item.insert("text".into(), Value::String(text));
             if let Some(kind) = compact_text(&button.kind, 32) {
                 item.insert("type".into(), Value::String(kind));
+            }
+            if let Some(rect) = browser_rect_value(&button.rect) {
+                item.insert("rect".into(), rect);
             }
             Some(Value::Object(item))
         })
@@ -1535,6 +1706,9 @@ pub(super) async fn read_browser_page(
             if let Some(value) = value {
                 item.insert("value".into(), Value::String(value));
             }
+            if let Some(rect) = browser_rect_value(&input.rect) {
+                item.insert("rect".into(), rect);
+            }
             if input.required {
                 item.insert("required".into(), Value::Bool(true));
             }
@@ -1545,10 +1719,11 @@ pub(super) async fn read_browser_page(
         })
         .take(10)
         .collect();
-    Ok(json!({
+    let result = json!({
         "target": target,
         "title": compact_text(&payload.title, 200).unwrap_or_default(),
         "url": payload.url,
+        "viewport": payload.viewport,
         "content_source": compact_text(&payload.content_source, 40).unwrap_or_else(|| "document".into()),
         "content": compact_text(&payload.text, 8_000).unwrap_or_default(),
         "headings": headings,
@@ -1557,7 +1732,9 @@ pub(super) async fn read_browser_page(
             "buttons": buttons,
             "inputs": inputs,
         },
-    }))
+    });
+    status_guard.finish();
+    Ok(result)
 }
 
 pub(super) async fn browser_back(app: &tauri::AppHandle, args: &Value) -> Result<Value, String> {
@@ -1720,6 +1897,84 @@ pub(super) async fn browser_scroll(app: &tauri::AppHandle, args: &Value) -> Resu
         "ページをスクロールできませんでした",
     )
     .await
+}
+
+pub(super) async fn browser_mouse_click(
+    app: &tauri::AppHandle,
+    args: &Value,
+) -> Result<Value, String> {
+    let target = resolve_browser_target_from_args(app, args)?;
+    let x = args.get("x").and_then(|v| v.as_f64()).unwrap_or(0.0);
+    let y = args.get("y").and_then(|v| v.as_f64()).unwrap_or(0.0);
+    let status_guard =
+        crate::webview_toolbar::BrowserAgentStatusGuard::start(app, &target, "mouse_click");
+    let result =
+        crate::computer_control::mouse_click(app, Some(&target), x, y, Some("webview")).await?;
+    tokio::time::sleep(std::time::Duration::from_millis(450)).await;
+    let current_url = crate::webview_toolbar::browser_get_url(app.clone(), target.clone())
+        .await
+        .unwrap_or_default();
+    let mut out = match result {
+        Value::Object(map) => map,
+        other => {
+            let mut map = serde_json::Map::new();
+            map.insert("result".into(), other);
+            map
+        }
+    };
+    out.insert("target".into(), Value::String(target.clone()));
+    out.insert("coordinate_space".into(), Value::String("webview".into()));
+    if !current_url.is_empty() {
+        out.insert("current_url".into(), Value::String(current_url));
+    }
+    if let Ok(payload) = crate::webview_toolbar::extract_page_text(app, &target).await {
+        out.insert("observation".into(), compact_browser_observation(&payload));
+    }
+    insert_browser_window_snapshot(app, &mut out);
+    status_guard.finish();
+    Ok(Value::Object(out))
+}
+
+pub(super) async fn browser_mouse_drag(
+    app: &tauri::AppHandle,
+    args: &Value,
+) -> Result<Value, String> {
+    let target = resolve_browser_target_from_args(app, args)?;
+    let from_x = args.get("from_x").and_then(|v| v.as_f64()).unwrap_or(0.0);
+    let from_y = args.get("from_y").and_then(|v| v.as_f64()).unwrap_or(0.0);
+    let to_x = args.get("to_x").and_then(|v| v.as_f64()).unwrap_or(0.0);
+    let to_y = args.get("to_y").and_then(|v| v.as_f64()).unwrap_or(0.0);
+    let steps = args.get("steps").and_then(|v| v.as_u64()).unwrap_or(8);
+    let status_guard =
+        crate::webview_toolbar::BrowserAgentStatusGuard::start(app, &target, "mouse_drag");
+    let result = crate::computer_control::mouse_drag(
+        app,
+        Some(&target),
+        from_x,
+        from_y,
+        to_x,
+        to_y,
+        steps,
+        Some("webview"),
+    )
+    .await?;
+    tokio::time::sleep(std::time::Duration::from_millis(450)).await;
+    let mut out = match result {
+        Value::Object(map) => map,
+        other => {
+            let mut map = serde_json::Map::new();
+            map.insert("result".into(), other);
+            map
+        }
+    };
+    out.insert("target".into(), Value::String(target.clone()));
+    out.insert("coordinate_space".into(), Value::String("webview".into()));
+    if let Ok(payload) = crate::webview_toolbar::extract_page_text(app, &target).await {
+        out.insert("observation".into(), compact_browser_observation(&payload));
+    }
+    insert_browser_window_snapshot(app, &mut out);
+    status_guard.finish();
+    Ok(Value::Object(out))
 }
 
 pub(super) async fn browser_wait_for(

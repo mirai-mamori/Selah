@@ -4,6 +4,8 @@
   "description": "enables store distribution permissions without the self-updater IPC surface",
   "windows": [
     "main",
+    "agent-popup",
+    "*-agent",
     "login",
     "luna-login",
     "detail-*",

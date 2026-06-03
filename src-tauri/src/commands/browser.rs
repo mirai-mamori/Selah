@@ -7,7 +7,7 @@ pub async fn open_external_url(
     app: tauri::AppHandle,
     url: String,
     title: Option<String>,
-) -> Result<(), String> {
+) -> Result<crate::webview_toolbar::BrowserWindowInfo, String> {
     use std::sync::atomic::{AtomicU32, Ordering};
     static COUNTER: AtomicU32 = AtomicU32::new(0);
 
@@ -22,7 +22,7 @@ pub async fn open_external_url(
     let label = format!("ext-{}", id);
     let win_title = title.unwrap_or_else(|| parsed_url.host_str().unwrap_or("Web").to_string());
 
-    crate::webview_toolbar::create_browser_window(
+    let mut info = crate::webview_toolbar::create_browser_window(
         &app,
         &label,
         tauri::WebviewUrl::External(parsed_url),
@@ -31,8 +31,8 @@ pub async fn open_external_url(
         640.0,
         &[],
     )?;
-
-    Ok(())
+    info.url = url;
+    Ok(info)
 }
 
 /// Open a URL in the system default browser (Safari, Chrome, etc.)

@@ -1,7 +1,7 @@
 //! Tauri commands for the Selah agent chat feature.
 
 use serde::{Deserialize, Serialize};
-use tauri::{AppHandle, State};
+use tauri::{AppHandle, Manager, State};
 
 use crate::agent;
 use crate::ai::ImagePart;
@@ -111,8 +111,95 @@ pub async fn agent_send(
 }
 
 #[tauri::command]
+pub async fn agent_send_with_context(
+    app: AppHandle,
+    conv_id: String,
+    content: String,
+    images: Option<Vec<ImagePart>>,
+    browser_target: Option<String>,
+) -> Result<(), String> {
+    let content = content.trim().to_string();
+    let imgs = images.unwrap_or_default();
+    if content.is_empty() && imgs.is_empty() {
+        return Err("メッセージが空です".into());
+    }
+
+    let browser_target = browser_target
+        .as_deref()
+        .map(str::trim)
+        .filter(|target| !target.is_empty())
+        .map(|target| crate::webview_toolbar::resolve_browser_target(&app, Some(target)))
+        .transpose()?;
+
+    agent::agent_send_with_context(
+        app,
+        conv_id,
+        content,
+        imgs,
+        agent::AgentTurnContext {
+            browser_target,
+            browser_click_labels: Vec::new(),
+        },
+    )
+    .await
+}
+
+#[tauri::command]
 pub fn agent_cancel(conv_id: String) {
     agent::cancel(&conv_id);
+}
+
+#[tauri::command]
+pub fn agent_cancel_active() {
+    agent::cancel_active();
+}
+
+#[tauri::command]
+pub fn open_agent_popup(
+    app: AppHandle,
+    owner_label: Option<String>,
+    target: Option<String>,
+) -> Result<(), String> {
+    if owner_label.as_deref().is_some() || target.as_deref().is_some() {
+        return crate::webview_toolbar::open_agent_side_panel(
+            &app,
+            owner_label.as_deref(),
+            target.as_deref(),
+        );
+    }
+
+    const LABEL: &str = "agent-popup";
+    if let Some(win) = app.get_webview_window(LABEL) {
+        let _ = win.unminimize();
+        let _ = win.show();
+        let _ = win.set_focus();
+        return Ok(());
+    }
+
+    let builder = tauri::WebviewWindowBuilder::new(
+        &app,
+        LABEL,
+        tauri::WebviewUrl::App("agent-popup.html".into()),
+    )
+    .title("Agent")
+    .inner_size(420.0, 620.0)
+    .min_inner_size(340.0, 420.0)
+    .resizable(true);
+
+    #[cfg(target_os = "macos")]
+    let builder = builder
+        .title_bar_style(tauri::TitleBarStyle::Overlay)
+        .hidden_title(true);
+
+    builder
+        .build()
+        .map(|_| ())
+        .map_err(|e| format!("Agent popup を開けませんでした: {}", e))
+}
+
+#[tauri::command]
+pub fn close_agent_popup(app: AppHandle, owner_label: String) -> Result<(), String> {
+    crate::webview_toolbar::close_agent_side_panel(&app, &owner_label)
 }
 
 #[tauri::command]

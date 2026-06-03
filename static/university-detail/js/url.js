@@ -3,7 +3,7 @@ var UNIVERSITY_BASES = {
   kwic: 'https://kwic.kwansei.ac.jp',
   kgc: 'https://kg-course.kwansei.ac.jp'
 };
-var AUTO_LINK_RE = /(https?:\/\/[^\s<)\]]+|\/(?:lms|portal|uniasv2)\/[^\s<)\]]+)/g;
+var AUTO_LINK_RE = /(https?:\/\/[^\s<)\]]+|\/(?:lms|portal|cabinet|uniasv2)\/[^\s<)\]]+)/g;
 var LINK_MATCH_IGNORED_PARAMS = {
   _cid: true,
   _csrf: true,
@@ -15,7 +15,7 @@ var LINK_MATCH_IGNORED_PARAMS = {
 
 function guessBaseOriginForHref(href, currentMode) {
   var raw = decodeHtmlEntities(href).trim();
-  if (raw.indexOf('/portal/') === 0) return UNIVERSITY_BASES.kwic;
+  if (raw.indexOf('/portal/') === 0 || raw.indexOf('/cabinet/') === 0) return UNIVERSITY_BASES.kwic;
   if (raw.indexOf('/uniasv2/') === 0) return UNIVERSITY_BASES.kgc;
   if (raw.indexOf('/lms/') === 0) return UNIVERSITY_BASES.luna;
   if (currentMode === 'kwic') return UNIVERSITY_BASES.kwic;
@@ -55,7 +55,7 @@ function detectUniversityService(url) {
   var host = (url.hostname || '').toLowerCase();
   var path = url.pathname || '';
   if (host.indexOf('luna.kwansei.ac.jp') >= 0 || path.indexOf('/lms/') === 0) return 'luna';
-  if (host.indexOf('kwic.kwansei.ac.jp') >= 0 || path.indexOf('/portal/') === 0) return 'kwic';
+  if (host.indexOf('kwic.kwansei.ac.jp') >= 0 || path.indexOf('/portal/') === 0 || path.indexOf('/cabinet/') === 0) return 'kwic';
   if (host.indexOf('kg-course.kwansei.ac.jp') >= 0 || path.indexOf('/uniasv2/') === 0) return 'kgc';
   return '';
 }

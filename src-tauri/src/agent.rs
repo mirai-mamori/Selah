@@ -10,19 +10,21 @@
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::HashSet;
+use std::sync::{LazyLock, Mutex};
 use tauri::{AppHandle, Emitter, Manager};
 
 use crate::agent_error::AgentError;
 use crate::agent_prompts;
 use crate::agent_provider::AgentProvider;
 use crate::agent_pseudo_call::{
-    fallback_answer as pseudo_tool_call_fallback_answer, find_start as find_pseudo_tool_call_start,
-    has_any as has_any_pseudo_tool_call, parse_any as parse_any_visible_tool_call,
-    parse_leading as parse_visible_tool_call, ToolCall,
+    find_start as find_pseudo_tool_call_start, has_any as has_any_pseudo_tool_call,
+    parse_any_raw as parse_any_raw_tool_call, parse_leading as parse_visible_tool_call,
+    RawToolCall, ToolCall,
 };
 use crate::agent_text;
 use crate::agent_tools;
 use crate::ai::{ChatMessage, ImagePart};
+use crate::config;
 use crate::db::Database;
 
 // ─────────────────────── Date/Time Context ───────────────────────
@@ -104,6 +106,10 @@ struct AgentConfig {
     slow_tool_timeout_secs: u64,
     /// Hard timeout for answer generation so the UI cannot stay in thinking forever.
     answer_timeout_secs: u64,
+    /// How many times Phase 2 may retry after emitting an invalid pseudo-tool call.
+    max_answer_repairs: usize,
+    /// How many times Phase 1 may retry after selecting unknown/invalid tools.
+    max_plan_repairs: usize,
 }
 
 /// Tools that are known to take much longer than `tool_timeout_secs` because
@@ -139,7 +145,26 @@ const CFG: AgentConfig = AgentConfig {
     tool_timeout_secs: 35,
     slow_tool_timeout_secs: 120,
     answer_timeout_secs: 90,
+    max_answer_repairs: 2,
+    max_plan_repairs: 2,
 };
+
+static ACTIVE_AGENT_TURNS: LazyLock<Mutex<HashSet<String>>> =
+    LazyLock::new(|| Mutex::new(HashSet::new()));
+
+fn mark_turn_active(conv_id: &str) {
+    ACTIVE_AGENT_TURNS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(conv_id.to_string());
+}
+
+fn mark_turn_inactive(conv_id: &str) {
+    ACTIVE_AGENT_TURNS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(conv_id);
+}
 
 // ─────────────────────── Stream Events ───────────────────────
 
@@ -176,6 +201,12 @@ fn emit(app: &AppHandle, conv_id: &str, ev: &StreamEvent) {
 
 // ─────────────────────── Public Entry Point ───────────────────────
 
+#[derive(Debug, Clone, Default)]
+pub struct AgentTurnContext {
+    pub browser_target: Option<String>,
+    pub browser_click_labels: Vec<String>,
+}
+
 /// Called from the Tauri command layer.
 pub async fn agent_send(
     app: AppHandle,
@@ -183,7 +214,29 @@ pub async fn agent_send(
     user_text: String,
     user_images: Vec<ImagePart>,
 ) -> Result<(), String> {
-    let result = run_turn(&app, &conv_id, user_text, user_images).await;
+    agent_send_with_context(
+        app,
+        conv_id,
+        user_text,
+        user_images,
+        AgentTurnContext::default(),
+    )
+    .await
+}
+
+/// Called from an Agent panel attached to a specific browser/detail webview.
+pub async fn agent_send_with_context(
+    app: AppHandle,
+    conv_id: String,
+    user_text: String,
+    user_images: Vec<ImagePart>,
+    turn_context: AgentTurnContext,
+) -> Result<(), String> {
+    AgentProvider::clear_cancel(&conv_id);
+    mark_turn_active(&conv_id);
+    let result = run_turn(&app, &conv_id, user_text, user_images, turn_context).await;
+    mark_turn_inactive(&conv_id);
+    AgentProvider::clear_cancel(&conv_id);
     match &result {
         Ok(()) => emit(&app, &conv_id, &StreamEvent::Done),
         Err(AgentError::Cancelled) => {
@@ -206,6 +259,20 @@ pub fn cancel(conv_id: &str) {
     AgentProvider::cancel(conv_id);
 }
 
+/// Cancel every currently running agent turn. Browser toolbar stop buttons do
+/// not know the conversation id, so they route through this app-wide escape hatch.
+pub fn cancel_active() {
+    let ids: Vec<String> = ACTIVE_AGENT_TURNS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .cloned()
+        .collect();
+    for id in ids {
+        AgentProvider::cancel(&id);
+    }
+}
+
 // ─────────────────────── Turn Pipeline ───────────────────────
 
 async fn run_turn(
@@ -213,6 +280,7 @@ async fn run_turn(
     conv_id: &str,
     user_text: String,
     user_images: Vec<ImagePart>,
+    mut turn_context: AgentTurnContext,
 ) -> Result<(), AgentError> {
     let provider = AgentProvider::resolve()?;
     let db = app.state::<Database>();
@@ -223,6 +291,7 @@ async fn run_turn(
     // 2. Load conversation history.
     let history = db.agent_load_messages(conv_id).unwrap_or_default();
     let history_slice = slice_history(&history, CFG.history_window);
+    turn_context.browser_click_labels = browser_click_labels_for_turn(&history, &user_text);
 
     // 3. Phase 1 — plan (skip for image-only turns).
     let plan = plan_phase(
@@ -232,11 +301,26 @@ async fn run_turn(
         &history_slice,
         &user_text,
         &user_images,
+        &turn_context,
     )
     .await?;
 
     // 4. Execute tools.
-    let mut tool_results = execute_tools(app, conv_id, &db, &plan, &user_text).await;
+    if AgentProvider::is_cancelled(conv_id) {
+        return Err(AgentError::Cancelled);
+    }
+    let mut tool_results =
+        execute_tools(app, conv_id, &db, &plan, &user_text, &turn_context).await?;
+    if AgentProvider::is_cancelled(conv_id) {
+        return Err(AgentError::Cancelled);
+    }
+
+    if let Some(answer) = local_browser_action_answer(&user_text, &tool_results, &turn_context) {
+        emit(app, conv_id, &StreamEvent::Token { text: &answer });
+        db.agent_append_message(conv_id, "assistant", &answer, None, None, None)
+            .map_err(AgentError::db)?;
+        return Ok(());
+    }
 
     // 5. Phase 2 — stream answer.
     let mut answer = answer_phase(
@@ -247,20 +331,97 @@ async fn run_turn(
         &user_text,
         &user_images,
         &tool_results,
+        &turn_context,
     )
     .await?;
 
     let mut handled_visible_tool_calls = HashSet::new();
+    let mut answer_repairs = 0usize;
     loop {
-        let Some(call) = parse_any_visible_tool_call(&answer) else {
+        let raw = parse_any_raw_tool_call(&answer);
+        let Some(raw_call) = raw.as_ref() else {
             if has_any_pseudo_tool_call(&answer) {
                 log::warn!(
-                    "[agent answer] suppressed unrecognized visible pseudo tool call before persistence"
+                    "[agent answer] suppressed unparsable visible pseudo tool call before persistence"
                 );
-                answer = pseudo_tool_call_fallback_answer();
+                if answer_repairs < CFG.max_answer_repairs {
+                    answer_repairs += 1;
+                    let repair_note = pseudo_tool_repair_note(None, &answer);
+                    answer = answer_phase_with_repair(
+                        app,
+                        conv_id,
+                        &provider,
+                        &history_slice,
+                        &user_text,
+                        &user_images,
+                        &tool_results,
+                        &repair_note,
+                        &turn_context,
+                    )
+                    .await?;
+                    continue;
+                }
+                answer = pseudo_tool_repair_failed_message(&user_text, raw.as_ref());
                 emit(app, conv_id, &StreamEvent::Token { text: &answer });
             }
             break;
+        };
+        let Some(exact_name) = agent_tools::exact_tool_name(&raw_call.name) else {
+            log::warn!(
+                "[agent answer] suppressed nonexistent visible pseudo tool call before persistence: {}",
+                raw_call.name
+            );
+            if answer_repairs < CFG.max_answer_repairs {
+                answer_repairs += 1;
+                let repair_note = pseudo_tool_repair_note(Some(raw_call), &answer);
+                answer = answer_phase_with_repair(
+                    app,
+                    conv_id,
+                    &provider,
+                    &history_slice,
+                    &user_text,
+                    &user_images,
+                    &tool_results,
+                    &repair_note,
+                    &turn_context,
+                )
+                .await?;
+                continue;
+            }
+            answer = pseudo_tool_repair_failed_message(&user_text, Some(raw_call));
+            emit(app, conv_id, &StreamEvent::Token { text: &answer });
+            break;
+        };
+        let Some(args) = agent_tools::sanitize_tool_args(exact_name, &raw_call.args) else {
+            log::warn!(
+                "[agent answer] suppressed visible pseudo tool call with invalid args: {}",
+                raw_call.name
+            );
+            if answer_repairs < CFG.max_answer_repairs {
+                answer_repairs += 1;
+                let repair_note = pseudo_tool_repair_note(Some(raw_call), &answer);
+                answer = answer_phase_with_repair(
+                    app,
+                    conv_id,
+                    &provider,
+                    &history_slice,
+                    &user_text,
+                    &user_images,
+                    &tool_results,
+                    &repair_note,
+                    &turn_context,
+                )
+                .await?;
+                continue;
+            }
+            answer = pseudo_tool_repair_failed_message(&user_text, Some(raw_call));
+            emit(app, conv_id, &StreamEvent::Token { text: &answer });
+            break;
+        };
+        let args = apply_browser_target_lock(exact_name, args, &turn_context);
+        let call = ToolCall {
+            name: exact_name.to_string(),
+            args,
         };
         let key = format!(
             "{}:{}",
@@ -272,8 +433,24 @@ async fn run_turn(
                 "[agent answer] repeated visible pseudo tool call suppressed: {}",
                 call.name
             );
-            answer = "さっきの操作をうまく実行形式に直せませんでした。もう一度、必要な資料名か課題名を指定してくれる？"
-                .to_string();
+            if answer_repairs < CFG.max_answer_repairs {
+                answer_repairs += 1;
+                let repair_note = pseudo_tool_repair_note(None, &answer);
+                answer = answer_phase_with_repair(
+                    app,
+                    conv_id,
+                    &provider,
+                    &history_slice,
+                    &user_text,
+                    &user_images,
+                    &tool_results,
+                    &repair_note,
+                    &turn_context,
+                )
+                .await?;
+                continue;
+            }
+            answer = pseudo_tool_repair_failed_message(&user_text, None);
             emit(app, conv_id, &StreamEvent::Token { text: &answer });
             break;
         }
@@ -286,7 +463,8 @@ async fn run_turn(
             tools: vec![call],
             image_only: false,
         };
-        let follow_results = execute_tools(app, conv_id, &db, &follow_plan, &user_text).await;
+        let follow_results =
+            execute_tools(app, conv_id, &db, &follow_plan, &user_text, &turn_context).await?;
         if follow_results.is_empty() {
             break;
         }
@@ -299,6 +477,7 @@ async fn run_turn(
             &user_text,
             &user_images,
             &tool_results,
+            &turn_context,
         )
         .await?;
     }
@@ -352,6 +531,7 @@ async fn plan_phase(
     history: &[crate::db::AgentMessageRow],
     user_text: &str,
     user_images: &[ImagePart],
+    turn_context: &AgentTurnContext,
 ) -> Result<Plan, AgentError> {
     if !user_images.is_empty() {
         return Ok(Plan {
@@ -360,22 +540,67 @@ async fn plan_phase(
         });
     }
     emit(app, conv_id, &StreamEvent::Phase { stage: "planning" });
-    choose_plan(provider, history, user_text, conv_id).await
+    choose_plan(app, provider, history, user_text, conv_id, turn_context).await
 }
 
 async fn choose_plan(
+    app: &AppHandle,
     provider: &AgentProvider,
     history: &[crate::db::AgentMessageRow],
     user_text: &str,
     conv_id: &str,
+    turn_context: &AgentTurnContext,
 ) -> Result<Plan, AgentError> {
+    let norm = normalize_planner_text(user_text);
+    if let Some(plan) = attached_browser_control_plan(&norm, turn_context) {
+        return Ok(finalize_plan(plan, history, user_text, turn_context));
+    }
+
     // Fast path: heuristic covers unambiguous keywords.
     if let Some(plan) = heuristic_plan(history, user_text) {
-        return Ok(finalize_plan(plan, history, user_text));
+        return Ok(finalize_plan(plan, history, user_text, turn_context));
     }
     // Slow path: ask model.
-    match run_plan_inference(provider, history, user_text, conv_id).await {
-        Ok(plan) => Ok(finalize_plan(plan, history, user_text)),
+    match run_plan_inference(app, provider, history, user_text, conv_id, turn_context).await {
+        Ok(plan) => {
+            let mut finalized =
+                finalize_plan_with_diagnostics(plan, history, user_text, turn_context);
+            let mut repairs = 0usize;
+            while finalized.has_rejections() && repairs < CFG.max_plan_repairs {
+                repairs += 1;
+                let repair_note = plan_repair_note(&finalized);
+                log::warn!(
+                    "[agent plan] retrying plan after rejected tool(s): {}",
+                    repair_note
+                );
+                match run_plan_inference_with_note(
+                    app,
+                    provider,
+                    history,
+                    user_text,
+                    conv_id,
+                    Some(&repair_note),
+                    turn_context,
+                )
+                .await
+                {
+                    Ok(next_plan) => {
+                        finalized = finalize_plan_with_diagnostics(
+                            next_plan,
+                            history,
+                            user_text,
+                            turn_context,
+                        );
+                    }
+                    Err(AgentError::Cancelled) => return Err(AgentError::Cancelled),
+                    Err(e) => {
+                        log::warn!("agent plan repair failed: {}", e);
+                        break;
+                    }
+                }
+            }
+            Ok(finalized.plan)
+        }
         Err(AgentError::Cancelled) => Err(AgentError::Cancelled),
         Err(e) => {
             log::warn!("agent plan phase failed: {} — proceeding with no tools", e);
@@ -385,10 +610,33 @@ async fn choose_plan(
 }
 
 async fn run_plan_inference(
+    app: &AppHandle,
     provider: &AgentProvider,
     history: &[crate::db::AgentMessageRow],
     user_text: &str,
     conv_id: &str,
+    turn_context: &AgentTurnContext,
+) -> Result<Plan, AgentError> {
+    run_plan_inference_with_note(
+        app,
+        provider,
+        history,
+        user_text,
+        conv_id,
+        None,
+        turn_context,
+    )
+    .await
+}
+
+async fn run_plan_inference_with_note(
+    app: &AppHandle,
+    provider: &AgentProvider,
+    history: &[crate::db::AgentMessageRow],
+    user_text: &str,
+    conv_id: &str,
+    repair_note: Option<&str>,
+    turn_context: &AgentTurnContext,
 ) -> Result<Plan, AgentError> {
     let supports_prefill = provider.supports_prefill();
     log::debug!(
@@ -396,7 +644,14 @@ async fn run_plan_inference(
         truncate_for_log(user_text, 200),
         history.iter().filter(|r| r.role == "tool").count()
     );
-    let msgs = build_plan_messages(history, user_text, supports_prefill);
+    let msgs = build_plan_messages_with_note(
+        Some(app),
+        history,
+        user_text,
+        supports_prefill,
+        repair_note,
+        turn_context,
+    );
     let prefill = if supports_prefill {
         CFG.plan_prefill
     } else {
@@ -441,14 +696,41 @@ fn truncate_for_log(s: &str, max: usize) -> String {
 
 /// Build the ChatML message list for the planner.  Pure function — does not
 /// touch the model or database, so it can be unit-tested.
+#[cfg(test)]
 fn build_plan_messages(
+    app: Option<&AppHandle>,
     history: &[crate::db::AgentMessageRow],
     user_text: &str,
     supports_prefill: bool,
 ) -> Vec<ChatMessage> {
+    build_plan_messages_with_note(
+        app,
+        history,
+        user_text,
+        supports_prefill,
+        None,
+        &AgentTurnContext::default(),
+    )
+}
+
+fn build_plan_messages_with_note(
+    app: Option<&AppHandle>,
+    history: &[crate::db::AgentMessageRow],
+    user_text: &str,
+    supports_prefill: bool,
+    repair_note: Option<&str>,
+    turn_context: &AgentTurnContext,
+) -> Vec<ChatMessage> {
+    let mut system = agent_prompts::plan_system_prompt(&datetime_context(), supports_prefill);
+    append_browser_context(&mut system, app, turn_context.browser_target.as_deref());
+    if let Some(note) = repair_note {
+        system.push_str("\n\n=== INVALID PREVIOUS PLAN ===\n");
+        system.push_str(note);
+        system.push_str("\nRe-plan now. Use exact tool names from Available tools only.");
+    }
     let mut msgs = vec![ChatMessage {
         role: "system".into(),
-        content: agent_prompts::plan_system_prompt(&datetime_context(), supports_prefill),
+        content: system,
         images: Vec::new(),
     }];
 
@@ -633,7 +915,22 @@ fn summarize_plan_tool_result(name: &str, json: &str) -> String {
                 .unwrap_or_default();
             Some(format!("page[title={}, url={}] {}", title, url, headings))
         }
+        "computer_screenshot" => {
+            let rect = parsed.get("screen_rect").unwrap_or(&Value::Null);
+            let width = rect.get("width").and_then(|v| v.as_i64()).unwrap_or(0);
+            let height = rect.get("height").and_then(|v| v.as_i64()).unwrap_or(0);
+            let target = parsed.get("target").and_then(|v| v.as_str()).unwrap_or("");
+            Some(format!(
+                "screenshot[target={}, size={}x{}]",
+                target, width, height
+            ))
+        }
         "browser_click"
+        | "browser_mouse_click"
+        | "browser_mouse_drag"
+        | "computer_mouse_click"
+        | "computer_mouse_drag"
+        | "computer_scroll"
         | "browser_fill"
         | "browser_select_option"
         | "browser_press"
@@ -1048,21 +1345,159 @@ fn summarize_plan_tool_result(name: &str, json: &str) -> String {
     trim_to(summary.as_deref().unwrap_or(json), 260)
 }
 
-fn finalize_plan(plan: Plan, history: &[crate::db::AgentMessageRow], user_text: &str) -> Plan {
+fn append_browser_context(
+    system: &mut String,
+    app: Option<&AppHandle>,
+    active_target: Option<&str>,
+) {
+    let Some(app) = app else {
+        return;
+    };
+    let windows = crate::webview_toolbar::list_browser_windows(app);
+    system.push_str("\n\n=== CURRENT BROWSER WINDOWS ===\n");
+    if let Some(active) = active_target {
+        system.push_str(&format!(
+            "ACTIVE ATTACHED TARGET: {active}\n\
+             The current Agent panel is attached to this exact webview. For references like \
+             \"this page\", \"current page\", \"这里\", \"这个页面\", \"このページ\", or \
+             \"今見ている内容\", use target=\"{active}\" exactly. Do not use another window \
+             unless the user explicitly asks to operate a different named window.\n"
+        ));
+    }
+    if windows.is_empty() {
+        system.push_str("No app browser window is currently registered.\n");
+        return;
+    }
+    system.push_str(
+        "These are live app browser windows. Use target exactly when reading or operating a specific page; if only one window exists, browser tools may omit target.\n",
+    );
+    for window in windows.iter().take(6) {
+        let active = active_target
+            .map(|target| target == window.target || target == window.label)
+            .unwrap_or(false);
+        system.push_str(&format!(
+            "- label={} target={} active={} url={}\n",
+            window.label,
+            window.target,
+            active,
+            trim_to(&window.url, 240)
+        ));
+    }
+}
+
+fn finalize_plan(
+    plan: Plan,
+    history: &[crate::db::AgentMessageRow],
+    user_text: &str,
+    turn_context: &AgentTurnContext,
+) -> Plan {
+    finalize_plan_with_diagnostics(plan, history, user_text, turn_context).plan
+}
+
+#[derive(Default)]
+struct FinalizedPlan {
+    plan: Plan,
+    unknown_tools: Vec<String>,
+    invalid_args: Vec<String>,
+}
+
+impl FinalizedPlan {
+    fn has_rejections(&self) -> bool {
+        !self.unknown_tools.is_empty() || !self.invalid_args.is_empty()
+    }
+}
+
+fn plan_repair_note(finalized: &FinalizedPlan) -> String {
+    let unknown = if finalized.unknown_tools.is_empty() {
+        "none".to_string()
+    } else {
+        finalized.unknown_tools.join(", ")
+    };
+    let invalid = if finalized.invalid_args.is_empty() {
+        "none".to_string()
+    } else {
+        finalized.invalid_args.join(", ")
+    };
+    format!(
+        "The previous plan selected unknown tools [{unknown}] or tools with invalid arguments [{invalid}]. \
+         Do not repeat those names. If no exact listed tool fits, output {{\"tools\":[]}}."
+    )
+}
+
+fn is_browser_target_scoped_tool(name: &str) -> bool {
+    matches!(
+        name,
+        "read_browser_page"
+            | "browser_back"
+            | "browser_forward"
+            | "browser_reload_page"
+            | "browser_click"
+            | "browser_mouse_click"
+            | "browser_mouse_drag"
+            | "computer_screenshot"
+            | "computer_mouse_click"
+            | "computer_mouse_drag"
+            | "computer_scroll"
+            | "browser_fill"
+            | "browser_select_option"
+            | "browser_press"
+            | "browser_scroll"
+            | "browser_wait_for"
+            | "browser_close"
+    )
+}
+
+fn apply_browser_target_lock(
+    tool_name: &str,
+    mut args: Value,
+    turn_context: &AgentTurnContext,
+) -> Value {
+    let Some(target) = turn_context.browser_target.as_deref() else {
+        return args;
+    };
+    if !is_browser_target_scoped_tool(tool_name) {
+        return args;
+    }
+    if let Value::Object(map) = &mut args {
+        let old_target = map.get("target").and_then(|v| v.as_str()).unwrap_or("");
+        if old_target != target {
+            if !old_target.is_empty() {
+                log::warn!(
+                    "[agent plan] browser target locked: tool={} requested={} forced={}",
+                    tool_name,
+                    old_target,
+                    target
+                );
+            }
+            map.insert("target".into(), Value::String(target.to_string()));
+        }
+    }
+    args
+}
+
+fn finalize_plan_with_diagnostics(
+    plan: Plan,
+    history: &[crate::db::AgentMessageRow],
+    user_text: &str,
+    turn_context: &AgentTurnContext,
+) -> FinalizedPlan {
     if should_skip_tools(history, user_text) {
         log::debug!(
             "[agent plan] skip_tools=true (smalltalk/followup), dropping {} tool(s)",
             plan.tools.len()
         );
-        return Plan::default();
+        return FinalizedPlan::default();
     }
     let mut seen = HashSet::new();
+    let mut unknown_tools = Vec::new();
+    let mut invalid_args = Vec::new();
     let tools: Vec<ToolCall> = plan
         .tools
         .into_iter()
         .filter_map(|call| {
             let Some(name) = agent_tools::canonical_tool_name(&call.name) else {
                 log::warn!("[agent plan] unknown tool dropped: {}", call.name);
+                unknown_tools.push(call.name);
                 return None;
             };
             let sanitized = agent_tools::sanitize_tool_args(name, &call.args);
@@ -1072,8 +1507,9 @@ fn finalize_plan(plan: Plan, history: &[crate::db::AgentMessageRow], user_text: 
                     name,
                     call.args
                 );
+                invalid_args.push(name.to_string());
             }
-            let args = sanitized?;
+            let args = apply_browser_target_lock(name, sanitized?, turn_context);
             let key = format!(
                 "{}:{}",
                 name,
@@ -1089,9 +1525,13 @@ fn finalize_plan(plan: Plan, history: &[crate::db::AgentMessageRow], user_text: 
         })
         .take(CFG.max_tools)
         .collect();
-    Plan {
-        tools,
-        image_only: plan.image_only,
+    FinalizedPlan {
+        plan: Plan {
+            tools,
+            image_only: plan.image_only,
+        },
+        unknown_tools,
+        invalid_args,
     }
 }
 
@@ -1103,14 +1543,19 @@ async fn execute_tools(
     db: &Database,
     plan: &Plan,
     user_text: &str,
-) -> Vec<(String, Value)> {
+    turn_context: &AgentTurnContext,
+) -> Result<Vec<(String, Value)>, AgentError> {
     let mut results = Vec::new();
     let mut auto_read_done = false;
+    let mut auto_mouse_done = false;
     let plan_already_reads_file = plan
         .tools
         .iter()
         .any(|call| call.name == "read_downloaded_file");
     for call in plan.tools.iter().take(CFG.max_tools) {
+        if AgentProvider::is_cancelled(conv_id) {
+            return Err(AgentError::Cancelled);
+        }
         emit(app, conv_id, &StreamEvent::ToolCall { name: &call.name });
         let started = std::time::Instant::now();
         log::debug!(
@@ -1119,15 +1564,26 @@ async fn execute_tools(
             serde_json::to_string(&call.args).unwrap_or_default()
         );
         let timeout = timeout_for(&call.name);
-        let result =
-            match tokio::time::timeout(timeout, agent_tools::dispatch(app, &call.name, &call.args))
-                .await
-            {
-                Ok(result) => result,
-                Err(_) => json!({
-                    "error": format!("tool timed out after {}s", timeout.as_secs()),
-                }),
-            };
+        let dispatch = agent_tools::dispatch(app, &call.name, &call.args);
+        tokio::pin!(dispatch);
+        let deadline = tokio::time::sleep(timeout);
+        tokio::pin!(deadline);
+        let mut cancel_tick = tokio::time::interval(std::time::Duration::from_millis(120));
+        let result = loop {
+            tokio::select! {
+                value = &mut dispatch => break value,
+                _ = &mut deadline => {
+                    break json!({
+                        "error": format!("tool timed out after {}s", timeout.as_secs()),
+                    });
+                }
+                _ = cancel_tick.tick() => {
+                    if AgentProvider::is_cancelled(conv_id) {
+                        return Err(AgentError::Cancelled);
+                    }
+                }
+            }
+        };
         let ok = result.get("error").is_none();
         let preview = preview_of(&result);
         log::debug!(
@@ -1159,6 +1615,97 @@ async fn execute_tools(
         );
 
         results.push((call.name.clone(), result));
+
+        if AgentProvider::is_cancelled(conv_id) {
+            return Err(AgentError::Cancelled);
+        }
+
+        if !auto_mouse_done
+            && call.name == "read_browser_page"
+            && turn_context.browser_target.is_some()
+        {
+            let last_page = &results[results.len() - 1].1;
+            let mouse_args = infer_mouse_click_from_observation(user_text, last_page, turn_context)
+                .or_else(|| infer_tab_browse_click_from_observation(user_text, last_page));
+            if let Some(mouse_args) = mouse_args {
+                let mouse_args =
+                    apply_browser_target_lock("computer_mouse_click", mouse_args, turn_context);
+                let mouse_result =
+                    execute_auto_tool(app, conv_id, db, "computer_mouse_click", mouse_args).await?;
+                results.push(("computer_mouse_click".into(), mouse_result));
+                auto_mouse_done = true;
+                if AgentProvider::is_cancelled(conv_id) {
+                    return Err(AgentError::Cancelled);
+                }
+
+                let read_args =
+                    apply_browser_target_lock("read_browser_page", json!({}), turn_context);
+                let read_result =
+                    execute_auto_tool(app, conv_id, db, "read_browser_page", read_args).await?;
+                results.push(("read_browser_page".into(), read_result));
+                if AgentProvider::is_cancelled(conv_id) {
+                    return Err(AgentError::Cancelled);
+                }
+            }
+        }
+
+        if !auto_mouse_done
+            && call.name == "computer_screenshot"
+            && turn_context.browser_target.is_some()
+        {
+            let screenshot_mouse_args = infer_mouse_click_from_screenshot(
+                user_text,
+                &results[results.len() - 1].1,
+                turn_context,
+            );
+            let observation_mouse_args = if screenshot_mouse_args.is_none() {
+                let read_args =
+                    apply_browser_target_lock("read_browser_page", json!({}), turn_context);
+                let read_result =
+                    execute_auto_tool(app, conv_id, db, "read_browser_page", read_args).await?;
+                let mouse_args =
+                    infer_mouse_click_from_observation(user_text, &read_result, turn_context)
+                        .or_else(|| {
+                            infer_tab_browse_click_from_observation(user_text, &read_result)
+                        });
+                results.push(("read_browser_page".into(), read_result));
+                if AgentProvider::is_cancelled(conv_id) {
+                    return Err(AgentError::Cancelled);
+                }
+                mouse_args
+            } else {
+                None
+            };
+            if let Some(mouse_args) = screenshot_mouse_args.or(observation_mouse_args) {
+                let mouse_args =
+                    apply_browser_target_lock("computer_mouse_click", mouse_args, turn_context);
+                let mouse_result =
+                    execute_auto_tool(app, conv_id, db, "computer_mouse_click", mouse_args).await?;
+                results.push(("computer_mouse_click".into(), mouse_result));
+                auto_mouse_done = true;
+                if AgentProvider::is_cancelled(conv_id) {
+                    return Err(AgentError::Cancelled);
+                }
+
+                let shot_args =
+                    apply_browser_target_lock("computer_screenshot", json!({}), turn_context);
+                let shot_result =
+                    execute_auto_tool(app, conv_id, db, "computer_screenshot", shot_args).await?;
+                results.push(("computer_screenshot".into(), shot_result));
+                if AgentProvider::is_cancelled(conv_id) {
+                    return Err(AgentError::Cancelled);
+                }
+
+                let read_args =
+                    apply_browser_target_lock("read_browser_page", json!({}), turn_context);
+                let read_result =
+                    execute_auto_tool(app, conv_id, db, "read_browser_page", read_args).await?;
+                results.push(("read_browser_page".into(), read_result));
+                if AgentProvider::is_cancelled(conv_id) {
+                    return Err(AgentError::Cancelled);
+                }
+            }
+        }
 
         if !auto_read_done
             && !plan_already_reads_file
@@ -1221,10 +1768,812 @@ async fn execute_tools(
                 );
                 results.push(("read_downloaded_file".into(), auto_result));
                 auto_read_done = true;
+                if AgentProvider::is_cancelled(conv_id) {
+                    return Err(AgentError::Cancelled);
+                }
             }
         }
     }
-    results
+    Ok(results)
+}
+
+async fn execute_auto_tool(
+    app: &AppHandle,
+    conv_id: &str,
+    db: &Database,
+    name: &str,
+    args: Value,
+) -> Result<Value, AgentError> {
+    emit(app, conv_id, &StreamEvent::ToolCall { name });
+    let started = std::time::Instant::now();
+    log::debug!(
+        "[agent tool] auto-follow name={} args={}",
+        name,
+        serde_json::to_string(&args).unwrap_or_default()
+    );
+    let timeout = timeout_for(name);
+    let result = match tokio::time::timeout(timeout, agent_tools::dispatch(app, name, &args)).await
+    {
+        Ok(result) => result,
+        Err(_) => json!({
+            "error": format!("tool timed out after {}s", timeout.as_secs()),
+        }),
+    };
+    let ok = result.get("error").is_none();
+    let preview = preview_of(&result);
+    log::debug!(
+        "[agent tool] finish name={} ok={} elapsed_ms={} preview={}",
+        name,
+        ok,
+        started.elapsed().as_millis(),
+        truncate_for_log(&preview, 200)
+    );
+    emit(
+        app,
+        conv_id,
+        &StreamEvent::ToolResult {
+            name,
+            preview: &preview,
+            ok,
+        },
+    );
+    let tool_json = serde_json::to_string(&result).unwrap_or_else(|_| "{}".into());
+    let _ = db.agent_append_message(conv_id, "tool", "", None, Some(name), Some(&tool_json));
+    Ok(result)
+}
+
+fn local_browser_action_answer(
+    user_text: &str,
+    tool_results: &[(String, Value)],
+    turn_context: &AgentTurnContext,
+) -> Option<String> {
+    if turn_context.browser_target.is_none()
+        || !is_browser_operation_intent(&normalize_planner_text(user_text))
+    {
+        return None;
+    }
+
+    let (_, result) = tool_results.iter().rev().find(|(name, result)| {
+        matches!(
+            name.as_str(),
+            "computer_mouse_click" | "browser_mouse_click" | "browser_click"
+        ) && result.get("error").is_none()
+    })?;
+    let answer = result
+        .get("current_url")
+        .and_then(|v| v.as_str())
+        .filter(|url| !url.trim().is_empty())
+        .map(|url| format!("已点击。当前页面：{url}"))
+        .unwrap_or_else(|| "已点击。".to_string());
+    Some(answer)
+}
+
+fn infer_mouse_click_from_observation(
+    user_text: &str,
+    page: &Value,
+    turn_context: &AgentTurnContext,
+) -> Option<Value> {
+    let norm = normalize_planner_text(user_text);
+    let labels = if turn_context.browser_click_labels.is_empty() {
+        requested_click_labels(&norm)?
+    } else {
+        turn_context.browser_click_labels.clone()
+    };
+    let matched = browser_observation_candidates(page)
+        .into_iter()
+        .filter(|item| {
+            let hay = normalize_click_match_text(&item.label);
+            labels
+                .iter()
+                .map(|label| normalize_click_match_text(label))
+                .any(|label| !label.is_empty() && (hay.contains(&label) || label.contains(&hay)))
+        })
+        .max_by_key(|item| click_candidate_priority(item, page));
+    if let Some(item) = matched {
+        return Some(json!({
+            "x": item.center_x,
+            "y": item.center_y,
+            "coordinate_space": "webview",
+        }));
+    }
+    if labels_indicate_home(&labels) {
+        if let Some(item) = top_left_click_candidate(page) {
+            return Some(json!({
+                "x": item.center_x,
+                "y": item.center_y,
+                "coordinate_space": "webview",
+            }));
+        }
+    }
+    None
+}
+
+fn click_candidate_priority(item: &BrowserClickCandidate, page: &Value) -> i64 {
+    let mut score = 0_i64;
+    if item.center_y <= 220 {
+        score += 1_000;
+    }
+    if same_host(
+        page.get("url").and_then(|v| v.as_str()).unwrap_or(""),
+        &item.url,
+    )
+    .unwrap_or(false)
+    {
+        score += 180;
+    }
+    let url = item.url.to_ascii_lowercase();
+    if url.ends_with(".pdf") || url.contains(".pdf?") {
+        score -= 800;
+    }
+    if contains_any(
+        &normalize_planner_text(&item.label),
+        &["申込", "予約", "login", "ログイン"],
+    ) {
+        score -= 500;
+    }
+    score - item.center_y.max(0)
+}
+
+fn infer_tab_browse_click_from_observation(user_text: &str, page: &Value) -> Option<Value> {
+    let norm = normalize_planner_text(user_text);
+    if !wants_to_browse_visible_tabs(&norm) {
+        return None;
+    }
+    top_navigation_click_candidate(page).map(|item| {
+        json!({
+            "x": item.center_x,
+            "y": item.center_y,
+            "coordinate_space": "webview",
+        })
+    })
+}
+
+fn infer_mouse_click_from_screenshot(
+    user_text: &str,
+    screenshot: &Value,
+    turn_context: &AgentTurnContext,
+) -> Option<Value> {
+    let norm = normalize_planner_text(user_text);
+    let labels = if turn_context.browser_click_labels.is_empty() {
+        requested_click_labels(&norm)?
+    } else {
+        turn_context.browser_click_labels.clone()
+    };
+    if !labels_indicate_home(&labels) {
+        return None;
+    }
+
+    let width = screenshot
+        .get("screen_rect")
+        .and_then(|v| v.get("width"))
+        .and_then(|v| v.as_f64())
+        .unwrap_or(1200.0)
+        .max(1.0);
+    let height = screenshot
+        .get("screen_rect")
+        .and_then(|v| v.get("height"))
+        .and_then(|v| v.as_f64())
+        .unwrap_or(800.0)
+        .max(1.0);
+    let x = (width * 0.12).clamp(48.0, 160.0).min(width - 1.0);
+    let y = (height * 0.08).clamp(32.0, 92.0).min(height - 1.0);
+    Some(json!({
+        "x": x.round() as i64,
+        "y": y.round() as i64,
+        "coordinate_space": "screenshot",
+    }))
+}
+
+struct BrowserClickCandidate {
+    label: String,
+    url: String,
+    center_x: i64,
+    center_y: i64,
+}
+
+fn requested_click_labels(norm: &str) -> Option<Vec<String>> {
+    if contains_any(
+        norm,
+        &[
+            "回首页",
+            "回到首页",
+            "返回首页",
+            "去首页",
+            "进入首页",
+            "回主页",
+            "回到主页",
+            "返回主页",
+            "トップページ",
+            "ホーム",
+            "homepage",
+            "gohome",
+        ],
+    ) {
+        let mut labels: Vec<String> = [
+            "home",
+            "ホーム",
+            "トップ",
+            "トップページ",
+            "首页",
+            "主页",
+            "top",
+            "logo",
+            "ロゴ",
+        ]
+        .into_iter()
+        .map(str::to_string)
+        .collect();
+        labels.sort();
+        labels.dedup();
+        return Some(labels);
+    }
+
+    extract_browser_click_text(norm).and_then(|text| normalized_click_labels(&text))
+}
+
+fn browser_click_labels_for_turn(
+    history: &[crate::db::AgentMessageRow],
+    user_text: &str,
+) -> Vec<String> {
+    let norm = normalize_planner_text(user_text);
+    if let Some(labels) = requested_click_labels(&norm) {
+        return labels;
+    }
+    if let Some(index) = selection_index_from_norm(&norm) {
+        if let Some(labels) = recent_numbered_click_labels(history, index, &norm) {
+            return labels;
+        }
+    }
+    if !is_short_click_confirmation(&norm) {
+        return Vec::new();
+    }
+    let recent = history
+        .iter()
+        .rev()
+        .take(6)
+        .map(|row| row.content.as_str())
+        .collect::<Vec<_>>()
+        .join(" ");
+    let recent_norm = normalize_planner_text(&recent);
+    if contains_any(
+        &recent_norm,
+        &[
+            "回首页",
+            "回到首页",
+            "返回首页",
+            "回主页",
+            "回到主页",
+            "返回主页",
+            "主页",
+            "首页",
+            "ホーム",
+            "トップページ",
+            "homepage",
+            "logo",
+            "ロゴ",
+        ],
+    ) {
+        return requested_click_labels("回到主页").unwrap_or_default();
+    }
+    if let Some(labels) = recent_explicit_click_labels(history, &norm) {
+        return labels;
+    }
+    Vec::new()
+}
+
+fn recent_explicit_click_labels(
+    history: &[crate::db::AgentMessageRow],
+    current_norm: &str,
+) -> Option<Vec<String>> {
+    for row in history.iter().rev().take(10) {
+        let text = row.content.trim();
+        if text.is_empty() || normalize_planner_text(text) == current_norm {
+            continue;
+        }
+        if let Some(labels) = click_labels_from_recent_text(text) {
+            return Some(labels);
+        }
+    }
+    None
+}
+
+fn selection_index_from_norm(norm: &str) -> Option<usize> {
+    match norm {
+        "1" | "１" | "第1" | "第一" | "第一个" | "第一個" | "选1" | "選1" | "选择1" | "選擇1"
+        | "一番目" | "1番目" => Some(1),
+        "2" | "２" | "第2" | "第二" | "第二个" | "第二個" | "选2" | "選2" | "选择2" | "選擇2"
+        | "二番目" | "2番目" => Some(2),
+        "3" | "３" | "第3" | "第三" | "第三个" | "第三個" | "选3" | "選3" | "选择3" | "選擇3"
+        | "三番目" | "3番目" => Some(3),
+        _ => None,
+    }
+}
+
+fn recent_numbered_click_labels(
+    history: &[crate::db::AgentMessageRow],
+    index: usize,
+    current_norm: &str,
+) -> Option<Vec<String>> {
+    for row in history.iter().rev().take(12) {
+        if row.role != "assistant" {
+            continue;
+        }
+        let text = row.content.trim();
+        if text.is_empty() || normalize_planner_text(text) == current_norm {
+            continue;
+        }
+        if let Some(labels) = numbered_click_labels_from_text(text, index) {
+            return Some(labels);
+        }
+    }
+    None
+}
+
+fn numbered_click_labels_from_text(text: &str, index: usize) -> Option<Vec<String>> {
+    for line in text.lines() {
+        if numbered_line_index(line) != Some(index) {
+            continue;
+        }
+        let labels = extract_click_label_candidates(line);
+        if !labels.is_empty() {
+            return Some(labels);
+        }
+    }
+    None
+}
+
+fn numbered_line_index(line: &str) -> Option<usize> {
+    let trimmed = line
+        .trim_start()
+        .trim_start_matches(|c: char| matches!(c, '*' | '-' | '・' | '•'))
+        .trim_start();
+    let mut chars = trimmed.chars();
+    let first = chars.next()?;
+    let value = match first {
+        '1' | '１' => 1,
+        '2' | '２' => 2,
+        '3' | '３' => 3,
+        _ => return None,
+    };
+    let next = chars.next().unwrap_or(' ');
+    if matches!(next, '.' | '．' | ')' | '）' | '、' | ':' | '：') || next.is_whitespace() {
+        Some(value)
+    } else {
+        None
+    }
+}
+
+fn click_labels_from_recent_text(text: &str) -> Option<Vec<String>> {
+    let mut candidates = Vec::new();
+    for line in text.lines().rev() {
+        let line_norm = normalize_planner_text(line);
+        if !contains_any(
+            &line_norm,
+            &[
+                "点击",
+                "點擊",
+                "点",
+                "クリック",
+                "押して",
+                "标签",
+                "タブ",
+                "ボタン",
+                "リンク",
+                "上方",
+                "导航",
+                "ナビ",
+            ],
+        ) {
+            continue;
+        }
+        candidates.extend(extract_click_label_candidates(line));
+        if !candidates.is_empty() {
+            break;
+        }
+    }
+    if candidates.is_empty() {
+        candidates.extend(extract_click_label_candidates(text));
+    }
+    candidates.dedup();
+    if candidates.is_empty() {
+        None
+    } else {
+        Some(candidates)
+    }
+}
+
+fn extract_click_label_candidates(text: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    for value in extract_all_between_any(
+        text,
+        &[
+            ("“", "”"),
+            ("\"", "\""),
+            ("「", "」"),
+            ("『", "』"),
+            ("`", "`"),
+            ("**", "**"),
+        ],
+    ) {
+        out.extend(normalized_click_labels(&value).unwrap_or_default());
+    }
+    for value in extract_markdown_link_labels(text) {
+        out.extend(normalized_click_labels(&value).unwrap_or_default());
+    }
+    out.sort();
+    out.dedup();
+    out
+}
+
+fn normalized_click_labels(text: &str) -> Option<Vec<String>> {
+    let trimmed = text.trim();
+    if !is_meaningful_click_label(trimmed) {
+        return None;
+    }
+    let mut labels = Vec::new();
+    push_click_label_variant(&mut labels, trimmed);
+    for part in extract_all_between_any(trimmed, &[("（", "）"), ("(", ")")]) {
+        push_click_label_variant(&mut labels, &part);
+    }
+    let before_paren = trimmed.split(['（', '(']).next().unwrap_or(trimmed).trim();
+    push_click_label_variant(&mut labels, before_paren);
+
+    labels.sort();
+    labels.dedup();
+    if labels.is_empty() {
+        None
+    } else {
+        Some(labels)
+    }
+}
+
+fn normalize_click_match_text(s: &str) -> String {
+    normalize_planner_text(s)
+        .chars()
+        .map(agent_tools::normalize_cjk_char)
+        .collect()
+}
+
+fn push_click_label_variant(out: &mut Vec<String>, value: &str) {
+    let Some(cleaned) = strip_click_label_generic_words(value) else {
+        return;
+    };
+    let normalized = normalize_planner_text(&cleaned);
+    if !normalized.is_empty() {
+        out.push(normalized);
+    }
+}
+
+fn strip_click_label_generic_words(text: &str) -> Option<String> {
+    let mut value = text
+        .trim()
+        .trim_matches(|c: char| matches!(c, '"' | '\'' | '`' | '「' | '」' | '『' | '』'))
+        .to_string();
+    for suffix in [
+        "というボタン",
+        "这个按钮",
+        "這個按鈕",
+        "的按钮",
+        "的按鈕",
+        "ボタン",
+        "按钮",
+        "按鈕",
+        "button",
+        "リンク",
+        "链接",
+        "連結",
+        "link",
+        "タブ",
+        "标签",
+        "頁籤",
+        "选项卡",
+        "選項卡",
+        "菜单",
+        "メニュー",
+        "入口",
+        "选项",
+        "選項",
+    ] {
+        loop {
+            let trimmed = value.trim();
+            if !trimmed.ends_with(suffix) {
+                break;
+            }
+            value = trimmed[..trimmed.len().saturating_sub(suffix.len())]
+                .trim()
+                .to_string();
+        }
+    }
+    if value.trim().is_empty() {
+        None
+    } else {
+        Some(value)
+    }
+}
+
+fn is_meaningful_click_label(text: &str) -> bool {
+    let trimmed = text.trim();
+    let count = trimmed.chars().count();
+    if !(2..=80).contains(&count) {
+        return false;
+    }
+    let norm = normalize_planner_text(trimmed);
+    if norm.is_empty() || norm.starts_with("http") {
+        return false;
+    }
+    if contains_any(
+        &norm,
+        &["标签", "頁籤", "选项卡", "タブ", "tab", "导航", "菜单"],
+    ) && contains_any(&norm, &["全部", "看看", "看", "all", "一覧"])
+    {
+        return false;
+    }
+    !matches!(
+        norm.as_str(),
+        "标签"
+            | "全部"
+            | "这里"
+            | "這里"
+            | "この"
+            | "これ"
+            | "这个"
+            | "這個"
+            | "哪一个具体部分"
+            | "哪个"
+            | "哪個"
+            | "点击"
+            | "點擊"
+            | "click"
+            | "button"
+    )
+}
+
+fn extract_all_between_any(s: &str, pairs: &[(&str, &str)]) -> Vec<String> {
+    let mut out = Vec::new();
+    for (open, close) in pairs {
+        let mut rest = s;
+        while let Some((_, tail)) = rest.split_once(open) {
+            let Some((inside, next)) = tail.split_once(close) else {
+                break;
+            };
+            let inside = inside.trim();
+            if !inside.is_empty() {
+                out.push(inside.to_string());
+            }
+            rest = next;
+        }
+    }
+    out
+}
+
+fn extract_markdown_link_labels(s: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut rest = s;
+    while let Some((_, tail)) = rest.split_once('[') {
+        let Some((label, after_label)) = tail.split_once("](") else {
+            break;
+        };
+        let Some((_, next)) = after_label.split_once(')') else {
+            break;
+        };
+        let label = label.trim();
+        if !label.is_empty() {
+            out.push(label.to_string());
+        }
+        rest = next;
+    }
+    out
+}
+
+fn is_short_click_confirmation(norm: &str) -> bool {
+    matches!(
+        norm,
+        "点" | "点啊"
+            | "点击"
+            | "點"
+            | "點啊"
+            | "点吧"
+            | "好"
+            | "好的"
+            | "执行"
+            | "去点"
+            | "点logo"
+            | "重试"
+            | "再试"
+            | "再试一次"
+            | "重新试"
+            | "重新点击"
+            | "retry"
+            | "tryagain"
+            | "click"
+            | "doit"
+            | "yes"
+            | "ok"
+            | "押して"
+            | "クリック"
+    )
+}
+
+fn browser_observation_candidates(page: &Value) -> Vec<BrowserClickCandidate> {
+    let mut out = Vec::new();
+    if let Some(links) = page.get("links").and_then(|v| v.as_array()) {
+        for link in links {
+            if let Some(candidate) = click_candidate_from_value(link, &["text", "url"]) {
+                out.push(candidate);
+            }
+        }
+    }
+    let elements = page.get("interactive_elements").unwrap_or(&Value::Null);
+    if let Some(buttons) = elements.get("buttons").and_then(|v| v.as_array()) {
+        for button in buttons {
+            if let Some(candidate) = click_candidate_from_value(button, &["text", "type"]) {
+                out.push(candidate);
+            }
+        }
+    }
+    if let Some(inputs) = elements.get("inputs").and_then(|v| v.as_array()) {
+        for input in inputs {
+            if let Some(candidate) =
+                click_candidate_from_value(input, &["label", "name", "placeholder", "value"])
+            {
+                out.push(candidate);
+            }
+        }
+    }
+    out
+}
+
+fn labels_indicate_home(labels: &[String]) -> bool {
+    labels.iter().any(|label| {
+        matches!(
+            label.as_str(),
+            "home"
+                | "ホーム"
+                | "トップ"
+                | "トップページ"
+                | "首页"
+                | "主页"
+                | "top"
+                | "logo"
+                | "ロゴ"
+        )
+    })
+}
+
+fn top_left_click_candidate(page: &Value) -> Option<BrowserClickCandidate> {
+    let viewport_width = page
+        .get("viewport")
+        .and_then(|v| v.get("width"))
+        .and_then(|v| v.as_i64())
+        .unwrap_or(1200)
+        .max(1);
+    let max_x = ((viewport_width as f64) * 0.42).round() as i64;
+    browser_observation_candidates(page)
+        .into_iter()
+        .filter(|item| item.center_x >= 0 && item.center_y >= 0)
+        .filter(|item| item.center_x <= max_x && item.center_y <= 180)
+        .min_by_key(|item| item.center_y * 10_000 + item.center_x)
+}
+
+fn wants_to_browse_visible_tabs(norm: &str) -> bool {
+    contains_any(
+        norm,
+        &[
+            "标签",
+            "頁籤",
+            "选项卡",
+            "タブ",
+            "tab",
+            "导航",
+            "ナビ",
+            "菜单",
+            "メニュー",
+        ],
+    ) && contains_any(
+        norm,
+        &[
+            "点击",
+            "点",
+            "看看",
+            "看",
+            "全部",
+            "全て",
+            "すべて",
+            "all",
+            "一覧",
+            "打开",
+            "開く",
+        ],
+    )
+}
+
+fn top_navigation_click_candidate(page: &Value) -> Option<BrowserClickCandidate> {
+    let viewport_width = page
+        .get("viewport")
+        .and_then(|v| v.get("width"))
+        .and_then(|v| v.as_i64())
+        .unwrap_or(1200)
+        .max(1);
+    browser_observation_candidates(page)
+        .into_iter()
+        .filter(|item| item.center_x >= 0 && item.center_y >= 0)
+        .filter(|item| item.center_x <= viewport_width && item.center_y <= 220)
+        .filter(|item| is_safe_navigation_candidate(item, page))
+        .min_by_key(|item| item.center_y * 10_000 + item.center_x)
+}
+
+fn is_safe_navigation_candidate(item: &BrowserClickCandidate, page: &Value) -> bool {
+    let label = normalize_planner_text(&item.label);
+    if label.is_empty()
+        || label.chars().count() > 40
+        || labels_indicate_home(std::slice::from_ref(&label))
+        || label.starts_with("home")
+        || label.starts_with("トップ")
+        || contains_any(
+            &label,
+            &[
+                "問い合わせ",
+                "お問い合わせ",
+                "contact",
+                "login",
+                "ログイン",
+                "予約",
+                "申込",
+                "申し込み",
+                "apply",
+                "submit",
+            ],
+        )
+    {
+        return false;
+    }
+    if item.url.is_empty() {
+        return true;
+    }
+    let url_lower = item.url.to_ascii_lowercase();
+    if !(url_lower.starts_with("http://") || url_lower.starts_with("https://")) {
+        return false;
+    }
+    let page_url = page.get("url").and_then(|v| v.as_str()).unwrap_or("");
+    same_host(page_url, &item.url).unwrap_or(true)
+}
+
+fn same_host(a: &str, b: &str) -> Option<bool> {
+    let a = url::Url::parse(a).ok()?;
+    let b = url::Url::parse(b).ok()?;
+    Some(a.host_str() == b.host_str())
+}
+
+fn click_candidate_from_value(item: &Value, label_keys: &[&str]) -> Option<BrowserClickCandidate> {
+    let rect = item.get("rect")?;
+    let center_x = rect
+        .get("centerX")
+        .or_else(|| rect.get("center_x"))?
+        .as_i64()?;
+    let center_y = rect
+        .get("centerY")
+        .or_else(|| rect.get("center_y"))?
+        .as_i64()?;
+    let label = label_keys
+        .iter()
+        .filter_map(|key| item.get(*key).and_then(|v| v.as_str()))
+        .filter(|s| !s.trim().is_empty())
+        .collect::<Vec<_>>()
+        .join(" ");
+    if label.trim().is_empty() {
+        return None;
+    }
+    Some(BrowserClickCandidate {
+        label,
+        url: item
+            .get("url")
+            .or_else(|| item.get("href"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string(),
+        center_x,
+        center_y,
+    })
 }
 
 // ─────────────────────── Phase 2: Answer ───────────────────────
@@ -1237,10 +2586,72 @@ async fn answer_phase(
     user_text: &str,
     user_images: &[ImagePart],
     tool_results: &[(String, Value)],
+    turn_context: &AgentTurnContext,
 ) -> Result<String, AgentError> {
+    answer_phase_with_note(
+        app,
+        conv_id,
+        provider,
+        history,
+        user_text,
+        user_images,
+        tool_results,
+        None,
+        turn_context,
+    )
+    .await
+}
+
+async fn answer_phase_with_repair(
+    app: &AppHandle,
+    conv_id: &str,
+    provider: &AgentProvider,
+    history: &[crate::db::AgentMessageRow],
+    user_text: &str,
+    user_images: &[ImagePart],
+    tool_results: &[(String, Value)],
+    repair_note: &str,
+    turn_context: &AgentTurnContext,
+) -> Result<String, AgentError> {
+    answer_phase_with_note(
+        app,
+        conv_id,
+        provider,
+        history,
+        user_text,
+        user_images,
+        tool_results,
+        Some(repair_note),
+        turn_context,
+    )
+    .await
+}
+
+async fn answer_phase_with_note(
+    app: &AppHandle,
+    conv_id: &str,
+    provider: &AgentProvider,
+    history: &[crate::db::AgentMessageRow],
+    user_text: &str,
+    user_images: &[ImagePart],
+    tool_results: &[(String, Value)],
+    repair_note: Option<&str>,
+    turn_context: &AgentTurnContext,
+) -> Result<String, AgentError> {
+    if AgentProvider::is_cancelled(conv_id) {
+        return Err(AgentError::Cancelled);
+    }
     emit(app, conv_id, &StreamEvent::Phase { stage: "answering" });
 
-    let messages = build_answer_messages(history, user_text, user_images, tool_results);
+    let messages = build_answer_messages(
+        Some(app),
+        history,
+        user_text,
+        user_images,
+        tool_results,
+        repair_note,
+        turn_context,
+    );
     log::debug!(
         "[agent answer] start conv_id={} messages={} tool_results={}",
         conv_id,
@@ -1310,6 +2721,41 @@ async fn answer_phase(
         answer.trim().is_empty()
     );
     Ok(answer)
+}
+
+fn pseudo_tool_repair_note(raw: Option<&RawToolCall>, answer: &str) -> String {
+    let visible = agent_text::strip_think(answer);
+    let snippet = trim_to(visible.trim(), 700);
+    let raw_summary = raw
+        .map(|call| {
+            format!(
+                "raw tool name: {}; raw args: {}",
+                call.name,
+                serde_json::to_string(&call.args).unwrap_or_else(|_| "{}".into())
+            )
+        })
+        .unwrap_or_else(|| "raw tool name: unknown or repeated".to_string());
+    format!(
+        "Your previous visible answer attempted an invalid or repeated tool call. \
+         {raw_summary}. This answer was not shown to the user. Re-answer now in \
+         natural language only. Do not print tool names, JSON, pseudo-call syntax, \
+         or any call/tool block. Use only facts from the provided tool results. If \
+         the requested action was not completed, say that naturally and ask for the \
+         missing target. Previous hidden answer snippet: {snippet}"
+    )
+}
+
+fn pseudo_tool_repair_failed_message(user_text: &str, _raw: Option<&RawToolCall>) -> String {
+    if contains_any(
+        user_text,
+        &["吗", "你", "打开", "看看", "中文", "为什么", "工具"],
+    ) {
+        "模型连续尝试调用不存在或无效的工具，我已经拦截，没有把伪工具内容显示出来。请再说一次要打开或检查的目标。".to_string()
+    } else if contains_any(user_text, &["して", "開いて", "見て", "なぜ", "ツール"]) {
+        "存在しない、または無効なツール呼び出しを連続で検出したため、表示せずに止めました。開く対象や確認したい内容をもう一度指定してください。".to_string()
+    } else {
+        "The model repeatedly tried to call a nonexistent or invalid tool, so I blocked it from being shown. Please restate the page or action you want.".to_string()
+    }
 }
 
 enum VisibleStreamMode {
@@ -1439,10 +2885,13 @@ fn classify_visible_stream_start(buffer: &str) -> VisibleStart {
 }
 
 fn build_answer_messages(
+    app: Option<&AppHandle>,
     history: &[crate::db::AgentMessageRow],
     user_text: &str,
     user_images: &[ImagePart],
     tool_results: &[(String, Value)],
+    repair_note: Option<&str>,
+    turn_context: &AgentTurnContext,
 ) -> Vec<ChatMessage> {
     let mut budget = CFG.prompt_token_budget;
 
@@ -1452,6 +2901,14 @@ fn build_answer_messages(
         "\n\n=== CURRENT DATE/TIME ===\n{}\n",
         datetime_context()
     ));
+    system.push_str(agent_prompts::answer_tool_usage_section());
+    system.push_str("\n\n=== AVAILABLE TOOLS REFERENCE (READ-ONLY) ===\n");
+    system.push_str(
+        "These exact tool names/signatures exist, but this answer phase cannot execute new tools. \
+         Use this only to avoid inventing capabilities or fake tool names.\n",
+    );
+    system.push_str(agent_tools::tool_catalog_prompt());
+    append_browser_context(&mut system, app, turn_context.browser_target.as_deref());
 
     if !tool_results.is_empty() {
         system.push_str("\n\n<tool_results>\n");
@@ -1494,6 +2951,12 @@ fn build_answer_messages(
              Briefly say you cannot view images yet and ask for a text description.\n\
              Do not guess image contents. Do not add unrelated topics.\n",
         );
+    }
+
+    if let Some(note) = repair_note {
+        system.push_str("\n\n=== REPAIR INSTRUCTION ===\n");
+        system.push_str(note);
+        system.push('\n');
     }
 
     budget = budget.saturating_sub(estimate_tokens(&system));
@@ -1573,6 +3036,7 @@ fn sanitize_answer_tool_result(value: &Value) -> Value {
                         | "action"
                         | "_cid"
                         | "form_params"
+                        | "data_base64"
                 ) {
                     continue;
                 }
@@ -1848,6 +3312,14 @@ fn heuristic_plan(history: &[crate::db::AgentMessageRow], user_text: &str) -> Op
 
     let norm = normalize_planner_text(user_text);
 
+    if is_browser_operation_intent(&norm) {
+        return None;
+    }
+
+    if let Some(plan) = campus_browser_plan(&norm) {
+        return Some(plan);
+    }
+
     if let Some(path) = recent_downloaded_file_path(history) {
         if contains_any(
             &norm,
@@ -1960,6 +3432,218 @@ fn heuristic_plan(history: &[crate::db::AgentMessageRow], user_text: &str) -> Op
     }
 
     None // Fall through to model inference.
+}
+
+fn is_browser_operation_intent(norm: &str) -> bool {
+    contains_any(
+        norm,
+        &[
+            "点击",
+            "點擊",
+            "点一下",
+            "点开",
+            "押して",
+            "クリック",
+            "click",
+            "填写",
+            "填",
+            "入力",
+            "submit",
+            "选择",
+            "選択",
+            "scroll",
+            "スクロール",
+            "拖拽",
+            "拖动",
+            "ドラッグ",
+            "drag",
+            "mouse",
+            "鼠标",
+            "マウス",
+        ],
+    )
+}
+
+fn attached_browser_control_plan(norm: &str, turn_context: &AgentTurnContext) -> Option<Plan> {
+    turn_context.browser_target.as_ref()?;
+    if !turn_context.browser_click_labels.is_empty() {
+        return Some(single_tool_plan("computer_screenshot", json!({})));
+    }
+
+    if contains_any(
+        norm,
+        &[
+            "回首页",
+            "回到首页",
+            "返回首页",
+            "去首页",
+            "进入首页",
+            "回主页",
+            "回到主页",
+            "返回主页",
+            "トップページ",
+            "ホーム",
+            "home page",
+            "homepage",
+            "go home",
+        ],
+    ) {
+        return Some(single_tool_plan("computer_screenshot", json!({})));
+    }
+
+    if contains_any(norm, &["返回", "后退", "戻って", "戻る", "back"]) {
+        return Some(browser_nav_then_read_plan("browser_back"));
+    }
+    if contains_any(norm, &["前进", "進む", "forward"]) {
+        return Some(browser_nav_then_read_plan("browser_forward"));
+    }
+    if contains_any(norm, &["刷新页面", "重载", "リロード", "reload page"]) {
+        return Some(browser_nav_then_read_plan("browser_reload_page"));
+    }
+
+    if contains_any(norm, &["往下", "下に", "scroll down", "向下"]) {
+        return Some(computer_scroll_then_observe_plan(-900));
+    }
+    if contains_any(norm, &["往上", "上に", "scroll up", "向上"]) {
+        return Some(computer_scroll_then_observe_plan(900));
+    }
+
+    if is_browser_operation_intent(norm) {
+        return Some(single_tool_plan("read_browser_page", json!({})));
+    }
+
+    None
+}
+
+fn browser_nav_then_read_plan(tool: &str) -> Plan {
+    Plan {
+        tools: vec![
+            ToolCall {
+                name: tool.to_string(),
+                args: json!({}),
+            },
+            ToolCall {
+                name: "read_browser_page".into(),
+                args: json!({}),
+            },
+        ],
+        image_only: false,
+    }
+}
+
+fn computer_scroll_then_observe_plan(delta_y: i64) -> Plan {
+    Plan {
+        tools: vec![
+            ToolCall {
+                name: "computer_scroll".into(),
+                args: json!({ "delta_y": delta_y }),
+            },
+            ToolCall {
+                name: "computer_screenshot".into(),
+                args: json!({}),
+            },
+            ToolCall {
+                name: "read_browser_page".into(),
+                args: json!({}),
+            },
+        ],
+        image_only: false,
+    }
+}
+
+fn extract_browser_click_text(norm: &str) -> Option<String> {
+    let quoted = extract_between_any(
+        norm,
+        &[("“", "”"), ("\"", "\""), ("「", "」"), ("『", "』")],
+    );
+    if quoted.as_deref().is_some_and(|s| !s.trim().is_empty()) {
+        return quoted;
+    }
+
+    for marker in [
+        "点击",
+        "點擊",
+        "点一下",
+        "点开",
+        "押して",
+        "クリック",
+        "click",
+    ] {
+        if let Some((_, tail)) = norm.split_once(marker) {
+            let text = tail
+                .trim_matches(|c: char| c.is_whitespace() || matches!(c, ':' | '：' | ',' | '，'))
+                .split_whitespace()
+                .take(4)
+                .collect::<Vec<_>>()
+                .join(" ");
+            if (2..=80).contains(&text.chars().count()) {
+                return Some(text);
+            }
+        }
+    }
+
+    None
+}
+
+fn extract_between_any(s: &str, pairs: &[(&str, &str)]) -> Option<String> {
+    for (open, close) in pairs {
+        let Some((_, tail)) = s.split_once(open) else {
+            continue;
+        };
+        let Some((inside, _)) = tail.split_once(close) else {
+            continue;
+        };
+        let inside = inside.trim();
+        if !inside.is_empty() {
+            return Some(inside.to_string());
+        }
+    }
+    None
+}
+
+fn campus_browser_plan(norm: &str) -> Option<Plan> {
+    if is_browser_operation_intent(norm) {
+        return None;
+    }
+
+    if !contains_any(
+        norm,
+        &[
+            "打开",
+            "打開",
+            "看看",
+            "看一下",
+            "浏览",
+            "開いて",
+            "開く",
+            "見て",
+            "open",
+            "browser",
+        ],
+    ) {
+        return None;
+    }
+
+    if contains_any(norm, &["luna", "ルナ"]) {
+        return Some(single_tool_plan(
+            "open_browser_url",
+            json!({ "url": config::LUNA_BASE }),
+        ));
+    }
+    if contains_any(norm, &["kwic"]) {
+        return Some(single_tool_plan(
+            "open_browser_url",
+            json!({ "url": config::KWIC_BASE }),
+        ));
+    }
+    if contains_any(norm, &["kgcourse", "kgc"]) {
+        return Some(single_tool_plan(
+            "open_browser_url",
+            json!({ "url": config::KG_COURSE_BASE }),
+        ));
+    }
+
+    None
 }
 
 fn single_tool_plan(name: &str, args: Value) -> Plan {
@@ -2442,7 +4126,7 @@ fn trim_to(s: &str, max_chars: usize) -> String {
 }
 
 fn preview_of(v: &Value) -> String {
-    let s = serde_json::to_string(v).unwrap_or_default();
+    let s = serde_json::to_string(&sanitize_answer_tool_result(v)).unwrap_or_default();
     let mut end = CFG.preview_bytes.min(s.len());
     while end > 0 && !s.is_char_boundary(end) {
         end -= 1;
@@ -2497,6 +4181,7 @@ fn maybe_autotitle(db: &Database, conv_id: &str, user_text: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::agent_pseudo_call::parse_any as parse_any_visible_tool_call;
 
     fn tool_row(name: &str) -> crate::db::AgentMessageRow {
         crate::db::AgentMessageRow {
@@ -2535,6 +4220,388 @@ mod tests {
         let plan = heuristic_plan(&[], "明日の天気は？").expect("plan");
         assert_eq!(plan.tools.len(), 1);
         assert_eq!(plan.tools[0].name, "get_weather");
+    }
+
+    #[test]
+    fn heuristic_opens_luna_with_real_browser_tool() {
+        let plan = heuristic_plan(&[], "打开luna看看").expect("plan");
+        assert_eq!(plan.tools.len(), 1);
+        assert_eq!(plan.tools[0].name, "open_browser_url");
+        assert_eq!(
+            plan.tools[0].args.get("url").and_then(|v| v.as_str()),
+            Some(config::LUNA_BASE)
+        );
+    }
+
+    #[test]
+    fn heuristic_does_not_reopen_kwic_for_browser_clicks() {
+        let plan = heuristic_plan(&[], "浏览器点击kwic的最新通知");
+        assert!(
+            plan.is_none(),
+            "browser click intent should go through the full planner with current browser context"
+        );
+    }
+
+    #[test]
+    fn attached_browser_panel_home_request_starts_with_screenshot() {
+        let ctx = AgentTurnContext {
+            browser_target: Some("ext-a-ct".into()),
+            browser_click_labels: Vec::new(),
+        };
+        let plan = attached_browser_control_plan(&normalize_planner_text("回到首页"), &ctx)
+            .expect("attached browser plan");
+        assert_eq!(plan.tools.len(), 1);
+        assert_eq!(plan.tools[0].name, "computer_screenshot");
+    }
+
+    #[test]
+    fn attached_browser_panel_click_label_starts_with_screenshot() {
+        let ctx = AgentTurnContext {
+            browser_target: Some("ext-a-ct".into()),
+            browser_click_labels: vec!["home".into()],
+        };
+        let plan = attached_browser_control_plan(&normalize_planner_text("点啊"), &ctx)
+            .expect("attached browser click plan");
+        assert_eq!(plan.tools.len(), 1);
+        assert_eq!(plan.tools[0].name, "computer_screenshot");
+    }
+
+    #[test]
+    fn browser_observation_can_infer_mouse_click_for_home() {
+        let page = serde_json::json!({
+            "links": [
+                {
+                    "text": "HOME",
+                    "rect": { "centerX": 42, "centerY": 18 }
+                }
+            ],
+            "interactive_elements": {
+                "buttons": [],
+                "inputs": []
+            }
+        });
+        let args =
+            infer_mouse_click_from_observation("回到首页", &page, &AgentTurnContext::default())
+                .expect("mouse args");
+        assert_eq!(args.get("x").and_then(|v| v.as_i64()), Some(42));
+        assert_eq!(args.get("y").and_then(|v| v.as_i64()), Some(18));
+    }
+
+    #[test]
+    fn browser_home_request_can_fall_back_to_top_left_logo_area() {
+        let page = serde_json::json!({
+            "viewport": { "width": 1200, "height": 800 },
+            "links": [
+                {
+                    "text": "公益財団法人 ひょうご環境創造協会",
+                    "rect": { "centerX": 96, "centerY": 42 }
+                },
+                {
+                    "text": "お問い合わせ",
+                    "rect": { "centerX": 980, "centerY": 48 }
+                }
+            ],
+            "interactive_elements": {
+                "buttons": [],
+                "inputs": []
+            }
+        });
+        let args =
+            infer_mouse_click_from_observation("回到主页", &page, &AgentTurnContext::default())
+                .expect("mouse args");
+        assert_eq!(args.get("x").and_then(|v| v.as_i64()), Some(96));
+        assert_eq!(args.get("y").and_then(|v| v.as_i64()), Some(42));
+    }
+
+    #[test]
+    fn browser_screenshot_can_infer_top_left_home_click() {
+        let screenshot = serde_json::json!({
+            "coordinate_space": "screenshot",
+            "screen_rect": { "x": 200, "y": 80, "width": 1200, "height": 800 },
+            "image": { "mime": "image/png", "data_base64": "" }
+        });
+        let args = infer_mouse_click_from_screenshot(
+            "回到主页",
+            &screenshot,
+            &AgentTurnContext::default(),
+        )
+        .expect("mouse args");
+        assert_eq!(args.get("x").and_then(|v| v.as_i64()), Some(144));
+        assert_eq!(args.get("y").and_then(|v| v.as_i64()), Some(64));
+        assert_eq!(
+            args.get("coordinate_space").and_then(|v| v.as_str()),
+            Some("screenshot")
+        );
+    }
+
+    #[test]
+    fn short_click_confirmation_inherits_recent_home_intent() {
+        let history = vec![
+            crate::db::AgentMessageRow {
+                id: 1,
+                conv_id: "c".into(),
+                role: "user".into(),
+                content: "你不会点击logo回到主页吗".into(),
+                images_json: None,
+                tool_name: None,
+                tool_result_json: None,
+                created_at: 0,
+            },
+            crate::db::AgentMessageRow {
+                id: 2,
+                conv_id: "c".into(),
+                role: "user".into(),
+                content: "点啊".into(),
+                images_json: None,
+                tool_name: None,
+                tool_result_json: None,
+                created_at: 1,
+            },
+        ];
+        let labels = browser_click_labels_for_turn(&history, "点啊");
+        assert!(labels.iter().any(|label| label == "home"));
+        assert!(labels.iter().any(|label| label == "logo"));
+    }
+
+    #[test]
+    fn short_click_confirmation_inherits_recent_suggested_tab_label() {
+        let history = vec![
+            crate::db::AgentMessageRow {
+                id: 1,
+                conv_id: "c".into(),
+                role: "assistant".into(),
+                content:
+                    "如果是想寻找志愿者相关的信息，我可以帮你点击上方的“ボランティア集まれ”按钮。"
+                        .into(),
+                images_json: None,
+                tool_name: None,
+                tool_result_json: None,
+                created_at: 0,
+            },
+            crate::db::AgentMessageRow {
+                id: 2,
+                conv_id: "c".into(),
+                role: "user".into(),
+                content: "点击".into(),
+                images_json: None,
+                tool_name: None,
+                tool_result_json: None,
+                created_at: 1,
+            },
+        ];
+        let labels = browser_click_labels_for_turn(&history, "点击");
+        assert!(labels.iter().any(|label| label == "ボランティア集まれ"));
+    }
+
+    #[test]
+    fn observation_can_click_recent_suggested_tab_label() {
+        let page = serde_json::json!({
+            "links": [
+                {
+                    "text": "ボランティア集まれ",
+                    "url": "https://jof-camp.com/new/volunteer/join-leader/",
+                    "rect": { "centerX": 640, "centerY": 96 }
+                }
+            ],
+            "interactive_elements": {
+                "buttons": [],
+                "inputs": []
+            }
+        });
+        let ctx = AgentTurnContext {
+            browser_target: Some("ext-a-ct".into()),
+            browser_click_labels: vec!["ボランティア集まれ".into()],
+        };
+        let args = infer_mouse_click_from_observation("点击", &page, &ctx).expect("mouse args");
+        assert_eq!(args.get("x").and_then(|v| v.as_i64()), Some(640));
+        assert_eq!(args.get("y").and_then(|v| v.as_i64()), Some(96));
+    }
+
+    #[test]
+    fn generic_browse_tabs_request_clicks_safe_top_navigation_candidate() {
+        let page = serde_json::json!({
+            "url": "https://jof-camp.com/new/",
+            "viewport": { "width": 1200, "height": 800 },
+            "links": [
+                {
+                    "text": "HOME",
+                    "url": "https://jof-camp.com/new/",
+                    "rect": { "centerX": 46, "centerY": 92 }
+                },
+                {
+                    "text": "募集中のキャンプ",
+                    "url": "https://jof-camp.com/new/camp/",
+                    "rect": { "centerX": 280, "centerY": 92 }
+                },
+                {
+                    "text": "お問い合わせ",
+                    "url": "https://jof-camp.com/new/contact/",
+                    "rect": { "centerX": 960, "centerY": 92 }
+                }
+            ],
+            "interactive_elements": {
+                "buttons": [],
+                "inputs": []
+            }
+        });
+        let args =
+            infer_tab_browse_click_from_observation("点击标签看看全部", &page).expect("tab click");
+        assert_eq!(args.get("x").and_then(|v| v.as_i64()), Some(280));
+        assert_eq!(args.get("y").and_then(|v| v.as_i64()), Some(92));
+    }
+
+    #[test]
+    fn generic_tab_tail_is_not_treated_as_literal_click_label() {
+        assert!(requested_click_labels(&normalize_planner_text("点击标签看看全部")).is_none());
+    }
+
+    #[test]
+    fn click_label_strips_generic_button_suffix() {
+        let labels =
+            requested_click_labels(&normalize_planner_text("点击募集中的按钮")).expect("labels");
+        assert!(labels.iter().any(|label| label == "募集中"));
+    }
+
+    #[test]
+    fn numeric_selection_inherits_recent_numbered_browser_option() {
+        let history = vec![
+            crate::db::AgentMessageRow {
+                id: 1,
+                conv_id: "c".into(),
+                role: "assistant".into(),
+                content: "1. 页面顶部导航栏左侧的 **「募集中のキャンプ（募集中营地）」** 按钮\n2. 页面下方的 **「募集中」** 绿色图标链接".into(),
+                images_json: None,
+                tool_name: None,
+                tool_result_json: None,
+                created_at: 0,
+            },
+            crate::db::AgentMessageRow {
+                id: 2,
+                conv_id: "c".into(),
+                role: "user".into(),
+                content: "1".into(),
+                images_json: None,
+                tool_name: None,
+                tool_result_json: None,
+                created_at: 1,
+            },
+        ];
+        let labels = browser_click_labels_for_turn(&history, "1");
+        assert!(labels.iter().any(|label| label == "募集中のキャンプ"));
+        assert!(labels.iter().all(|label| label != "募集中"));
+    }
+
+    #[test]
+    fn retry_inherits_recent_explicit_click_target() {
+        let history = vec![
+            crate::db::AgentMessageRow {
+                id: 1,
+                conv_id: "c".into(),
+                role: "assistant".into(),
+                content: "我这就为你点击左上角的「募集中のキャンプ（募集中营地）」按钮。".into(),
+                images_json: None,
+                tool_name: None,
+                tool_result_json: None,
+                created_at: 0,
+            },
+            crate::db::AgentMessageRow {
+                id: 2,
+                conv_id: "c".into(),
+                role: "user".into(),
+                content: "重试".into(),
+                images_json: None,
+                tool_name: None,
+                tool_result_json: None,
+                created_at: 1,
+            },
+        ];
+        let labels = browser_click_labels_for_turn(&history, "重试");
+        assert!(labels.iter().any(|label| label == "募集中のキャンプ"));
+    }
+
+    #[test]
+    fn ambiguous_short_boshuuchuu_click_prefers_top_navigation_over_pdf() {
+        let page = serde_json::json!({
+            "url": "https://jof-camp.com/new/",
+            "links": [
+                {
+                    "text": "募集中",
+                    "url": "https://jof-camp.com/new/files/spring.pdf",
+                    "rect": { "centerX": 520, "centerY": 560 }
+                },
+                {
+                    "text": "募集中のキャンプ",
+                    "url": "https://jof-camp.com/new/jof_camp/",
+                    "rect": { "centerX": 280, "centerY": 92 }
+                }
+            ],
+            "interactive_elements": {
+                "buttons": [],
+                "inputs": []
+            }
+        });
+        let args = infer_mouse_click_from_observation(
+            "点击募集中的按钮",
+            &page,
+            &AgentTurnContext::default(),
+        )
+        .expect("mouse args");
+        assert_eq!(args.get("x").and_then(|v| v.as_i64()), Some(280));
+        assert_eq!(args.get("y").and_then(|v| v.as_i64()), Some(92));
+    }
+
+    #[test]
+    fn observation_click_matches_cjk_equivalent_visible_label() {
+        let page = serde_json::json!({
+            "url": "https://kwic.kwansei.ac.jp/portal/",
+            "links": [
+                {
+                    "text": "語学資料",
+                    "url": "https://kwic.kwansei.ac.jp/portal/lang",
+                    "rect": { "centerX": 92, "centerY": 44 }
+                },
+                {
+                    "text": "履修登録",
+                    "url": "https://kwic.kwansei.ac.jp/portal/registration",
+                    "rect": { "centerX": 220, "centerY": 44 }
+                }
+            ],
+            "interactive_elements": {
+                "buttons": [],
+                "inputs": []
+            }
+        });
+        let args = infer_mouse_click_from_observation(
+            "点击语学资料",
+            &page,
+            &AgentTurnContext {
+                browser_target: Some("kwic-detail-0-ct".into()),
+                browser_click_labels: Vec::new(),
+            },
+        )
+        .expect("mouse args");
+        assert_eq!(args.get("x").and_then(|v| v.as_i64()), Some(92));
+        assert_eq!(args.get("y").and_then(|v| v.as_i64()), Some(44));
+    }
+
+    #[test]
+    fn browser_click_success_can_finish_without_remote_answer() {
+        let answer = local_browser_action_answer(
+            "点击可见链接",
+            &[(
+                "computer_mouse_click".into(),
+                serde_json::json!({
+                    "current_url": "https://example.test/next"
+                }),
+            )],
+            &AgentTurnContext {
+                browser_target: Some("kwic-detail-0-ct".into()),
+                browser_click_labels: Vec::new(),
+            },
+        )
+        .expect("local browser action answer");
+        assert!(answer.contains("已点击"));
+        assert!(answer.contains("https://example.test/next"));
     }
 
     #[test]
@@ -2710,6 +4777,12 @@ mod tests {
             agent_tools::canonical_tool_name("fetch_lms_course_resources"),
             Some("list_luna_announcements")
         );
+        assert_eq!(
+            agent_tools::exact_tool_name("open_browser_url"),
+            Some("open_browser_url")
+        );
+        assert!(agent_tools::exact_tool_name("launch_browser").is_none());
+        assert!(agent_tools::canonical_tool_name("launch_browser").is_none());
         assert!(agent_tools::is_known_tool("read_file"));
     }
 
@@ -2821,9 +4894,12 @@ mod tests {
         let answer = r#"call:imaginary_file_tool {"path":"/tmp/a.md"}"#;
         assert!(parse_visible_tool_call(answer).is_none());
         assert!(has_any_pseudo_tool_call(answer));
-        let fallback = pseudo_tool_call_fallback_answer();
-        assert!(!fallback.contains("call:"));
-        assert!(!fallback.contains("imaginary_file_tool"));
+        let raw = parse_any_raw_tool_call(answer).expect("raw pseudo call");
+        assert_eq!(raw.name, "imaginary_file_tool");
+        assert_eq!(
+            raw.args.get("path").and_then(|v| v.as_str()),
+            Some("/tmp/a.md")
+        );
     }
 
     #[test]
@@ -3099,6 +5175,83 @@ mod tests {
     }
 
     #[test]
+    fn finalize_plan_reports_rejected_tools_for_repair() {
+        let plan = Plan {
+            tools: vec![
+                ToolCall {
+                    name: "launch_browser".into(),
+                    args: serde_json::json!({ "url": "https://example.com" }),
+                },
+                ToolCall {
+                    name: "browser_click".into(),
+                    args: serde_json::json!({}),
+                },
+                ToolCall {
+                    name: "open_browser_url".into(),
+                    args: serde_json::json!({ "url": "https://example.com" }),
+                },
+            ],
+            image_only: false,
+        };
+        let finalized = finalize_plan_with_diagnostics(
+            plan,
+            &[],
+            "打开 example.com",
+            &AgentTurnContext::default(),
+        );
+        assert_eq!(finalized.unknown_tools, vec!["launch_browser"]);
+        assert_eq!(finalized.invalid_args, vec!["browser_click"]);
+        assert_eq!(finalized.plan.tools.len(), 1);
+        assert_eq!(finalized.plan.tools[0].name, "open_browser_url");
+        assert!(plan_repair_note(&finalized).contains("launch_browser"));
+    }
+
+    #[test]
+    fn finalize_plan_locks_browser_target_for_attached_panel() {
+        let plan = Plan {
+            tools: vec![
+                ToolCall {
+                    name: "read_browser_page".into(),
+                    args: serde_json::json!({}),
+                },
+                ToolCall {
+                    name: "browser_click".into(),
+                    args: serde_json::json!({
+                        "target": "ext-b-ct",
+                        "text": "詳細",
+                    }),
+                },
+                ToolCall {
+                    name: "list_browser_windows".into(),
+                    args: serde_json::json!({}),
+                },
+            ],
+            image_only: false,
+        };
+        let ctx = AgentTurnContext {
+            browser_target: Some("ext-a-ct".into()),
+            browser_click_labels: Vec::new(),
+        };
+        let finalized = finalize_plan_with_diagnostics(plan, &[], "这个页面看看", &ctx);
+        assert_eq!(finalized.plan.tools.len(), 3);
+        assert_eq!(
+            finalized.plan.tools[0]
+                .args
+                .get("target")
+                .and_then(|v| v.as_str()),
+            Some("ext-a-ct")
+        );
+        assert_eq!(
+            finalized.plan.tools[1]
+                .args
+                .get("target")
+                .and_then(|v| v.as_str()),
+            Some("ext-a-ct")
+        );
+        assert!(finalized.plan.tools[2].args.get("target").is_none());
+    }
+
+    #[test]
     fn build_plan_messages_structure() {
         let history = vec![
             crate::db::AgentMessageRow {
@@ -3113,7 +5266,7 @@ mod tests {
             },
             tool_row("get_weather"),
         ];
-        let msgs = build_plan_messages(&history, "明日は？", true);
+        let msgs = build_plan_messages(None, &history, "明日は？", true);
         // system + 1 user history + 1 tool history + current user = 4
         assert_eq!(msgs.len(), 4);
         assert_eq!(msgs[0].role, "system");
@@ -3124,10 +5277,21 @@ mod tests {
     #[test]
     fn build_answer_messages_includes_tool_results() {
         let tool_results = vec![("get_weather".to_string(), serde_json::json!({"temp": 22}))];
-        let msgs = build_answer_messages(&[], "天気は？", &[], &tool_results);
+        let msgs = build_answer_messages(
+            None,
+            &[],
+            "天気は？",
+            &[],
+            &tool_results,
+            None,
+            &AgentTurnContext::default(),
+        );
         assert_eq!(msgs.len(), 2); // system + user
         assert!(msgs[0].content.contains("tool_results"));
         assert!(msgs[0].content.contains("get_weather"));
+        assert!(msgs[0].content.contains("TOOL EXECUTION BOUNDARY"));
+        assert!(msgs[0].content.contains("AVAILABLE TOOLS REFERENCE"));
+        assert!(msgs[0].content.contains("open_browser_url(url: string)"));
     }
 
     #[test]
@@ -3151,7 +5315,15 @@ mod tests {
                 created_at: 0,
             })
             .collect();
-        let msgs = build_answer_messages(&history, "test", &[], &[]);
+        let msgs = build_answer_messages(
+            None,
+            &history,
+            "test",
+            &[],
+            &[],
+            None,
+            &AgentTurnContext::default(),
+        );
         // Budget should prevent ALL 200 history messages from being included.
         assert!(
             msgs.len() < 200,

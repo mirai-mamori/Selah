@@ -61,7 +61,6 @@
     gemini: "Google AI Studio (aistudio.google.com) で API キーを取得できます。",
   };
   const DEFAULT_URLS: Record<string, string> = { openai: "https://api.openai.com/v1", gemini: "" };
-  const DEFAULT_MODELS: Record<string, string> = { openai: "gpt-5.4-nano", gemini: "gemini-3-flash-preview" };
   const isWindows = navigator.userAgent.includes('Windows');
 
   const DEFAULT_STT_BACKEND_OPTIONS: SttExecutionBackendOption[] = [
@@ -362,12 +361,7 @@
   }
 
   function onProviderSwitch() {
-    if (!isLocal()) {
-      const p = aiProvider;
-      const pr = MODEL_PRESETS[p] || [];
-      if (!model || !pr.includes(model)) model = DEFAULT_MODELS[p] || "";
-      if (p === "openai" && !baseUrl) baseUrl = DEFAULT_URLS.openai;
-    }
+    if (aiProvider === "openai" && !baseUrl) baseUrl = DEFAULT_URLS.openai;
   }
 
   async function loadModelList() {

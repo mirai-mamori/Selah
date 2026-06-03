@@ -99,6 +99,13 @@ sel!(
     ".subportal-block-list-li-txt-info3 span"
 );
 sel!(SEL_SUBPORTAL_DEPT, ".subportal-block-list-li-txt-info4");
+sel!(SEL_CABINET_ROW, ".cabinetList .result-list.result-data");
+sel!(
+    SEL_CABINET_TITLE,
+    ".cabinet-view-list-name .cabinetDisplayLink, .cabinet-view-list-name a"
+);
+sel!(SEL_CABINET_NEW, ".cabinet-view-list-new .cabinet-area-new");
+sel!(SEL_CABINET_DATE, ".cabinet-view-list-createdate span");
 
 // Tab-specific notification selectors
 sel!(SEL_TAB1_LI, "#portalinfocontent1 li.portal-info-content-li");
@@ -413,6 +420,25 @@ pub struct KwicSubportalData {
     pub notifications: Vec<KwicPortalNotification>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct KwicCabinetItem {
+    pub cabinet_id: String,
+    pub list_id: String,
+    pub name: String,
+    pub level: u32,
+    pub updated_at: String,
+    pub is_new: bool,
+    pub url: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct KwicCabinetReference {
+    pub title: String,
+    pub items: Vec<KwicCabinetItem>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub raw_html_debug: Option<String>,
+}
+
 /// Fetch and parse a KWIC Portal subportal page (e.g. /portal/subportal?tagCd=1)
 #[tauri::command]
 pub async fn kwic_fetch_subportal(
@@ -469,6 +495,62 @@ pub async fn kwic_fetch_subportal(
     }
 }
 
+/// Fetch and parse the KWIC student cabinet reference page.
+#[tauri::command]
+pub async fn kwic_fetch_cabinet_reference(
+    state: State<'_, KwicState>,
+    db: State<'_, crate::db::Database>,
+) -> Result<KwicCabinetReference, String> {
+    let cache_key = "kwic_cabinet_reference";
+    match kwic_http(&state).await {
+        Ok(http) => match kwic_get(&http, "/cabinet/reference").await {
+            Ok(html) => {
+                #[cfg(debug_assertions)]
+                {
+                    if crate::should_dump_debug_html() {
+                        let _ = std::fs::write(
+                            std::env::temp_dir().join("kwic-cabinet-reference.html"),
+                            &html,
+                        );
+                    }
+                }
+
+                #[cfg(debug_assertions)]
+                let data = {
+                    let mut data = parse_cabinet_reference(&html);
+                    data.raw_html_debug =
+                        Some(crate::client::safe_truncate(&html, 5000).to_string());
+                    data
+                };
+                #[cfg(not(debug_assertions))]
+                let data = parse_cabinet_reference(&html);
+                if let Ok(json) = serde_json::to_string(&data) {
+                    let _ = db.save_data_cache(cache_key, &json);
+                }
+                Ok(data)
+            }
+            Err(e) => {
+                if let Ok(Some((json, _))) = db.get_data_cache(cache_key) {
+                    if let Ok(cached) = serde_json::from_str(&json) {
+                        log::info!("{}: cache fallback ({})", cache_key, e);
+                        return Ok(cached);
+                    }
+                }
+                Err(e)
+            }
+        },
+        Err(e) => {
+            if let Ok(Some((json, _))) = db.get_data_cache(cache_key) {
+                if let Ok(cached) = serde_json::from_str(&json) {
+                    log::info!("{}: cache fallback ({})", cache_key, e);
+                    return Ok(cached);
+                }
+            }
+            Err(e)
+        }
+    }
+}
+
 /// Open a KWIC Portal notification detail in a native detail window
 #[tauri::command]
 pub async fn kwic_open_detail_window(
@@ -501,11 +583,47 @@ pub async fn kwic_open_detail_window(
     );
 
     tauri::WebviewWindowBuilder::new(&app, &label, tauri::WebviewUrl::App(url_str.into()))
+        .initialization_script(crate::webview_toolbar::browser_bridge_script())
         .title(&title)
         .inner_size(520.0, 600.0)
         .resizable(true)
         .build()
         .map_err(|e| format!("ウィンドウ作成失敗: {}", e))?;
+    crate::webview_toolbar::register_readable_window(&app, &label, &label);
+
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn kwic_open_cabinet_window(
+    app: tauri::AppHandle,
+    title: Option<String>,
+) -> Result<(), String> {
+    let existing = app
+        .webview_windows()
+        .keys()
+        .filter(|k| k.starts_with("kwic-detail-"))
+        .count();
+    if existing >= 10 {
+        return Err(config::TOO_MANY_WINDOWS_MSG.into());
+    }
+    let id = KWIC_DETAIL_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let label = format!("kwic-detail-{}", id);
+    let title = title.unwrap_or_else(|| "学生キャビネット".to_string());
+    let encoded_title = urlencoding::encode(&title);
+    let url_str = format!(
+        "university-detail.html?mode=kwicCabinet&title={}",
+        encoded_title
+    );
+
+    tauri::WebviewWindowBuilder::new(&app, &label, tauri::WebviewUrl::App(url_str.into()))
+        .initialization_script(crate::webview_toolbar::browser_bridge_script())
+        .title(&title)
+        .inner_size(640.0, 720.0)
+        .resizable(true)
+        .build()
+        .map_err(|e| format!("ウィンドウ作成失敗: {}", e))?;
+    crate::webview_toolbar::register_readable_window(&app, &label, &label);
 
     Ok(())
 }
@@ -778,6 +896,121 @@ fn parse_info_item(li: &scraper::ElementRef) -> Option<(KwicPortalItem, String, 
     ))
 }
 
+fn normalize_text(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn hidden_value(row: &scraper::ElementRef, class_name: &str) -> String {
+    let selector = match scraper::Selector::parse(&format!("input.{}", class_name)) {
+        Ok(sel) => sel,
+        Err(_) => return String::new(),
+    };
+    row.select(&selector)
+        .next()
+        .and_then(|el| el.value().attr("value"))
+        .unwrap_or_default()
+        .trim()
+        .to_string()
+}
+
+fn absolute_kwic_url(path_or_url: &str) -> String {
+    if path_or_url.starts_with("http://") || path_or_url.starts_with("https://") {
+        path_or_url.to_string()
+    } else if path_or_url.starts_with('/') {
+        format!("{}{}", config::KWIC_BASE, path_or_url)
+    } else {
+        format!("{}/{}", config::KWIC_BASE, path_or_url)
+    }
+}
+
+fn cabinet_direct_url(list_url: &str, cabinet_id: &str) -> String {
+    let base_path = if list_url.trim().is_empty() {
+        "/cabinet/reference?typeCd=0"
+    } else {
+        list_url.trim()
+    };
+    let absolute = absolute_kwic_url(base_path);
+    match url::Url::parse(&absolute) {
+        Ok(mut url) => {
+            let has_cabinet = url.query_pairs().any(|(key, _)| key == "cabinetId");
+            let has_direct = url.query_pairs().any(|(key, _)| key == "directLink");
+            {
+                let mut pairs = url.query_pairs_mut();
+                if !has_cabinet && !cabinet_id.is_empty() {
+                    pairs.append_pair("cabinetId", cabinet_id);
+                }
+                if !has_direct {
+                    pairs.append_pair("directLink", "1");
+                }
+            }
+            url.to_string()
+        }
+        Err(_) => absolute,
+    }
+}
+
+fn parse_cabinet_reference(html: &str) -> KwicCabinetReference {
+    use scraper::Html;
+    let doc = Html::parse_document(html);
+    let mut items = Vec::new();
+
+    for row in doc.select(&SEL_CABINET_ROW) {
+        let cabinet_id = hidden_value(&row, "listCabinetId");
+        let mut name = hidden_value(&row, "listCabinetName");
+        let level = hidden_value(&row, "listCabinetLevel")
+            .parse::<u32>()
+            .unwrap_or(0);
+        let list_url = hidden_value(&row, "listUrl");
+
+        if name.is_empty() {
+            name = row
+                .select(&SEL_CABINET_TITLE)
+                .next()
+                .map(|el| normalize_text(&el.text().collect::<Vec<_>>().join(" ")))
+                .unwrap_or_default();
+        }
+        if name.is_empty() || cabinet_id.is_empty() {
+            continue;
+        }
+
+        let updated_at = row
+            .select(&SEL_CABINET_NEW)
+            .next()
+            .and_then(|el| el.value().attr("data-value"))
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .or_else(|| {
+                row.select(&SEL_CABINET_DATE)
+                    .next()
+                    .map(|el| normalize_text(&el.text().collect::<Vec<_>>().join(" ")))
+            })
+            .unwrap_or_default();
+        let is_new = row
+            .select(&SEL_CABINET_NEW)
+            .next()
+            .map(|el| !el.value().classes().any(|class| class == "not-new"))
+            .unwrap_or(false);
+        let list_id = row.value().attr("id").unwrap_or_default().to_string();
+        let url = cabinet_direct_url(&list_url, &cabinet_id);
+
+        items.push(KwicCabinetItem {
+            cabinet_id,
+            list_id,
+            name,
+            level,
+            updated_at,
+            is_new,
+            url,
+        });
+    }
+
+    KwicCabinetReference {
+        title: "学生キャビネット".to_string(),
+        items,
+        raw_html_debug: None,
+    }
+}
+
 /// Extract CSRF token from KWIC Portal HTML
 fn extract_csrf_token(html: &str) -> Option<String> {
     use scraper::Html;
@@ -1002,5 +1235,60 @@ fn parse_subportal(html: &str) -> KwicSubportalData {
         title: page_title,
         links,
         notifications,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_kwic_cabinet_reference_rows() {
+        let html = r#"
+        <div class="block block-area clearfix cabinetList">
+          <div class="contents-list">
+            <div class="result-list contents-display-flex result-data type-list" id="cabinetList_126">
+              <input type="hidden" value="216" name="cabinetId" class="listCabinetId">
+              <input type="hidden" value="教務機構" name="cabinetName" class="listCabinetName">
+              <input type="hidden" value="1" name="cabinetLevel" class="listCabinetLevel">
+              <input type="hidden" value="/cabinet/reference?typeCd=0" class="listUrl">
+              <div class="cabinet-view-list-item">
+                <div class="cabinet-view-list-name">
+                  <a class="cabinet-area-title-txt cabinetDisplayLink cabinet-title-omit-sp">教務機構</a>
+                </div>
+                <div class="cabinet-view-list-new">
+                  <span class="cabinet-area-new not-new" data-value="2026/05/19">NEW</span>
+                </div>
+                <div class="cabinet-view-list-createdate"><span>2026/05/19</span></div>
+              </div>
+            </div>
+            <div class="result-list contents-display-flex result-data type-list" id="cabinetList_1415">
+              <input type="hidden" value="264" name="cabinetId" class="listCabinetId">
+              <input type="hidden" value="国際教育・協力センター（CIEC）: 海外への留学" name="cabinetName" class="listCabinetName">
+              <input type="hidden" value="1" name="cabinetLevel" class="listCabinetLevel">
+              <input type="hidden" value="/cabinet/reference?typeCd=0" class="listUrl">
+              <div class="cabinet-view-list-item">
+                <div class="cabinet-view-list-name"><a class="cabinetDisplayLink">国際教育・協力センター（CIEC）: 海外への留学</a></div>
+                <div class="cabinet-view-list-new"><span class="cabinet-area-new" data-value="2026/05/27">NEW</span></div>
+                <div class="cabinet-view-list-createdate"><span>2026/05/27</span></div>
+              </div>
+            </div>
+          </div>
+        </div>
+        "#;
+
+        let parsed = parse_cabinet_reference(html);
+
+        assert_eq!(parsed.items.len(), 2);
+        assert_eq!(parsed.items[0].cabinet_id, "216");
+        assert_eq!(parsed.items[0].name, "教務機構");
+        assert_eq!(parsed.items[0].updated_at, "2026/05/19");
+        assert!(!parsed.items[0].is_new);
+        assert_eq!(parsed.items[1].cabinet_id, "264");
+        assert!(parsed.items[1].is_new);
+        assert!(parsed.items[1].url.contains("/cabinet/reference?"));
+        assert!(parsed.items[1].url.contains("typeCd=0"));
+        assert!(parsed.items[1].url.contains("cabinetId=264"));
+        assert!(parsed.items[1].url.contains("directLink=1"));
     }
 }

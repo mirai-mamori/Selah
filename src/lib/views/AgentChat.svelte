@@ -52,6 +52,8 @@
   let msgListEl: HTMLElement | null = null;
   let thinkTraceEl = $state<HTMLElement | null>(null);
   let composerTextarea = $state<HTMLTextAreaElement | null>(null);
+  let composerComposing = false;
+  let suppressEnterUntil = 0;
   let autoFollow = $state(true);
   let aiCfg = $state<AiConfig | null>(null);
   let historyOpen = $state(false);
@@ -507,8 +509,21 @@
     ]).catch((e) => console.warn("cancel", e));
   }
 
+  function onCompositionStart() {
+    composerComposing = true;
+  }
+
+  function onCompositionEnd() {
+    composerComposing = false;
+    suppressEnterUntil = performance.now() + 160;
+  }
+
   function onKeydown(e: KeyboardEvent) {
     if (e.key === "Enter" && !e.shiftKey && !e.isComposing) {
+      if (composerComposing || e.keyCode === 229 || performance.now() < suppressEnterUntil) {
+        e.preventDefault();
+        return;
+      }
       e.preventDefault();
       send();
     }
@@ -1043,6 +1058,8 @@
               bind:value={inputText}
               bind:this={composerTextarea}
               oninput={resizeComposer}
+              oncompositionstart={onCompositionStart}
+              oncompositionend={onCompositionEnd}
               onkeydown={onKeydown}
               placeholder={sending ? "返事を書いている途中……" : "なにか書いてみて。"}
               rows="1"

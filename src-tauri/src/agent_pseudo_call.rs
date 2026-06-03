@@ -18,6 +18,13 @@ pub(crate) struct ToolCall {
     pub args: Value,
 }
 
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub(crate) struct RawToolCall {
+    pub name: String,
+    #[serde(default)]
+    pub args: Value,
+}
+
 pub(crate) fn parse_leading(answer: &str) -> Option<ToolCall> {
     let visible = agent_text::strip_think(answer);
     let visible = leading_candidate(&visible)?;
@@ -53,20 +60,22 @@ pub(crate) fn parse_leading(answer: &str) -> Option<ToolCall> {
     None
 }
 
+#[cfg(test)]
 pub(crate) fn parse_any(answer: &str) -> Option<ToolCall> {
     let visible = agent_text::strip_think(answer);
     let idx = find_start(&visible)?;
     parse_leading(&visible[idx..])
 }
 
+pub(crate) fn parse_any_raw(answer: &str) -> Option<RawToolCall> {
+    let visible = agent_text::strip_think(answer);
+    let idx = find_start(&visible)?;
+    parse_leading_raw(&visible[idx..])
+}
+
 pub(crate) fn has_any(answer: &str) -> bool {
     let visible = agent_text::strip_think(answer);
     find_start(&visible).is_some()
-}
-
-pub(crate) fn fallback_answer() -> String {
-    "内部ツール呼び出しの形式が崩れたため、そのまま表示せずに止めました。読みたいファイル名や必要な操作をもう一度指定してください。"
-        .to_string()
 }
 
 pub(crate) fn find_start(text: &str) -> Option<usize> {
@@ -147,6 +156,56 @@ fn split_tool_name_and_rest(s: &str) -> Option<(&str, &'static str, &str)> {
         best = Some((raw_name, canonical, &s[name_scan_len..]));
     }
     best
+}
+
+fn parse_leading_raw(answer: &str) -> Option<RawToolCall> {
+    let visible = agent_text::strip_think(answer);
+    let visible = leading_candidate(&visible)?;
+    for marker in agent_text::PSEUDO_TOOL_MARKERS {
+        let Some(after_marker) = visible.strip_prefix(marker) else {
+            continue;
+        };
+        let (raw_name, rest) = split_raw_tool_name_and_rest(after_marker)?;
+        let rest = rest.trim_start();
+        let args = if let Some(rest) = rest.strip_prefix('(') {
+            let args_body = extract_parenthesized_body(rest)?;
+            parse_function_style_args(args_body)
+        } else if rest.starts_with('{') {
+            let obj = first_json_object(rest)?;
+            parse_braced_args(obj)?
+        } else if let Some(rest) = rest.strip_prefix('〔') {
+            let args_body = extract_until_char(rest, '〕')?;
+            parse_braced_args(&format!("{{{args_body}}}"))?
+        } else if let Some(rest) = rest.strip_prefix('[') {
+            let args_body = extract_until_char(rest, ']')?;
+            parse_braced_args(&format!("{{{args_body}}}"))?
+        } else if rest.contains('=') {
+            parse_loose_key_value_args(rest)
+        } else {
+            json!({})
+        };
+        return Some(RawToolCall {
+            name: raw_name.to_string(),
+            args,
+        });
+    }
+    None
+}
+
+fn split_raw_tool_name_and_rest(s: &str) -> Option<(&str, &str)> {
+    let name_scan_len = s
+        .char_indices()
+        .take_while(|(_, ch)| {
+            ch.is_ascii_alphanumeric() || matches!(*ch, '_' | ':' | '.' | '-' | '/')
+        })
+        .map(|(idx, ch)| idx + ch.len_utf8())
+        .last()
+        .unwrap_or(0);
+    if name_scan_len == 0 {
+        None
+    } else {
+        Some((&s[..name_scan_len], &s[name_scan_len..]))
+    }
 }
 
 fn leading_candidate(text: &str) -> Option<&str> {
@@ -485,7 +544,12 @@ mod tests {
         let answer = r#"call:imaginary_file_tool {"path":"/tmp/a.md"}"#;
         assert!(parse_leading(answer).is_none());
         assert!(has_any(answer));
-        assert!(!fallback_answer().contains("call:"));
+        let raw = parse_any_raw(answer).expect("raw pseudo call");
+        assert_eq!(raw.name, "imaginary_file_tool");
+        assert_eq!(
+            raw.args.get("path").and_then(|v| v.as_str()),
+            Some("/tmp/a.md")
+        );
     }
 
     #[test]

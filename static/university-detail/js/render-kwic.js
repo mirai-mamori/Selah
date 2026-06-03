@@ -46,3 +46,37 @@ function renderKwicDetail(data) {
     });
   });
 }
+
+function renderKwicCabinetReference(data) {
+  var c = document.getElementById('content');
+  if (!data) { c.innerHTML = '<div class="error">\u30c7\u30fc\u30bf\u304c\u3042\u308a\u307e\u305b\u3093</div>'; return; }
+  var items = Array.isArray(data.items) ? data.items : [];
+  var h = '<div class="detail-wrap">';
+  h += '<div class="course-label">KWIC \u30dd\u30fc\u30bf\u30eb</div>';
+  h += '<div class="page-title">' + escapeHtml(data.title || '\u5b66\u751f\u30ad\u30e3\u30d3\u30cd\u30c3\u30c8') + '</div>';
+  h += '<div class="meta-table"><div class="meta-row"><span class="meta-key">\u4ef6\u6570</span><span class="meta-value">' + items.length + '</span></div></div>';
+  if (!items.length) {
+    h += '<div class="error">\u8a72\u5f53\u30c7\u30fc\u30bf\u306f\u3042\u308a\u307e\u305b\u3093\u3002</div>';
+  } else {
+    h += '<div class="attachments cabinet-reference-list"><h4>\u30ad\u30e3\u30d3\u30cd\u30c3\u30c8</h4>';
+    for (var i = 0; i < items.length; i++) {
+      var item = items[i] || {};
+      h += '<button class="attachment kwic-cabinet-item" data-url="' + escapeHtml(item.url || '') + '" data-title="' + escapeHtml(item.name || '') + '">';
+      h += '<span><span class="cabinet-item-title">' + escapeHtml(item.name || '') + '</span>';
+      if (item.is_new) h += ' <span class="item-badge new">NEW</span>';
+      if (item.updated_at) h += '<span class="cabinet-item-date">' + escapeHtml(item.updated_at) + '</span>';
+      h += '</span><span style="flex:none;opacity:0.5">' + ICONS.external + '</span></button>';
+    }
+    h += '</div>';
+  }
+  h += '</div>';
+  c.innerHTML = h;
+  c.querySelectorAll('.kwic-cabinet-item').forEach(function(b) {
+    b.addEventListener('click', function() {
+      var url = b.dataset.url;
+      var title = b.dataset.title || b.textContent.trim() || '\u5b66\u751f\u30ad\u30e3\u30d3\u30cd\u30c3\u30c8';
+      var inv = window.__TAURI__?.core?.invoke;
+      if (inv && url) inv('kwic_open_link', { url: url, title: title });
+    });
+  });
+}

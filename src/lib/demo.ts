@@ -31,6 +31,7 @@ import type {
   KwicPortalHome,
   KwicSubportalData,
   KwicPortalNotification,
+  KwicCabinetReference,
   MailMessage,
   MailAttachment,
 } from "./api";
@@ -485,6 +486,32 @@ export function demoKwicSubportal(tagCd: string): KwicSubportalData {
     },
   };
   return data[tagCd] ?? { title: "サブポータル", links: [], notifications: [] };
+}
+
+export function demoKwicCabinetReference(): KwicCabinetReference {
+  return {
+    title: "学生キャビネット",
+    items: [
+      {
+        cabinet_id: "216",
+        list_id: "cabinetList_126",
+        name: "教務機構",
+        level: 1,
+        updated_at: todayStr(),
+        is_new: true,
+        url: "https://kwic.kwansei.ac.jp/cabinet/reference?typeCd=0&cabinetId=216&directLink=1",
+      },
+      {
+        cabinet_id: "203",
+        list_id: "cabinetList_1420",
+        name: "キャリアセンター",
+        level: 1,
+        updated_at: futureDate(-2),
+        is_new: false,
+        url: "https://kwic.kwansei.ac.jp/cabinet/reference?typeCd=0&cabinetId=203&directLink=1",
+      },
+    ],
+  };
 }
 
 export function demoKwicDetail(n: Pick<KwicPortalNotification, "id" | "title">) {

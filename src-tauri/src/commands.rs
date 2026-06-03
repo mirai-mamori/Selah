@@ -332,11 +332,13 @@ pub async fn open_detail_window(
     );
 
     tauri::WebviewWindowBuilder::new(&app, &label, tauri::WebviewUrl::App(url_str.into()))
+        .initialization_script(crate::webview_toolbar::browser_bridge_script())
         .title(&course_name)
         .inner_size(480.0, 560.0)
         .resizable(true)
         .build()
         .map_err(|e| format!("ウィンドウ作成失敗: {}", e))?;
+    crate::webview_toolbar::register_readable_window(&app, &label, &label);
 
     Ok(())
 }
@@ -545,6 +547,39 @@ pub async fn debug_ping(target: String) -> Result<PingResult, String> {
 #[cfg(not(debug_assertions))]
 #[tauri::command]
 pub async fn debug_ping() -> Result<PingResult, String> {
+    Err("debug commands are not available in release builds".into())
+}
+
+#[cfg(debug_assertions)]
+#[tauri::command]
+pub async fn debug_computer_mouse_click(
+    app: tauri::AppHandle,
+    target: Option<String>,
+    x: f64,
+    y: f64,
+    coordinate_space: Option<String>,
+) -> Result<serde_json::Value, String> {
+    crate::computer_control::mouse_click(&app, target.as_deref(), x, y, coordinate_space.as_deref())
+        .await
+}
+
+#[cfg(not(debug_assertions))]
+#[tauri::command]
+pub async fn debug_computer_mouse_click() -> Result<serde_json::Value, String> {
+    Err("debug commands are not available in release builds".into())
+}
+
+#[cfg(debug_assertions)]
+#[tauri::command]
+pub async fn debug_browser_mouse_click_selftest(
+    app: tauri::AppHandle,
+) -> Result<serde_json::Value, String> {
+    crate::webview_toolbar::debug_browser_mouse_click_selftest(app).await
+}
+
+#[cfg(not(debug_assertions))]
+#[tauri::command]
+pub async fn debug_browser_mouse_click_selftest() -> Result<serde_json::Value, String> {
     Err("debug commands are not available in release builds".into())
 }
 

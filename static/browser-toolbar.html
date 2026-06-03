@@ -57,6 +57,39 @@
   }
 
   .sep { width: 1px; height: 16px; background: rgba(0,0,0,0.06); margin: 0 3px; flex-shrink: 0; }
+  .agent-status {
+    -webkit-app-region: no-drag;
+    display: none;
+    align-items: center;
+    gap: 6px;
+    height: 24px;
+    padding: 0 6px 0 8px;
+    border-radius: 6px;
+    background: rgba(217, 119, 6, 0.1);
+    color: rgba(146, 64, 14, 0.95);
+    border: 0.5px solid rgba(217, 119, 6, 0.18);
+    font-size: 11px;
+    white-space: nowrap;
+    flex-shrink: 0;
+  }
+  .agent-status.active { display: flex; }
+  .agent-dot {
+    width: 6px;
+    height: 6px;
+    border-radius: 999px;
+    background: #d97706;
+    box-shadow: 0 0 0 3px rgba(217, 119, 6, 0.13);
+  }
+  .agent-stop {
+    border: none;
+    border-radius: 5px;
+    padding: 2px 5px;
+    background: rgba(146, 64, 14, 0.12);
+    color: inherit;
+    cursor: pointer;
+    font: inherit;
+  }
+  .agent-stop:hover { background: rgba(146, 64, 14, 0.2); }
 
   /* Dark mode — triggered by system OR manual [data-theme="dark"] */
   @media (prefers-color-scheme: dark) {
@@ -81,6 +114,13 @@
       color: rgba(96,165,250,0.7);
       border-color: rgba(96,165,250,0.15);
     }
+    html:not([data-theme="light"]) .agent-status {
+      background: rgba(251, 191, 36, 0.12);
+      color: rgba(253, 230, 138, 0.95);
+      border-color: rgba(251, 191, 36, 0.18);
+    }
+    html:not([data-theme="light"]) .agent-stop { background: rgba(253, 230, 138, 0.12); }
+    html:not([data-theme="light"]) .agent-stop:hover { background: rgba(253, 230, 138, 0.2); }
     html:not([data-theme="light"]) .sep { background: rgba(255,255,255,0.06); }
   }
 
@@ -106,6 +146,13 @@
     color: rgba(96,165,250,0.7);
     border-color: rgba(96,165,250,0.15);
   }
+  html[data-theme="dark"] .agent-status {
+    background: rgba(251, 191, 36, 0.12);
+    color: rgba(253, 230, 138, 0.95);
+    border-color: rgba(251, 191, 36, 0.18);
+  }
+  html[data-theme="dark"] .agent-stop { background: rgba(253, 230, 138, 0.12); }
+  html[data-theme="dark"] .agent-stop:hover { background: rgba(253, 230, 138, 0.2); }
   html[data-theme="dark"] .sep { background: rgba(255,255,255,0.06); }
 </style>
 </head>
@@ -121,7 +168,15 @@
   </button>
   <div class="sep"></div>
   <div class="url-bar" id="url"></div>
+  <div class="agent-status" id="agentStatus" aria-live="polite">
+    <span class="agent-dot"></span>
+    <span id="agentStatusText">Agent 操作中</span>
+    <button class="agent-stop" id="agentStop" type="button" title="Agentを停止">停止</button>
+  </div>
   <div class="sep"></div>
+  <button class="btn" id="agent" title="Agent">
+    <svg viewBox="0 0 24 24"><path d="M12 3a4 4 0 014 4v1h1.5A2.5 2.5 0 0120 10.5v5A4.5 4.5 0 0115.5 20h-7A4.5 4.5 0 014 15.5v-5A2.5 2.5 0 016.5 8H8V7a4 4 0 014-4zm-2 5h4V7a2 2 0 10-4 0v1zm-3.5 2a.5.5 0 00-.5.5v5A2.5 2.5 0 008.5 18h7a2.5 2.5 0 002.5-2.5v-5a.5.5 0 00-.5-.5h-11zM9 13a1 1 0 110-2 1 1 0 010 2zm6 0a1 1 0 110-2 1 1 0 010 2zm-5.5 2h5a1 1 0 010 2h-5a1 1 0 010-2z"/></svg>
+  </button>
   <button class="btn" id="external" title="外部ブラウザで開く">
     <svg viewBox="0 0 24 24"><path d="M19 19H5V5h7V3H5a2 2 0 00-2 2v14a2 2 0 002 2h14a2 2 0 002-2v-7h-2v7zM14 3v2h3.59l-9.83 9.83 1.41 1.41L19 6.41V10h2V3h-7z"/></svg>
   </button>
@@ -178,6 +233,20 @@
     displayUrl(event.payload);
   });
 
+  const agentStatus = document.getElementById('agentStatus');
+  const agentStatusText = document.getElementById('agentStatusText');
+  await listen('browser-agent-status', (event) => {
+    const payload = event.payload || {};
+    if (payload.active) {
+      const action = payload.action ? `Agent 操作中: ${payload.action}` : 'Agent 操作中';
+      agentStatusText.textContent = action;
+      agentStatus.classList.add('active');
+    } else {
+      agentStatus.classList.remove('active');
+      agentStatusText.textContent = 'Agent 操作中';
+    }
+  });
+
   // Get initial URL
   try {
     const url = await invoke('browser_get_url', { target });
@@ -190,6 +259,21 @@
     invoke('browser_go_forward', { target }).catch(() => {});
   document.getElementById('reload').onclick = () =>
     invoke('browser_reload', { target }).catch(() => {});
+
+  document.getElementById('agent').onclick = () =>
+    invoke('open_agent_popup', {
+      ownerLabel: target ? target.replace(/-(ct|tb)$/, '') : null,
+      target
+    }).catch(() => {});
+
+  document.getElementById('agentStop').onclick = (e) => {
+    e.stopPropagation();
+    invoke('agent_cancel_active').catch(() => {});
+    invoke('open_agent_popup', {
+      ownerLabel: target ? target.replace(/-(ct|tb)$/, '') : null,
+      target
+    }).catch(() => {});
+  };
 
   document.getElementById('external').onclick = async () => {
     try {

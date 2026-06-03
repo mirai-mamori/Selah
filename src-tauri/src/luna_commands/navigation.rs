@@ -286,6 +286,7 @@ pub async fn university_open_detail_window(
 
     let builder =
         tauri::WebviewWindowBuilder::new(&app, &label, tauri::WebviewUrl::App(url_str.into()))
+            .initialization_script(crate::webview_toolbar::browser_bridge_script())
             .title(&title)
             .inner_size(720.0, 780.0)
             .min_inner_size(560.0, 480.0)
@@ -299,6 +300,7 @@ pub async fn university_open_detail_window(
     builder
         .build()
         .map_err(|e| format!("ウィンドウ作成失敗: {}", e))?;
+    crate::webview_toolbar::register_readable_window(&app, &label, &label);
 
     Ok(())
 }
@@ -342,7 +344,8 @@ pub async fn luna_launch_lti(
 ) -> Result<(), String> {
     let http = luna_http(&state).await?;
     let final_url = luna_client::launch_lti(&http, &path).await?;
-    crate::commands::open_external_url(app, final_url, None).await
+    crate::commands::open_external_url(app, final_url, None).await?;
+    Ok(())
 }
 
 /// Reveal a file in Finder (restricted to app download directory)

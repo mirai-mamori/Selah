@@ -1,10 +1,12 @@
 use serde::Deserialize;
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{LazyLock, Mutex};
 use tauri::{Emitter, Manager};
 
 const TOOLBAR_HEIGHT: f64 = 38.0;
+const AGENT_PANEL_WIDTH: f64 = 360.0;
 const BROWSER_BRIDGE_SCRIPT: &str = r#"
 (function () {
   if (window.__selahBrowserBridgeInstalled) return;
@@ -45,6 +47,14 @@ const BROWSER_BRIDGE_SCRIPT: &str = r#"
       'script,style,noscript,template,svg,canvas,iframe,nav,header,footer,aside,' +
       '[role="navigation"],[role="banner"],[role="contentinfo"],[role="dialog"],[aria-modal="true"],' +
       '.cookie,.cookies,.consent,.ads,.ad,.advertisement,.breadcrumb,.sidebar,.drawer,.modal,.popup'
+    );
+  }
+
+  function isControlJunk(el) {
+    if (!el || !(el instanceof Element)) return false;
+    return !!el.closest(
+      'script,style,noscript,template,iframe,[role="dialog"],[aria-modal="true"],' +
+      '.cookie,.cookies,.consent,.ads,.ad,.advertisement,.modal,.popup'
     );
   }
 
@@ -110,7 +120,7 @@ const BROWSER_BRIDGE_SCRIPT: &str = r#"
     var nodes = root ? root.querySelectorAll('h1,h2,h3,h4,h5,h6') : [];
     for (var i = 0; i < nodes.length && out.length < 10; i++) {
       var el = nodes[i];
-      if (!isVisible(el) || isJunk(el)) continue;
+      if (!isVisible(el) || isControlJunk(el)) continue;
       pushUnique(out, seen, textOf(el), 140);
     }
     return out;
@@ -120,10 +130,10 @@ const BROWSER_BRIDGE_SCRIPT: &str = r#"
     var out = [];
     var seen = new Set();
     var nodes = root ? root.querySelectorAll('a[href]') : [];
-    for (var i = 0; i < nodes.length && out.length < 8; i++) {
+    for (var i = 0; i < nodes.length && out.length < 30; i++) {
       var el = nodes[i];
-      if (!isVisible(el) || isJunk(el)) continue;
-      var text = textOf(el);
+      if (!isVisible(el) || isControlJunk(el)) continue;
+      var text = candidateText(el);
       var href = normalizeText(el.href || el.getAttribute('href') || '');
       if (!href || href === '#' || href.startsWith('javascript:')) continue;
       var key = (text + '|' + href).toLowerCase();
@@ -131,7 +141,8 @@ const BROWSER_BRIDGE_SCRIPT: &str = r#"
       seen.add(key);
       out.push({
         text: text.length > 120 ? text.slice(0, 120) + '…' : text,
-        url: href.length > 240 ? href.slice(0, 240) + '…' : href
+        url: href.length > 240 ? href.slice(0, 240) + '…' : href,
+        rect: elementRect(el)
       });
     }
     return out;
@@ -150,15 +161,16 @@ const BROWSER_BRIDGE_SCRIPT: &str = r#"
       : [];
     for (var i = 0; i < nodes.length && out.length < 10; i++) {
       var el = nodes[i];
-      if (!isVisible(el) || isJunk(el)) continue;
-      var text = textOf(el) || normalizeText(el.value || el.getAttribute('aria-label') || el.getAttribute('title') || '');
+      if (!isVisible(el) || isControlJunk(el)) continue;
+      var text = candidateText(el);
       if (!text) continue;
       var key = (text + '|' + buttonKind(el)).toLowerCase();
       if (seen.has(key)) continue;
       seen.add(key);
       out.push({
         text: text.length > 120 ? text.slice(0, 120) + '…' : text,
-        type: buttonKind(el)
+        type: buttonKind(el),
+        rect: elementRect(el)
       });
     }
     return out;
@@ -193,7 +205,7 @@ const BROWSER_BRIDGE_SCRIPT: &str = r#"
     var nodes = root ? root.querySelectorAll('input,textarea,select') : [];
     for (var i = 0; i < nodes.length && out.length < 10; i++) {
       var el = nodes[i];
-      if (!isVisible(el) || isJunk(el)) continue;
+      if (!isVisible(el) || isControlJunk(el)) continue;
       var tag = (el.tagName || '').toLowerCase();
       var type = normalizeText(el.getAttribute('type') || tag).toLowerCase();
       if (type === 'hidden') continue;
@@ -211,6 +223,7 @@ const BROWSER_BRIDGE_SCRIPT: &str = r#"
         name: name.length > 80 ? name.slice(0, 80) + '…' : name,
         placeholder: placeholder.length > 120 ? placeholder.slice(0, 120) + '…' : placeholder,
         value: value.length > 120 ? value.slice(0, 120) + '…' : value,
+        rect: elementRect(el),
         required: !!el.required,
         disabled: !!el.disabled
       });
@@ -269,12 +282,18 @@ const BROWSER_BRIDGE_SCRIPT: &str = r#"
 
   function candidateText(el) {
     if (!el) return '';
+    var imgAlt = '';
+    try {
+      var img = el.querySelector && el.querySelector('img[alt]');
+      imgAlt = img ? img.getAttribute('alt') || '' : '';
+    } catch (_) {}
     return normalizeText(
       textOf(el) ||
       el.getAttribute('aria-label') ||
       el.getAttribute('title') ||
       el.getAttribute('value') ||
       el.getAttribute('alt') ||
+      imgAlt ||
       ''
     );
   }
@@ -308,12 +327,66 @@ const BROWSER_BRIDGE_SCRIPT: &str = r#"
     return items[safe];
   }
 
+  function elementRect(el) {
+    if (!el || typeof el.getBoundingClientRect !== 'function') return null;
+    var rect = el.getBoundingClientRect();
+    if (!rect || rect.width <= 0 || rect.height <= 0) return null;
+    return {
+      x: Math.round(rect.left),
+      y: Math.round(rect.top),
+      width: Math.round(rect.width),
+      height: Math.round(rect.height),
+      centerX: Math.round(rect.left + rect.width / 2),
+      centerY: Math.round(rect.top + rect.height / 2)
+    };
+  }
+
   function currentPageMeta() {
     return {
       url: String(window.location.href || ''),
-      title: normalizeText(document.title || '')
+      title: normalizeText(document.title || ''),
+      viewport: {
+        width: Math.round(window.innerWidth || 0),
+        height: Math.round(window.innerHeight || 0),
+        scrollX: Math.round(window.scrollX || 0),
+        scrollY: Math.round(window.scrollY || 0),
+        scrollHeight: Math.round(document.documentElement?.scrollHeight || document.body?.scrollHeight || 0)
+      }
     };
   }
+
+  function coreInvoke() {
+    return window.__TAURI__?.core?.invoke || window.__TAURI_INTERNALS__?.invoke || null;
+  }
+
+  function openPopupThroughApp(rawUrl, title) {
+    var invoke = coreInvoke();
+    if (!invoke || !rawUrl) return false;
+    var resolved = null;
+    try {
+      resolved = new URL(String(rawUrl || ''), window.location.href);
+    } catch (_) {
+      return false;
+    }
+    if (resolved.protocol !== 'http:' && resolved.protocol !== 'https:') return false;
+    invoke('open_external_url', {
+      url: resolved.toString(),
+      title: normalizeText(title || resolved.host || resolved.toString())
+    }).catch(function (error) {
+      console.warn('open_external_url failed for popup:', error);
+    });
+    return true;
+  }
+
+  try {
+    var originalWindowOpen = typeof window.open === 'function' ? window.open.bind(window) : null;
+    window.open = function (rawUrl, target, features) {
+      if (rawUrl && openPopupThroughApp(rawUrl, document.title || '')) {
+        return null;
+      }
+      return originalWindowOpen ? originalWindowOpen(rawUrl, target, features) : null;
+    };
+  } catch (_) {}
 
   function elementSummary(el) {
     if (!el) return {};
@@ -512,6 +585,63 @@ const BROWSER_BRIDGE_SCRIPT: &str = r#"
     } else {
       el.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, view: window }));
     }
+  }
+
+  function viewportPoint(action, prefix) {
+    var xKey = prefix ? prefix + 'X' : 'x';
+    var yKey = prefix ? prefix + 'Y' : 'y';
+    var x = Number(action[xKey] ?? action[(prefix || '') + 'x']);
+    var y = Number(action[yKey] ?? action[(prefix || '') + 'y']);
+    if (!Number.isFinite(x) || !Number.isFinite(y)) {
+      throw new Error('Mouse coordinates are required');
+    }
+    x = Math.max(0, Math.min(Math.round(x), Math.max(0, window.innerWidth || 0)));
+    y = Math.max(0, Math.min(Math.round(y), Math.max(0, window.innerHeight || 0)));
+    return { x: x, y: y };
+  }
+
+  function dispatchMouse(type, point, button) {
+    var el = document.elementFromPoint(point.x, point.y) || document.body || document.documentElement;
+    if (!el) throw new Error('No element at mouse coordinates');
+    el.dispatchEvent(new MouseEvent(type, {
+      bubbles: true,
+      cancelable: true,
+      view: window,
+      clientX: point.x,
+      clientY: point.y,
+      button: button || 0,
+      buttons: type === 'mouseup' ? 0 : 1
+    }));
+    return el;
+  }
+
+  function performMouseClick(action) {
+    var point = viewportPoint(action, '');
+    var downEl = dispatchMouse('mouseover', point, 0);
+    dispatchMouse('mousemove', point, 0);
+    dispatchMouse('mousedown', point, 0);
+    dispatchMouse('mouseup', point, 0);
+    dispatchMouse('click', point, 0);
+    return { point: point, element: elementSummary(downEl) };
+  }
+
+  async function performMouseDrag(action) {
+    var from = viewportPoint(action, 'from');
+    var to = viewportPoint(action, 'to');
+    var steps = Math.max(2, Math.min(Number(action.steps || 8), 24));
+    var startEl = dispatchMouse('mouseover', from, 0);
+    dispatchMouse('mousemove', from, 0);
+    dispatchMouse('mousedown', from, 0);
+    for (var i = 1; i <= steps; i++) {
+      var point = {
+        x: Math.round(from.x + (to.x - from.x) * i / steps),
+        y: Math.round(from.y + (to.y - from.y) * i / steps)
+      };
+      dispatchMouse('mousemove', point, 0);
+      await wait(16);
+    }
+    dispatchMouse('mouseup', to, 0);
+    return { from: from, to: to, element: elementSummary(startEl) };
   }
 
   function normalizeKeyName(rawKey) {
@@ -731,6 +861,32 @@ const BROWSER_BRIDGE_SCRIPT: &str = r#"
         return;
       }
 
+      if (kind === 'mouse_click') {
+        var mouseClick = performMouseClick(payload);
+        await wait(80);
+        await report({
+          ok: true,
+          action: 'mouse_click',
+          x: mouseClick.point.x,
+          y: mouseClick.point.y,
+          element: mouseClick.element
+        });
+        return;
+      }
+
+      if (kind === 'mouse_drag') {
+        var drag = await performMouseDrag(payload);
+        await wait(80);
+        await report({
+          ok: true,
+          action: 'mouse_drag',
+          from: drag.from,
+          to: drag.to,
+          element: drag.element
+        });
+        return;
+      }
+
       if (kind === 'wait_for') {
         var waited = await waitForCondition(payload);
         await report(waited);
@@ -773,11 +929,12 @@ const BROWSER_BRIDGE_SCRIPT: &str = r#"
           payload: {
             title: title,
             url: String(window.location.href || ''),
+            viewport: currentPageMeta().viewport,
             text: bodyText,
             headings: collectHeadings(root),
-            links: collectLinks(root),
-            buttons: collectButtons(root),
-            inputs: collectInputs(root),
+            links: collectLinks(doc),
+            buttons: collectButtons(doc),
+            inputs: collectInputs(doc),
             contentSource: root && root.tagName ? String(root.tagName).toLowerCase() : 'document'
           }
         }
@@ -793,14 +950,350 @@ static PAGE_TEXT_WAITERS: LazyLock<
 static BROWSER_ACTION_WAITERS: LazyLock<
     Mutex<HashMap<String, tokio::sync::oneshot::Sender<Value>>>,
 > = LazyLock::new(|| Mutex::new(HashMap::new()));
+#[cfg(debug_assertions)]
+static BROWSER_MOUSE_SELFTEST_WAITERS: LazyLock<
+    Mutex<HashMap<String, tokio::sync::oneshot::Sender<BrowserMouseSelftestReport>>>,
+> = LazyLock::new(|| Mutex::new(HashMap::new()));
 static BROWSER_WINDOW_LABELS: LazyLock<Mutex<HashSet<String>>> =
     LazyLock::new(|| Mutex::new(HashSet::new()));
+static BROWSER_WINDOW_TARGETS: LazyLock<Mutex<HashMap<String, String>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+static BROWSER_AGENT_PANELS: LazyLock<Mutex<HashSet<String>>> =
+    LazyLock::new(|| Mutex::new(HashSet::new()));
+static BROWSER_NEW_WINDOW_COUNTER: AtomicU32 = AtomicU32::new(0);
 
 #[derive(Debug, Clone, serde::Serialize, Deserialize)]
 pub struct BrowserWindowInfo {
     pub label: String,
     pub target: String,
     pub url: String,
+}
+
+pub fn browser_bridge_script() -> &'static str {
+    BROWSER_BRIDGE_SCRIPT
+}
+
+pub fn browser_window_label_from_target(target: &str) -> String {
+    target
+        .strip_suffix("-ct")
+        .or_else(|| target.strip_suffix("-tb"))
+        .unwrap_or(target)
+        .to_string()
+}
+
+pub fn browser_toolbar_label_from_target(target: &str) -> String {
+    format!("{}-tb", browser_window_label_from_target(target))
+}
+
+pub fn emit_browser_agent_status(app: &tauri::AppHandle, target: &str, active: bool, action: &str) {
+    let toolbar_label = browser_toolbar_label_from_target(target);
+    let _ = app.emit_to(
+        tauri::EventTarget::AnyLabel {
+            label: toolbar_label,
+        },
+        "browser-agent-status",
+        serde_json::json!({
+            "active": active,
+            "action": action,
+        }),
+    );
+}
+
+pub fn register_readable_window(app: &tauri::AppHandle, label: &str, target: &str) {
+    let Some(window) = app.get_window(label) else {
+        return;
+    };
+    if app.get_webview(target).is_none() {
+        return;
+    }
+    BROWSER_WINDOW_LABELS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(label.to_string());
+    BROWSER_WINDOW_TARGETS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(label.to_string(), target.to_string());
+    let app_resize = app.clone();
+    let owner_label_resize = label.to_string();
+    let win_for_scale = window.clone();
+    window.on_window_event(move |event| {
+        if let tauri::WindowEvent::Resized(phys_size) = event {
+            let scale = win_for_scale.scale_factor().unwrap_or(1.0);
+            resize_browser_children(
+                &app_resize,
+                &owner_label_resize,
+                phys_size.width as f64 / scale,
+                phys_size.height as f64 / scale,
+            );
+        }
+    });
+}
+
+fn browser_popup_title(url: &url::Url) -> String {
+    url.host_str()
+        .filter(|host| !host.trim().is_empty())
+        .unwrap_or_else(|| url.as_str())
+        .to_string()
+}
+
+fn open_browser_popup_window(
+    app: &tauri::AppHandle,
+    url: url::Url,
+) -> Result<BrowserWindowInfo, String> {
+    let scheme = url.scheme();
+    if scheme != "http" && scheme != "https" {
+        return Err(format!("Unsupported popup URL scheme: {}", scheme));
+    }
+    let id = BROWSER_NEW_WINDOW_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let label = format!("ext-popup-{}", id);
+    let title = browser_popup_title(&url);
+    let mut info = create_browser_window(
+        app,
+        &label,
+        tauri::WebviewUrl::External(url.clone()),
+        &title,
+        980.0,
+        700.0,
+        &[],
+    )?;
+    info.url = url.to_string();
+    if let Some(window) = app.get_window(&label) {
+        let _ = window.set_focus();
+    }
+    Ok(info)
+}
+
+fn browser_agent_panel_label(owner_label: &str) -> String {
+    format!("{}-agent", owner_label)
+}
+
+fn browser_owner_for_target(target: &str) -> String {
+    browser_window_label_from_target(target)
+}
+
+fn resize_browser_children(app: &tauri::AppHandle, owner_label: &str, width: f64, height: f64) {
+    let toolbar_label = format!("{}-tb", owner_label);
+    let content_label = BROWSER_WINDOW_TARGETS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(owner_label)
+        .cloned()
+        .unwrap_or_else(|| format!("{}-ct", owner_label));
+    let panel_label = browser_agent_panel_label(owner_label);
+    let panel_open = BROWSER_AGENT_PANELS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .contains(owner_label)
+        && app.get_webview(&panel_label).is_some();
+    let panel_width = if panel_open {
+        AGENT_PANEL_WIDTH.min((width * 0.42).max(300.0))
+    } else {
+        0.0
+    };
+    let content_width = (width - panel_width).max(260.0);
+
+    if let Some(tb) = app.get_webview(&toolbar_label) {
+        let _ = tb.set_size(tauri::Size::Logical(tauri::LogicalSize::new(
+            content_width,
+            TOOLBAR_HEIGHT,
+        )));
+    }
+    if let Some(ct) = app.get_webview(&content_label) {
+        let y = if content_label.ends_with("-ct") {
+            TOOLBAR_HEIGHT
+        } else {
+            0.0
+        };
+        let h = if content_label.ends_with("-ct") {
+            (height - TOOLBAR_HEIGHT).max(0.0)
+        } else {
+            height.max(0.0)
+        };
+        let _ = ct.set_size(tauri::Size::Logical(tauri::LogicalSize::new(
+            content_width,
+            h,
+        )));
+        let _ = ct.set_position(tauri::Position::Logical(tauri::LogicalPosition::new(
+            0.0, y,
+        )));
+    }
+    if panel_open {
+        if let Some(panel) = app.get_webview(&panel_label) {
+            let _ = panel.set_position(tauri::Position::Logical(tauri::LogicalPosition::new(
+                content_width,
+                0.0,
+            )));
+            let _ = panel.set_size(tauri::Size::Logical(tauri::LogicalSize::new(
+                panel_width,
+                height.max(0.0),
+            )));
+        }
+    }
+}
+
+pub fn open_agent_side_panel(
+    app: &tauri::AppHandle,
+    owner_label: Option<&str>,
+    target: Option<&str>,
+) -> Result<(), String> {
+    let target = target.unwrap_or("").trim();
+    let owner = owner_label
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| browser_owner_for_target(target));
+    let target = if target.is_empty() {
+        BROWSER_WINDOW_TARGETS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&owner)
+            .cloned()
+            .unwrap_or_else(|| owner.clone())
+    } else {
+        target.to_string()
+    };
+    let window = app
+        .get_window(&owner)
+        .ok_or_else(|| format!("ウィンドウが見つかりません: {}", owner))?;
+    let panel_label = browser_agent_panel_label(&owner);
+    if app.get_webview(&panel_label).is_none() {
+        let panel_url = format!(
+            "agent-popup.html?embedded=1&owner={}&target={}",
+            urlencoding::encode(&owner),
+            urlencoding::encode(&target)
+        );
+        let panel_builder = tauri::webview::WebviewBuilder::new(
+            &panel_label,
+            tauri::WebviewUrl::App(panel_url.into()),
+        )
+        .auto_resize();
+        let size = window.inner_size().map_err(|e| e.to_string())?;
+        let scale = window.scale_factor().unwrap_or(1.0);
+        let width = size.width as f64 / scale;
+        let height = size.height as f64 / scale;
+        window
+            .add_child(
+                panel_builder,
+                tauri::Position::Logical(tauri::LogicalPosition::new(
+                    (width - AGENT_PANEL_WIDTH).max(260.0),
+                    0.0,
+                )),
+                tauri::Size::Logical(tauri::LogicalSize::new(
+                    AGENT_PANEL_WIDTH.min((width * 0.42).max(300.0)),
+                    height,
+                )),
+            )
+            .map_err(|e| format!("Agent パネル作成失敗: {}", e))?;
+    }
+    BROWSER_AGENT_PANELS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(owner.clone());
+    let size = window.inner_size().map_err(|e| e.to_string())?;
+    let scale = window.scale_factor().unwrap_or(1.0);
+    resize_browser_children(
+        app,
+        &owner,
+        size.width as f64 / scale,
+        size.height as f64 / scale,
+    );
+    Ok(())
+}
+
+pub fn close_agent_side_panel(app: &tauri::AppHandle, owner_label: &str) -> Result<(), String> {
+    let owner = owner_label.trim();
+    if owner.is_empty() {
+        return Err("owner_label is empty".into());
+    }
+    BROWSER_AGENT_PANELS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(owner);
+    let window = app
+        .get_window(owner)
+        .ok_or_else(|| format!("ウィンドウが見つかりません: {}", owner))?;
+    if let Some(panel) = app.get_webview(&browser_agent_panel_label(owner)) {
+        let _ = panel.set_position(tauri::Position::Logical(tauri::LogicalPosition::new(
+            50_000.0, 0.0,
+        )));
+        let _ = panel.set_size(tauri::Size::Logical(tauri::LogicalSize::new(0.0, 0.0)));
+    }
+    let size = window.inner_size().map_err(|e| e.to_string())?;
+    let scale = window.scale_factor().unwrap_or(1.0);
+    resize_browser_children(
+        app,
+        owner,
+        size.width as f64 / scale,
+        size.height as f64 / scale,
+    );
+    Ok(())
+}
+
+pub struct BrowserAgentStatusGuard {
+    app: tauri::AppHandle,
+    target: String,
+    active: bool,
+}
+
+impl BrowserAgentStatusGuard {
+    pub fn start(app: &tauri::AppHandle, target: &str, action: &str) -> Self {
+        emit_browser_agent_status(app, target, true, action);
+        Self {
+            app: app.clone(),
+            target: target.to_string(),
+            active: true,
+        }
+    }
+
+    pub fn finish(mut self) {
+        self.clear();
+    }
+
+    fn clear(&mut self) {
+        if self.active {
+            emit_browser_agent_status(&self.app, &self.target, false, "");
+            self.active = false;
+        }
+    }
+}
+
+impl Drop for BrowserAgentStatusGuard {
+    fn drop(&mut self) {
+        self.clear();
+    }
+}
+
+#[derive(Debug, Clone, Default, serde::Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BrowserElementRect {
+    #[serde(default)]
+    pub x: i64,
+    #[serde(default)]
+    pub y: i64,
+    #[serde(default)]
+    pub width: i64,
+    #[serde(default)]
+    pub height: i64,
+    #[serde(default)]
+    pub center_x: i64,
+    #[serde(default)]
+    pub center_y: i64,
+}
+
+#[derive(Debug, Clone, Default, serde::Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BrowserViewportPayload {
+    #[serde(default)]
+    pub width: i64,
+    #[serde(default)]
+    pub height: i64,
+    #[serde(default)]
+    pub scroll_x: i64,
+    #[serde(default)]
+    pub scroll_y: i64,
+    #[serde(default)]
+    pub scroll_height: i64,
 }
 
 #[derive(Debug, Clone, Default, serde::Serialize, Deserialize)]
@@ -810,6 +1303,8 @@ pub struct BrowserLinkPayload {
     pub text: String,
     #[serde(default)]
     pub url: String,
+    #[serde(default)]
+    pub rect: Option<BrowserElementRect>,
 }
 
 #[derive(Debug, Clone, Default, serde::Serialize, Deserialize)]
@@ -819,6 +1314,8 @@ pub struct BrowserButtonPayload {
     pub text: String,
     #[serde(default, rename = "type")]
     pub kind: String,
+    #[serde(default)]
+    pub rect: Option<BrowserElementRect>,
 }
 
 #[derive(Debug, Clone, Default, serde::Serialize, Deserialize)]
@@ -835,6 +1332,8 @@ pub struct BrowserInputPayload {
     #[serde(default)]
     pub value: String,
     #[serde(default)]
+    pub rect: Option<BrowserElementRect>,
+    #[serde(default)]
     pub required: bool,
     #[serde(default)]
     pub disabled: bool,
@@ -847,6 +1346,8 @@ pub struct PageTextPayload {
     pub title: String,
     #[serde(default)]
     pub url: String,
+    #[serde(default)]
+    pub viewport: Option<BrowserViewportPayload>,
     #[serde(default)]
     pub text: String,
     #[serde(default)]
@@ -875,6 +1376,17 @@ pub struct BrowserActionReport {
     payload: Value,
 }
 
+#[cfg(debug_assertions)]
+#[derive(Debug, Clone, Deserialize, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BrowserMouseSelftestReport {
+    request_id: String,
+    #[serde(default)]
+    count: u32,
+    #[serde(default)]
+    href: String,
+}
+
 /// Create a browser-style window with a native toolbar webview + content webview.
 /// The toolbar is a local HTML page with back/forward/reload/URL/open-in-browser.
 /// The content webview loads the external URL.
@@ -886,7 +1398,7 @@ pub fn create_browser_window(
     width: f64,
     height: f64,
     init_scripts: &[&str],
-) -> Result<(), String> {
+) -> Result<BrowserWindowInfo, String> {
     let toolbar_label = format!("{}-tb", label);
     let content_label = format!("{}-ct", label);
 
@@ -907,6 +1419,10 @@ pub fn create_browser_window(
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .insert(label.to_string());
+    BROWSER_WINDOW_TARGETS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(label.to_string(), content_label.clone());
 
     // --- Toolbar webview (local HTML) ---
     let toolbar_url = format!(
@@ -951,6 +1467,22 @@ pub fn create_browser_window(
         }
     });
 
+    let app_for_new_window = app.clone();
+    content_builder = content_builder.on_new_window(move |popup_url, _features| {
+        let app_for_open = app_for_new_window.clone();
+        let log_url = popup_url.to_string();
+        let _ = app_for_new_window.run_on_main_thread(move || {
+            if let Err(err) = open_browser_popup_window(&app_for_open, popup_url) {
+                log::warn!(
+                    "[browser] failed to open requested popup window url={}: {}",
+                    log_url,
+                    err
+                );
+            }
+        });
+        tauri::webview::NewWindowResponse::Deny
+    });
+
     window
         .add_child(
             content_builder,
@@ -961,31 +1493,22 @@ pub fn create_browser_window(
 
     // --- Handle window resize ---
     let app_resize = app.clone();
-    let tb_label_resize = toolbar_label;
-    let ct_label_resize = content_label;
+    let owner_label_resize = label.to_string();
     let win_for_scale = window.clone();
     window.on_window_event(move |event| {
         if let tauri::WindowEvent::Resized(phys_size) = event {
             let scale = win_for_scale.scale_factor().unwrap_or(1.0);
             let w = phys_size.width as f64 / scale;
             let h = phys_size.height as f64 / scale;
-
-            if let Some(tb) = app_resize.get_webview(&tb_label_resize) {
-                let _ = tb.set_size(tauri::Size::Logical(tauri::LogicalSize::new(
-                    w,
-                    TOOLBAR_HEIGHT,
-                )));
-            }
-            if let Some(ct) = app_resize.get_webview(&ct_label_resize) {
-                let _ = ct.set_size(tauri::Size::Logical(tauri::LogicalSize::new(
-                    w,
-                    (h - TOOLBAR_HEIGHT).max(0.0),
-                )));
-            }
+            resize_browser_children(&app_resize, &owner_label_resize, w, h);
         }
     });
 
-    Ok(())
+    Ok(BrowserWindowInfo {
+        label: label.to_string(),
+        target: content_label,
+        url: String::new(),
+    })
 }
 
 // ============ Browser Control Commands ============
@@ -1019,15 +1542,19 @@ pub async fn browser_get_url(app: tauri::AppHandle, target: String) -> Result<St
 /// Removes the label from the registry so subsequent `list_browser_windows`
 /// calls reflect reality even before Tauri finishes destroying the window.
 pub async fn browser_close(app: tauri::AppHandle, target: String) -> Result<String, String> {
-    let label = target
-        .strip_suffix("-ct")
-        .or_else(|| target.strip_suffix("-tb"))
-        .map(|s| s.to_string())
-        .unwrap_or_else(|| target.clone());
+    let label = browser_window_label_from_target(&target);
     let window = app
         .get_window(&label)
         .ok_or_else(|| format!("ウィンドウが見つかりません: {}", label))?;
     BROWSER_WINDOW_LABELS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(&label);
+    BROWSER_WINDOW_TARGETS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(&label);
+    BROWSER_AGENT_PANELS
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .remove(&label);
@@ -1059,6 +1586,30 @@ pub async fn browser_report_action_result(report: BrowserActionReport) -> Result
     Ok(())
 }
 
+#[cfg(debug_assertions)]
+#[tauri::command]
+pub async fn debug_browser_mouse_selftest_report(
+    report: BrowserMouseSelftestReport,
+) -> Result<(), String> {
+    if report.count == 0 {
+        eprintln!("SELAH_BROWSER_MOUSE_SELFTEST_READY {}", report.href);
+        return Ok(());
+    }
+    let tx = BROWSER_MOUSE_SELFTEST_WAITERS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(&report.request_id)
+        .ok_or_else(|| "No pending browser mouse selftest request".to_string())?;
+    let _ = tx.send(report);
+    Ok(())
+}
+
+#[cfg(not(debug_assertions))]
+#[tauri::command]
+pub async fn debug_browser_mouse_selftest_report() -> Result<(), String> {
+    Err("debug commands are not available in release builds".into())
+}
+
 pub fn list_browser_windows(app: &tauri::AppHandle) -> Vec<BrowserWindowInfo> {
     let labels: Vec<String> = BROWSER_WINDOW_LABELS
         .lock()
@@ -1069,10 +1620,14 @@ pub fn list_browser_windows(app: &tauri::AppHandle) -> Vec<BrowserWindowInfo> {
     let mut items: Vec<BrowserWindowInfo> = labels
         .into_iter()
         .filter_map(|label| {
-            let target = format!("{}-ct", &label);
-            let toolbar = format!("{}-tb", &label);
+            let target = BROWSER_WINDOW_TARGETS
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get(&label)
+                .cloned()
+                .unwrap_or_else(|| format!("{}-ct", &label));
             app.get_window(&label)?;
-            if app.get_webview(&target).is_none() || app.get_webview(&toolbar).is_none() {
+            if app.get_webview(&target).is_none() {
                 return None;
             }
             let url = app
@@ -1206,4 +1761,148 @@ pub async fn run_browser_action(
             ))
         }
     }
+}
+
+#[cfg(debug_assertions)]
+pub async fn debug_browser_mouse_click_selftest(app: tauri::AppHandle) -> Result<Value, String> {
+    let owner_label = "ext-browser-mouse-selftest";
+    if let Some(window) = app.get_window(owner_label) {
+        let _ = window.close();
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    }
+
+    let request_id = format!("browser-mouse-selftest-{}", uuid::Uuid::new_v4());
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    BROWSER_MOUSE_SELFTEST_WAITERS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(request_id.clone(), tx);
+    let page_url = format!(
+        "browser-mouse-selftest.html?request={}",
+        urlencoding::encode(&request_id)
+    );
+
+    let info = create_browser_window(
+        &app,
+        owner_label,
+        tauri::WebviewUrl::App(page_url.into()),
+        "Browser Mouse Selftest",
+        760.0,
+        520.0,
+        &[],
+    )?;
+
+    for (label, window) in app.windows() {
+        if label != owner_label {
+            let _ = window.hide();
+        }
+    }
+    if let Some(window) = app.get_window(owner_label) {
+        let _ = window.set_always_on_top(true);
+        let _ = window.set_position(tauri::Position::Physical(tauri::PhysicalPosition::new(
+            80, 80,
+        )));
+        let _ = window.show();
+        let _ = window.unminimize();
+        let _ = window.set_focus();
+    }
+    if let Some(webview) = app.get_webview(&info.target) {
+        let _ = webview.set_focus();
+    }
+
+    tokio::time::sleep(std::time::Duration::from_millis(1600)).await;
+    for (label, window) in app.windows() {
+        if label != owner_label {
+            let _ = window.hide();
+        }
+    }
+    if let Some(window) = app.get_window(owner_label) {
+        let _ = window.show();
+        let _ = window.set_focus();
+    }
+    if let Some(webview) = app.get_webview(&info.target) {
+        let _ = webview.set_focus();
+    }
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+
+    let click_x = 230.0;
+    let click_y = 136.0;
+
+    let click_result = crate::computer_control::mouse_click(
+        &app,
+        Some(&info.target),
+        click_x,
+        click_y,
+        Some("webview"),
+    )
+    .await?;
+    let click_result_for_error = click_result.clone();
+
+    let report = match tokio::time::timeout(std::time::Duration::from_millis(4_000), rx).await {
+        Ok(Ok(report)) => report,
+        Ok(Err(_)) => return Err("browser mouse selftest report channel closed".into()),
+        Err(_) => {
+            BROWSER_MOUSE_SELFTEST_WAITERS
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(&request_id);
+            let screenshot = write_selftest_screenshot(&app, &info.target).await;
+            return Err(format!(
+                "mouse click did not reach WebView button; clicked at viewport ({:.0}, {:.0}); click result: {}; screenshot: {}",
+                click_x,
+                click_y,
+                click_result_for_error,
+                screenshot.unwrap_or_else(|| "unavailable".into())
+            ));
+        }
+    };
+    if report.count == 0 {
+        return Err("browser mouse selftest report returned count=0".into());
+    }
+
+    if let Some(window) = app.get_window(owner_label) {
+        let _ = window.close();
+    }
+
+    Ok(serde_json::json!({
+        "status": "passed",
+        "label": info.label,
+        "target": info.target,
+        "button": {
+            "text": "Click target",
+            "rect": {
+                "x": 120,
+                "y": 112,
+                "width": 220,
+                "height": 48,
+                "centerX": click_x,
+                "centerY": click_y,
+            },
+        },
+        "click": click_result,
+        "report": report,
+    }))
+}
+
+#[cfg(debug_assertions)]
+async fn write_selftest_screenshot(app: &tauri::AppHandle, target: &str) -> Option<String> {
+    use base64::Engine;
+
+    let value = crate::computer_control::screenshot(app, Some(target))
+        .await
+        .ok()?;
+    let data = value
+        .get("image")
+        .and_then(|image| image.get("data_base64"))
+        .and_then(|data| data.as_str())?;
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(data)
+        .ok()?;
+    let rect = value.get("screen_rect").cloned().unwrap_or(Value::Null);
+    let path = std::env::temp_dir().join(format!(
+        "selah-browser-mouse-selftest-{}.png",
+        std::process::id()
+    ));
+    std::fs::write(&path, bytes).ok()?;
+    Some(format!("{} screen_rect={}", path.display(), rect))
 }

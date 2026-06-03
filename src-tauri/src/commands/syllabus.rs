@@ -372,11 +372,13 @@ pub async fn open_syllabus_detail(
     );
 
     tauri::WebviewWindowBuilder::new(&app, &label, tauri::WebviewUrl::App(url_str.into()))
+        .initialization_script(crate::webview_toolbar::browser_bridge_script())
         .title(&course_name)
         .inner_size(480.0, 560.0)
         .resizable(true)
         .build()
         .map_err(|e| format!("ウィンドウ作成失敗: {}", e))?;
+    crate::webview_toolbar::register_readable_window(&app, &label, &label);
 
     // 2. Spawn the actual KGC fetch in the background. When it finishes (or
     //    errors out), emit an event to the window so it can swap loading →

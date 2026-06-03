@@ -245,6 +245,12 @@ async function resolveUniversityLinkTarget(href, anchorText) {
   if (!service) return null;
 
   if (service === 'kwic') {
+    if ((url.pathname || '').indexOf('/cabinet/reference') === 0) {
+      return {
+        action: 'kwic_cabinet',
+        title: anchorText || '学生キャビネット'
+      };
+    }
     if ((url.pathname || '').indexOf('/portal/home/information/detail') === 0) {
       var infoId = url.searchParams.get('informationId') || '';
       if (infoId) {
@@ -438,6 +444,13 @@ async function openResolvedUniversityLink(target) {
       informationType: target.information_type,
       personCategoryCd: target.person_category_cd,
       categoryCd: target.category_cd
+    });
+    return true;
+  }
+
+  if (target.action === 'kwic_cabinet') {
+    await invoke('kwic_open_cabinet_window', {
+      title: target.title || '学生キャビネット'
     });
     return true;
   }

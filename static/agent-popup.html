@@ -1,0 +1,454 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta http-equiv="Content-Security-Policy" content="default-src 'self' https://ipc.localhost; script-src 'self' 'unsafe-inline' https://ipc.localhost; style-src 'self' 'unsafe-inline'; connect-src ipc: http://ipc.localhost https://ipc.localhost; img-src 'self' data:">
+<title>Agent</title>
+<style>
+  * { box-sizing: border-box; }
+  html, body {
+    margin: 0;
+    width: 100%;
+    height: 100%;
+    overflow: hidden;
+    font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Segoe UI", system-ui, sans-serif;
+    background: #f5f5f7;
+    color: #1d1d1f;
+  }
+  body {
+    display: flex;
+    flex-direction: column;
+  }
+  .titlebar {
+    height: 38px;
+    flex: 0 0 38px;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 10px;
+    padding: 0 12px 0 78px;
+    background: rgba(255,255,255,0.82);
+    border-bottom: 0.5px solid rgba(0,0,0,0.08);
+    -webkit-app-region: drag;
+  }
+  body.embedded .titlebar {
+    padding-left: 12px;
+    -webkit-app-region: no-drag;
+  }
+  .title {
+    font-size: 13px;
+    font-weight: 650;
+    white-space: nowrap;
+  }
+  .status {
+    min-width: 0;
+    font-size: 11px;
+    color: #6e6e73;
+    overflow: hidden;
+    white-space: nowrap;
+    text-overflow: ellipsis;
+  }
+  .close {
+    width: 24px;
+    height: 24px;
+    border: none;
+    border-radius: 6px;
+    background: transparent;
+    color: #86868b;
+    cursor: pointer;
+    display: none;
+    flex: 0 0 auto;
+  }
+  body.embedded .close { display: block; }
+  .close:hover { background: rgba(0,0,0,0.06); color: #1d1d1f; }
+  .messages {
+    flex: 1;
+    overflow-y: auto;
+    padding: 14px 12px 12px;
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+  }
+  .empty {
+    margin: auto;
+    max-width: 260px;
+    text-align: center;
+    color: #86868b;
+    font-size: 13px;
+    line-height: 1.5;
+  }
+  .msg {
+    max-width: 88%;
+    padding: 9px 11px;
+    border-radius: 12px;
+    font-size: 13px;
+    line-height: 1.48;
+    white-space: pre-wrap;
+    word-break: break-word;
+  }
+  .msg.user {
+    align-self: flex-end;
+    color: #fff;
+    background: #007aff;
+    border-bottom-right-radius: 5px;
+  }
+  .msg.assistant {
+    align-self: flex-start;
+    background: #fff;
+    border: 0.5px solid rgba(0,0,0,0.06);
+    border-bottom-left-radius: 5px;
+  }
+  .tool-row {
+    align-self: flex-start;
+    max-width: 92%;
+    padding: 5px 9px;
+    border-radius: 999px;
+    background: rgba(0,122,255,0.08);
+    color: #0b63ce;
+    font-size: 11px;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  .composer {
+    flex: 0 0 auto;
+    display: grid;
+    grid-template-columns: 1fr 34px;
+    gap: 8px;
+    padding: 10px;
+    background: rgba(255,255,255,0.88);
+    border-top: 0.5px solid rgba(0,0,0,0.08);
+  }
+  textarea {
+    width: 100%;
+    min-height: 38px;
+    max-height: 120px;
+    resize: none;
+    border: 0.5px solid rgba(0,0,0,0.12);
+    border-radius: 10px;
+    padding: 9px 10px;
+    background: #fff;
+    color: inherit;
+    font: inherit;
+    font-size: 13px;
+    line-height: 1.35;
+    outline: none;
+  }
+  textarea:focus {
+    border-color: rgba(0,122,255,0.55);
+    box-shadow: 0 0 0 3px rgba(0,122,255,0.1);
+  }
+  .send {
+    width: 34px;
+    height: 34px;
+    align-self: end;
+    border: none;
+    border-radius: 10px;
+    background: #007aff;
+    color: #fff;
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    transition: opacity .15s, transform .1s;
+  }
+  .send.stop {
+    background: #ff3b30;
+  }
+  .send:disabled {
+    opacity: .45;
+    cursor: default;
+  }
+  .send:not(:disabled):active {
+    transform: scale(.94);
+  }
+  .send svg {
+    width: 17px;
+    height: 17px;
+    fill: currentColor;
+  }
+  @media (prefers-color-scheme: dark) {
+    html, body { background: #1c1c1e; color: #f5f5f7; }
+    .titlebar, .composer {
+      background: rgba(28,28,30,0.88);
+      border-color: rgba(255,255,255,0.1);
+    }
+    .status, .empty { color: #98989d; }
+    .msg.assistant {
+      background: #2c2c2e;
+      border-color: rgba(255,255,255,0.1);
+    }
+    textarea {
+      background: #2c2c2e;
+      border-color: rgba(255,255,255,0.12);
+      color: #f5f5f7;
+    }
+    .tool-row {
+      background: rgba(10,132,255,0.16);
+      color: #8ec5ff;
+    }
+    .close:hover { background: rgba(255,255,255,0.08); color: #f5f5f7; }
+  }
+</style>
+</head>
+<body>
+  <header class="titlebar">
+    <div class="title">Agent</div>
+    <div class="status" id="status">準備中…</div>
+    <button class="close" id="close" type="button" title="閉じる">×</button>
+  </header>
+  <main class="messages" id="messages">
+    <div class="empty" id="empty">このページを見ながら、そのまま Agent に頼めます。</div>
+  </main>
+  <form class="composer" id="form">
+    <textarea id="input" rows="1" placeholder="Agent に聞く"></textarea>
+    <button class="send" id="send" type="submit" title="送信" disabled>
+      <svg id="sendIcon" viewBox="0 0 24 24"><path d="M3.4 20.4L21 12 3.4 3.6 3 10l10 2-10 2 .4 6.4z"/></svg>
+    </button>
+  </form>
+
+<script>
+(async () => {
+  const { invoke } = window.__TAURI__.core;
+  const { listen } = window.__TAURI__.event;
+  const params = new URLSearchParams(window.location.search);
+  const embedded = params.get('embedded') === '1';
+  const ownerLabel = params.get('owner') || '';
+  const pageTarget = params.get('target') || '';
+  document.body.classList.toggle('embedded', embedded);
+
+  const CONV_KEY = pageTarget
+    ? 'selah-agent-popup-conv-id:' + pageTarget
+    : 'selah-agent-popup-conv-id';
+  const convStorage = pageTarget ? sessionStorage : localStorage;
+  const messagesEl = document.getElementById('messages');
+  const emptyEl = document.getElementById('empty');
+  const statusEl = document.getElementById('status');
+  const formEl = document.getElementById('form');
+  const inputEl = document.getElementById('input');
+  const sendBtn = document.getElementById('send');
+  const sendIcon = document.getElementById('sendIcon');
+  const closeBtn = document.getElementById('close');
+
+  let convId = convStorage.getItem(CONV_KEY) || '';
+  let sending = false;
+  let unlisten = null;
+  let streamNode = null;
+  let composing = false;
+  let suppressEnterUntil = 0;
+
+  function setStatus(text) {
+    statusEl.textContent = text || '';
+  }
+
+  function scrollBottom() {
+    requestAnimationFrame(() => { messagesEl.scrollTop = messagesEl.scrollHeight; });
+  }
+
+  function setSendState() {
+    const hasText = inputEl.value.trim().length > 0;
+    sendBtn.disabled = !sending && !hasText;
+    sendBtn.classList.toggle('stop', sending);
+    sendBtn.title = sending ? '停止' : '送信';
+    sendIcon.innerHTML = sending
+      ? '<path d="M7 7h10v10H7z"/>'
+      : '<path d="M3.4 20.4L21 12 3.4 3.6 3 10l10 2-10 2 .4 6.4z"/>';
+  }
+
+  function autoGrow() {
+    inputEl.style.height = 'auto';
+    inputEl.style.height = Math.min(inputEl.scrollHeight, 120) + 'px';
+  }
+
+  function clearEmpty() {
+    if (emptyEl) emptyEl.remove();
+  }
+
+  function addMessage(role, content, streaming) {
+    clearEmpty();
+    const el = document.createElement('div');
+    el.className = 'msg ' + role;
+    el.textContent = content || '';
+    if (streaming) el.dataset.streaming = '1';
+    messagesEl.appendChild(el);
+    scrollBottom();
+    return el;
+  }
+
+  function addTool(text) {
+    clearEmpty();
+    const el = document.createElement('div');
+    el.className = 'tool-row';
+    el.textContent = text;
+    messagesEl.appendChild(el);
+    scrollBottom();
+  }
+
+  async function ensureConversation() {
+    if (convId) {
+      try {
+        await invoke('agent_load_messages', { convId });
+        return convId;
+      } catch (_) {
+        convId = '';
+        convStorage.removeItem(CONV_KEY);
+      }
+    }
+    convId = await invoke('agent_create_conversation', { title: 'Mini Agent' });
+    convStorage.setItem(CONV_KEY, convId);
+    return convId;
+  }
+
+  async function renderHistory() {
+    if (!convId) return;
+    let rows = [];
+    try {
+      rows = await invoke('agent_load_messages', { convId });
+    } catch (_) {
+      return;
+    }
+    messagesEl.querySelectorAll('.msg,.tool-row').forEach((n) => n.remove());
+    for (const row of rows) {
+      if (row.role === 'user' || row.role === 'assistant') {
+        addMessage(row.role, row.content || '', false);
+      }
+    }
+    if (!rows.some((r) => r.role === 'user' || r.role === 'assistant') && !document.getElementById('empty')) {
+      messagesEl.appendChild(emptyEl);
+    }
+  }
+
+  async function bindStream(id) {
+    if (unlisten) {
+      unlisten();
+      unlisten = null;
+    }
+    unlisten = await listen(`agent_stream:${id}`, (event) => {
+      handleStream(event.payload || {});
+    });
+  }
+
+  async function finishTurn(refresh) {
+    sending = false;
+    streamNode = null;
+    setStatus('準備完了');
+    setSendState();
+    if (refresh && convId) await renderHistory();
+  }
+
+  function handleStream(ev) {
+    if (!sending) return;
+    if (ev.type === 'phase') {
+      setStatus(ev.stage === 'planning' ? '考え中…' : ev.stage === 'answering' ? '返答中…' : ev.stage);
+      return;
+    }
+    if (ev.type === 'tool_call') {
+      addTool('実行中: ' + ev.name);
+      return;
+    }
+    if (ev.type === 'tool_result') {
+      addTool((ev.ok ? '完了: ' : '失敗: ') + ev.name);
+      return;
+    }
+    if (ev.type === 'token') {
+      if (!streamNode) streamNode = addMessage('assistant', '', true);
+      streamNode.textContent += ev.text || '';
+      scrollBottom();
+      return;
+    }
+    if (ev.type === 'error') {
+      addMessage('assistant', '……エラーが出たみたい。\n\n' + (ev.message || ''), false);
+      finishTurn(false);
+      return;
+    }
+    if (ev.type === 'done') {
+      finishTurn(true);
+    }
+  }
+
+  async function send() {
+    const text = inputEl.value.trim();
+    if (!text || sending) return;
+    const id = await ensureConversation();
+    await bindStream(id);
+    inputEl.value = '';
+    autoGrow();
+    addMessage('user', text, false);
+    sending = true;
+    streamNode = addMessage('assistant', '', true);
+    setStatus('考え中…');
+    setSendState();
+    try {
+      if (pageTarget) {
+        await invoke('agent_send_with_context', {
+          convId: id,
+          content: text,
+          images: [],
+          browserTarget: pageTarget,
+        });
+      } else {
+        await invoke('agent_send', { convId: id, content: text, images: [] });
+      }
+      setTimeout(() => {
+        if (sending) finishTurn(true);
+      }, 500);
+    } catch (e) {
+      if (!sending) return;
+      addMessage('assistant', '……送信に失敗したみたい。\n\n' + String(e), false);
+      finishTurn(false);
+    }
+  }
+
+  async function stop() {
+    if (!sending || !convId) return;
+    sending = false;
+    setStatus('停止しました');
+    setSendState();
+    await invoke('agent_cancel', { convId }).catch(() => {});
+  }
+
+  closeBtn.addEventListener('click', () => {
+    if (embedded && ownerLabel) {
+      invoke('close_agent_popup', { ownerLabel }).catch(() => {});
+    } else {
+      window.__TAURI__?.window?.getCurrentWindow?.().close().catch(() => {});
+    }
+  });
+
+  formEl.addEventListener('submit', (e) => {
+    e.preventDefault();
+    if (sending) stop();
+    else send();
+  });
+  inputEl.addEventListener('input', () => {
+    autoGrow();
+    setSendState();
+  });
+  inputEl.addEventListener('compositionstart', () => { composing = true; });
+  inputEl.addEventListener('compositionend', () => {
+    composing = false;
+    suppressEnterUntil = performance.now() + 160;
+  });
+  inputEl.addEventListener('keydown', (e) => {
+    if (e.key !== 'Enter' || e.shiftKey) return;
+    if (composing || e.isComposing || performance.now() < suppressEnterUntil) return;
+    e.preventDefault();
+    if (!sending) send();
+  });
+
+  try {
+    await ensureConversation();
+    await bindStream(convId);
+    await renderHistory();
+    setStatus(pageTarget ? 'このページに接続中' : '準備完了');
+  } catch (e) {
+    setStatus('初期化失敗');
+    addMessage('assistant', 'Agent を起動できませんでした。\n\n' + String(e), false);
+  }
+  setSendState();
+  setTimeout(() => inputEl.focus(), 80);
+})();
+</script>
+</body>
+</html>

@@ -34,7 +34,7 @@ function detailRendererScriptsForMode(mode) {
     scripts.push('drafts.js', 'render-inquiry.js');
   } else if (mode === 'kgc' || mode === 'syllabus') {
     scripts.push('render-external.js');
-  } else if (mode === 'kwic') {
+  } else if (mode === 'kwic' || mode === 'kwicCabinet') {
     scripts.push('render-kwic.js');
   }
   return scripts;
@@ -51,13 +51,39 @@ function renderLoadError(err) {
   c.innerHTML = '<div class="error">' + escapeHtml(String(err || '詳細ビューの読み込みに失敗しました')) + '</div>';
 }
 
+function installAgentTitlebarButton() {
+  var titlebar = document.getElementById('titlebar');
+  if (!titlebar || titlebar.style.display === 'none') return;
+  if (titlebar.querySelector('[data-open-agent]')) return;
+  var btn = document.createElement('button');
+  btn.type = 'button';
+  btn.className = 'luna-open-btn agent-open-btn';
+  btn.dataset.openAgent = '1';
+  btn.title = 'Agent';
+  btn.innerHTML = '<svg width="12" height="12" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M12 3a4 4 0 014 4v1h1.5A2.5 2.5 0 0120 10.5v5A4.5 4.5 0 0115.5 20h-7A4.5 4.5 0 014 15.5v-5A2.5 2.5 0 016.5 8H8V7a4 4 0 014-4zm-2 5h4V7a2 2 0 10-4 0v1zm-3.5 2a.5.5 0 00-.5.5v5A2.5 2.5 0 008.5 18h7a2.5 2.5 0 002.5-2.5v-5a.5.5 0 00-.5-.5h-11zM9 13a1 1 0 110-2 1 1 0 010 2zm6 0a1 1 0 110-2 1 1 0 010 2z"/></svg>Agent';
+  btn.addEventListener('click', function(e) {
+    e.preventDefault();
+    e.stopPropagation();
+    var invoke = window.__TAURI__?.core?.invoke;
+    var getCurrentWindow = window.__TAURI__?.window?.getCurrentWindow;
+    var label = '';
+    try {
+      label = getCurrentWindow ? getCurrentWindow().label : '';
+    } catch (_) {}
+    invoke?.('open_agent_popup', { ownerLabel: label || null, target: label || null }).catch(function(){});
+  });
+  titlebar.appendChild(btn);
+}
+
 // Router
 document.addEventListener('DOMContentLoaded', async function() {
   var params = new URLSearchParams(window.location.search);
   var mode = params.get('mode'), path = decodeHtmlEntities(params.get('path') || '');
   // Hide titlebar for modes that don't need it
-  if (mode === 'kgc' || mode === 'syllabus' || mode === 'kwic') {
+  if (mode === 'kgc' || mode === 'syllabus' || mode === 'kwic' || mode === 'kwicCabinet') {
     document.getElementById('titlebar').style.display = 'none';
+  } else {
+    installAgentTitlebarButton();
   }
   try {
     await ensureDetailRenderer(mode);
@@ -161,6 +187,8 @@ document.addEventListener('DOMContentLoaded', async function() {
         personCategoryCd: params.get('personCategoryCd') || '',
         categoryCd: params.get('categoryCd') || '',
       }));
+    } else if (mode === 'kwicCabinet') {
+      renderKwicCabinetReference(await invoke('kwic_fetch_cabinet_reference'));
     } else if (mode === 'kgc') {
       var kgcPath = params.get('path') || '';
       var kgcName = params.get('name') || '授業詳細';

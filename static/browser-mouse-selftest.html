@@ -1,0 +1,110 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Browser Mouse Selftest</title>
+  <style>
+    :root {
+      color-scheme: light;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      background: #f7f8fb;
+      color: #172033;
+    }
+
+    body {
+      margin: 0;
+      min-height: 100vh;
+    }
+
+    main {
+      position: relative;
+      width: 100vw;
+      min-height: 100vh;
+      padding: 32px;
+      background: #ffffff;
+      box-sizing: border-box;
+    }
+
+    h1 {
+      margin: 0 0 12px;
+      font-size: 22px;
+      font-weight: 700;
+      letter-spacing: 0;
+    }
+
+    p {
+      margin: 0 0 24px;
+      line-height: 1.5;
+      color: #42506a;
+    }
+
+    button {
+      position: absolute;
+      left: 120px;
+      top: 112px;
+      width: 220px;
+      height: 48px;
+      border: 0;
+      border-radius: 8px;
+      background: #1f6feb;
+      color: #ffffff;
+      font-size: 16px;
+      font-weight: 650;
+      cursor: pointer;
+    }
+
+    button:active {
+      transform: translateY(1px);
+    }
+
+    #status {
+      position: absolute;
+      left: 120px;
+      top: 188px;
+      margin-top: 20px;
+      font-size: 15px;
+      color: #0f7b45;
+      font-weight: 650;
+    }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>Browser Mouse Selftest</h1>
+    <p>This page proves that Selah can click a real browser WebView with OS mouse events.</p>
+    <button id="target-button" type="button">Click target</button>
+    <div id="status" aria-live="polite">Clicked count: 0</div>
+  </main>
+
+  <script>
+    var count = 0;
+    var requestId = new URLSearchParams(window.location.search).get('request') || '';
+    function invokeSelftestReport() {
+      var invoke = window.__TAURI__?.core?.invoke || window.__TAURI_INTERNALS__?.invoke || null;
+      if (!invoke || !requestId) return;
+      invoke('debug_browser_mouse_selftest_report', {
+        report: {
+          requestId: requestId,
+          count: count,
+          href: String(window.location.href || '')
+        }
+      }).catch(function (error) {
+        console.warn('debug_browser_mouse_selftest_report failed', error);
+      });
+    }
+
+    window.addEventListener('DOMContentLoaded', invokeSelftestReport);
+    setTimeout(invokeSelftestReport, 100);
+    setTimeout(invokeSelftestReport, 500);
+
+    document.getElementById('target-button').addEventListener('click', function () {
+      count += 1;
+      document.getElementById('status').textContent = 'Clicked count: ' + count;
+      document.body.setAttribute('data-click-count', String(count));
+      window.location.hash = 'clicked-' + count;
+      invokeSelftestReport();
+    });
+  </script>
+</body>
+</html>

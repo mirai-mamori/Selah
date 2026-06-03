@@ -21,6 +21,7 @@ const CANCELLED_MSG: &str = "推論はキャンセルされました";
 
 static REMOTE_CANCEL: LazyLock<Mutex<HashSet<String>>> =
     LazyLock::new(|| Mutex::new(HashSet::new()));
+static TURN_CANCEL: LazyLock<Mutex<HashSet<String>>> = LazyLock::new(|| Mutex::new(HashSet::new()));
 
 pub fn cancel_remote(gen_id: &str) {
     if let Ok(mut set) = REMOTE_CANCEL.lock() {
@@ -116,6 +117,9 @@ impl AgentProvider {
         think_budget_pct: u32,
         gen_id: &str,
     ) -> Result<String, AgentError> {
+        if Self::is_cancelled(gen_id) {
+            return Err(AgentError::Cancelled);
+        }
         match self {
             Self::Local {
                 model_id,
@@ -175,6 +179,9 @@ impl AgentProvider {
     where
         F: FnMut(&str, bool) + Send + 'static,
     {
+        if Self::is_cancelled(gen_id) {
+            return Err(AgentError::Cancelled);
+        }
         match self {
             Self::Local {
                 model_id,
@@ -220,6 +227,9 @@ impl AgentProvider {
     /// Cancel any ongoing inference for `gen_id`.
     /// Cancels both the answer-phase id and the synthesised plan-phase id.
     pub fn cancel(gen_id: &str) {
+        if let Ok(mut set) = TURN_CANCEL.lock() {
+            set.insert(gen_id.to_string());
+        }
         local_ai::cancel_inference(gen_id);
         cancel_remote(gen_id);
         let plan_id = plan_gen_id(gen_id);
@@ -227,6 +237,26 @@ impl AgentProvider {
             local_ai::cancel_inference(&plan_id);
             cancel_remote(&plan_id);
         }
+    }
+
+    pub fn clear_cancel(gen_id: &str) {
+        if let Ok(mut set) = TURN_CANCEL.lock() {
+            set.remove(gen_id);
+        }
+        local_ai::clear_inference_cancel(gen_id);
+        clear_remote_cancel(gen_id);
+        let plan_id = plan_gen_id(gen_id);
+        if !plan_id.is_empty() {
+            local_ai::clear_inference_cancel(&plan_id);
+            clear_remote_cancel(&plan_id);
+        }
+    }
+
+    pub fn is_cancelled(gen_id: &str) -> bool {
+        TURN_CANCEL
+            .lock()
+            .map(|set| set.contains(gen_id))
+            .unwrap_or(false)
     }
 
     /// Whether the provider honours assistant prefill (used for Phase 1 JSON).
@@ -241,7 +271,53 @@ fn agent_error_from_model(e: String) -> AgentError {
     if e == CANCELLED_MSG {
         AgentError::Cancelled
     } else {
-        AgentError::model(e)
+        AgentError::model(format_remote_api_error(&e).unwrap_or(e))
+    }
+}
+
+fn format_remote_api_error(raw: &str) -> Option<String> {
+    let (status_label, payload) = parse_api_error_payload(raw)?;
+    let parsed: serde_json::Value = serde_json::from_str(payload).ok()?;
+    let error = parsed.get("error").unwrap_or(&parsed);
+    let code = error.get("code").and_then(|v| v.as_i64());
+    let api_status = error.get("status").and_then(|v| v.as_str()).unwrap_or("");
+    let message = error
+        .get("message")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim();
+    if code.is_none() && api_status.is_empty() && message.is_empty() {
+        return None;
+    }
+
+    let mut details = Vec::new();
+    if let Some(code) = code {
+        details.push(format!("code={code}"));
+    }
+    if !api_status.is_empty() {
+        details.push(format!("status={api_status}"));
+    }
+    if !message.is_empty() {
+        details.push(format!("message={message}"));
+    }
+    Some(format!(
+        "远端 AI provider 请求失败（{status_label}{}）。这表示当前配置的 API key/项目/模型权限不可用，不是浏览器本地工具或网页登录失败。请检查 Settings 里的 provider、API key、模型名，以及对应云项目的 API 启用、权限、配额/计费状态。",
+        if details.is_empty() {
+            String::new()
+        } else {
+            format!("; {}", details.join(", "))
+        }
+    ))
+}
+
+fn parse_api_error_payload(raw: &str) -> Option<(&str, &str)> {
+    let rest = raw.strip_prefix("API error (")?;
+    let (status_label, after_status) = rest.split_once("):")?;
+    let payload = after_status.trim();
+    if payload.starts_with('{') {
+        Some((status_label.trim(), payload))
+    } else {
+        None
     }
 }
 
@@ -396,6 +472,13 @@ async fn remote_gemini_non_streaming(
             .and_then(|c| c.get("parts")),
     );
     if content.is_empty() {
+        if let Some(call) = gemini_function_call(&v) {
+            log::warn!(
+                "[agent answer] gemini returned functionCall part; forwarding pseudo call to executor: {}",
+                truncate(&call, 200)
+            );
+            return Ok(call);
+        }
         if let Some(call) = gemini_malformed_function_call(&v) {
             log::warn!(
                 "[agent answer] gemini returned MALFORMED_FUNCTION_CALL; forwarding pseudo call to executor: {}",
@@ -732,7 +815,7 @@ where
 
     let mut full_text = String::new();
     let mut buffer = String::new();
-    let mut malformed_call: Option<String> = None;
+    let mut tool_call: Option<String> = None;
     let mut byte_stream = resp.bytes_stream();
     use futures_util::StreamExt;
 
@@ -749,12 +832,21 @@ where
 
             if let Some(data) = line.strip_prefix("data: ") {
                 if let Ok(v) = serde_json::from_str::<serde_json::Value>(data) {
+                    if let Some(call) = gemini_function_call(&v) {
+                        log::warn!(
+                            "[agent answer] gemini stream returned functionCall part; forwarding pseudo call to executor: {}",
+                            truncate(&call, 200)
+                        );
+                        tool_call = Some(call);
+                        buffer.clear();
+                        break;
+                    }
                     if let Some(call) = gemini_malformed_function_call(&v) {
                         log::warn!(
                             "[agent answer] gemini stream returned MALFORMED_FUNCTION_CALL; forwarding pseudo call to executor: {}",
                             truncate(&call, 200)
                         );
-                        malformed_call = Some(call);
+                        tool_call = Some(call);
                         buffer.clear();
                         break;
                     }
@@ -771,12 +863,12 @@ where
                 }
             }
         }
-        if malformed_call.is_some() {
+        if tool_call.is_some() {
             break;
         }
     }
 
-    if let Some(call) = malformed_call {
+    if let Some(call) = tool_call {
         return Ok(call);
     }
     Ok(full_text)
@@ -802,6 +894,37 @@ fn gemini_malformed_function_call(v: &serde_json::Value) -> Option<String> {
             }
             let message = candidate.get("finishMessage")?.as_str()?;
             extract_pseudo_call_from_finish_message(message)
+        })
+}
+
+fn gemini_function_call(v: &serde_json::Value) -> Option<String> {
+    v.get("candidates")?
+        .as_array()?
+        .iter()
+        .find_map(|candidate| {
+            candidate
+                .get("content")?
+                .get("parts")?
+                .as_array()?
+                .iter()
+                .find_map(|part| {
+                    let call = part.get("functionCall")?;
+                    let name = call.get("name")?.as_str()?.trim();
+                    if name.is_empty() {
+                        return None;
+                    }
+                    let args = call
+                        .get("args")
+                        .cloned()
+                        .unwrap_or_else(|| serde_json::json!({}));
+                    let args = if args.is_object() {
+                        args
+                    } else {
+                        serde_json::json!({})
+                    };
+                    let args = serde_json::to_string(&args).ok()?;
+                    Some(format!("call:{name}{args}"))
+                })
         })
 }
 
@@ -884,6 +1007,52 @@ mod tests {
     }
 
     #[test]
+    fn extracts_gemini_function_call_part() {
+        let payload = serde_json::json!({
+            "candidates": [{
+                "content": {
+                    "parts": [{
+                        "functionCall": {
+                            "name": "read_browser_page",
+                            "args": {}
+                        },
+                        "thoughtSignature": "ignored"
+                    }]
+                },
+                "finishReason": "STOP"
+            }]
+        });
+
+        assert_eq!(
+            gemini_function_call(&payload).as_deref(),
+            Some("call:read_browser_page{}")
+        );
+    }
+
+    #[test]
+    fn extracts_gemini_function_call_part_with_args() {
+        let payload = serde_json::json!({
+            "candidates": [{
+                "content": {
+                    "parts": [{
+                        "functionCall": {
+                            "name": "browser_click",
+                            "args": {
+                                "target": "最新のお知らせ"
+                            }
+                        }
+                    }]
+                }
+            }]
+        });
+
+        assert_eq!(
+            gemini_function_call(&payload).as_deref(),
+            Some("call:browser_click{\"target\":\"最新のお知らせ\"}")
+        );
+    }
+
+    #[test]
     fn extracts_fullwidth_colon_from_malformed_function_call() {
         let payload = serde_json::json!({
             "candidates": [{
@@ -897,6 +1066,23 @@ mod tests {
             gemini_malformed_function_call(&payload).as_deref(),
             Some("call：read_file〔path: \"/tmp/a.pdf\"〕")
         );
+    }
+
+    #[test]
+    fn formats_standard_remote_api_error_without_provider_specific_match() {
+        let raw = r#"API error (403 Forbidden): {
+  "error": {
+    "code": 403,
+    "message": "provider supplied permission message",
+    "status": "PERMISSION_DENIED"
+  }
+}"#;
+        let formatted = format_remote_api_error(raw).expect("formatted error");
+        assert!(formatted.contains("403 Forbidden"));
+        assert!(formatted.contains("code=403"));
+        assert!(formatted.contains("status=PERMISSION_DENIED"));
+        assert!(formatted.contains("provider supplied permission message"));
+        assert!(!formatted.contains("Lightning"));
     }
 
     #[test]
@@ -942,5 +1128,16 @@ mod tests {
                 .collect::<String>(),
             "The user wants tools"
         );
+    }
+
+    #[test]
+    fn turn_cancel_survives_until_explicitly_cleared() {
+        let gen_id = "test-turn-cancel-survives-until-cleared";
+        AgentProvider::clear_cancel(gen_id);
+        assert!(!AgentProvider::is_cancelled(gen_id));
+        AgentProvider::cancel(gen_id);
+        assert!(AgentProvider::is_cancelled(gen_id));
+        AgentProvider::clear_cancel(gen_id);
+        assert!(!AgentProvider::is_cancelled(gen_id));
     }
 }

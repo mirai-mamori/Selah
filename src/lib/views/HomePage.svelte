@@ -3,7 +3,7 @@
   import { get } from "svelte/store";
   import { authState, lunaAuthState, kwicAuthState, activeTab, cachedBackendFetch, onCacheUpdate, getCached, aiNotifStore, sessionExpired } from "../stores";
   import type { NotificationsData, NotificationEntry } from "../stores";
-  import { kwicFetchSubportal, kwicOpenLink, kwicOpenDetail, getAiConfig, isAiReady, isLocalStandard2b, resetAiReady, isDemoActive, openLunaTodoItem, backendAiRefreshNow } from "../api";
+  import { kwicFetchSubportal, kwicOpenLink, kwicOpenDetail, kwicOpenCabinetReference, getAiConfig, isAiReady, isLocalStandard2b, resetAiReady, isDemoActive, openLunaTodoItem, backendAiRefreshNow } from "../api";
   import type { KwicPortalHome, KwicSubportalData, WeatherData } from "../api";
   import type { LunaTodoItem, LunaNotification, ScheduleResponse } from "../types";
   import { PERIOD_TIMES, DAY_LABELS } from "../types";
@@ -46,6 +46,7 @@
   let subportalData = $state<KwicSubportalData | null>(null);
   let subportalLoading = $state(false);
   let subportalError = $state("");
+  let portalExpansionItems = $state<Array<{ title: string; url: string }> | null>(null);
 
   // AI smart notification state
   let aiConfigEnabled = $state(false);
@@ -58,7 +59,37 @@
   /** AI notifs are usable: enabled, ready, and not blocked by 2B */
   let aiNotifUsable = $derived(aiConfigEnabled && aiEnabled && !aiNotifBlocked2b);
 
+  function isTeacherQualificationPortal(item: { title: string }) {
+    return item.title.includes("教職") || item.title.includes("資格取得");
+  }
+
+  function isCertificatePortal(item: { title: string }) {
+    return item.title.includes("証明書発行") || item.title.includes("各種手続");
+  }
+
+  function isCabinetPortal(item: { url: string }) {
+    return /\/cabinet\/reference(?:\?|$)/.test(item.url);
+  }
+
+  function openMergedPortal(title: string, items: Array<{ title: string; url: string } | undefined>) {
+    const links = items.filter((item): item is { title: string; url: string } => !!item);
+    if (!links.length) return;
+    subportalLoading = false;
+    subportalError = "";
+    portalExpansionItems = links;
+    subportalData = {
+      title,
+      links: links.map(item => ({ title: item.title, url: item.url, icon_url: "", description: "" })),
+      notifications: [],
+    };
+  }
+
   async function openSubportal(item: { url: string; title: string }) {
+    portalExpansionItems = null;
+    if (isCabinetPortal(item)) {
+      await kwicOpenCabinetReference(item.title || "学生キャビネット").catch(e => console.error("kwic_open_cabinet_window failed:", e));
+      return;
+    }
     // Extract tagCd from URL like /portal/subportal?tagCd=1
     const match = item.url.match(/tagCd=(\d+)/);
     if (!match) {
@@ -82,6 +113,7 @@
   function closeSubportal() {
     subportalData = null;
     subportalError = "";
+    portalExpansionItems = null;
   }
 
   // ============ Derived ============
@@ -750,7 +782,15 @@
         {:else if subportalError}
           <div class="subportal-error">{subportalError}</div>
         {:else if subportalData}
-          {#if subportalData.links.length > 0}
+          {#if portalExpansionItems && portalExpansionItems.length > 0}
+            <div class="kwic-link-list">
+              {#each portalExpansionItems as item}
+                <button class="kwic-sub-link" onclick={() => openSubportal(item)}>
+                  <span class="kwic-sub-link-title">{item.title}</span>
+                </button>
+              {/each}
+            </div>
+          {:else if subportalData.links.length > 0}
             <div class="kwic-link-list">
               {#each subportalData.links as link}
                 <button class="kwic-sub-link" onclick={() => kwicOpenLink(link.url, link.title)}>
@@ -767,17 +807,41 @@
       {@const mainLinks = kwicHome.sections.find(s => s.title === "メインリンク")}
       {#if mainLinks && mainLinks.items.length > 0}
         {@const ICT_TAG = "tagCd=6"}
-        {@const filteredItems = mainLinks.items.filter(i => !i.url.includes(ICT_TAG))}
+        {@const portalItems = mainLinks.items.filter(i => !i.url.includes(ICT_TAG) && !isCabinetPortal(i))}
+        {@const teacherItem = portalItems.find(isTeacherQualificationPortal)}
+        {@const certificateItem = portalItems.find(isCertificatePortal)}
+        {@const hasCertificateSlot = portalItems.some(isCertificatePortal)}
+        {@const cabinetItem = mainLinks.items.find(isCabinetPortal) ?? { title: "キャビネット", url: "/cabinet/reference" }}
         <section class="section">
           <div class="section-head-static">
             <span>ポータルリンク</span>
           </div>
           <div class="kwic-link-grid">
-            {#each filteredItems as item}
-              <button class="kwic-link-card" onclick={() => openSubportal(item)}>
-                <span class="kwic-link-title">{item.title}</span>
-              </button>
+            {#each portalItems as item}
+              {#if isTeacherQualificationPortal(item)}
+                <button class="kwic-link-card" onclick={() => openMergedPortal("資格・手続き", [item, certificateItem])}>
+                  <span class="kwic-link-title">資格・手続き</span>
+                </button>
+              {:else if isCertificatePortal(item)}
+                <button class="kwic-link-card" onclick={() => openSubportal(cabinetItem)}>
+                  <span class="kwic-link-title">キャビネット</span>
+                </button>
+              {:else}
+                <button class="kwic-link-card" onclick={() => openSubportal(item)}>
+                  <span class="kwic-link-title">{item.title}</span>
+                </button>
+              {/if}
             {/each}
+            {#if !teacherItem && certificateItem}
+              <button class="kwic-link-card" onclick={() => openMergedPortal("資格・手続き", [certificateItem])}>
+                <span class="kwic-link-title">資格・手続き</span>
+              </button>
+            {/if}
+            {#if !hasCertificateSlot}
+              <button class="kwic-link-card" onclick={() => openSubportal(cabinetItem)}>
+                <span class="kwic-link-title">キャビネット</span>
+              </button>
+            {/if}
           </div>
         </section>
       {/if}

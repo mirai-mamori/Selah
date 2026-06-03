@@ -893,6 +893,22 @@ export interface KwicSubportalData {
   notifications: KwicPortalNotification[];
 }
 
+export interface KwicCabinetItem {
+  cabinet_id: string;
+  list_id: string;
+  name: string;
+  level: number;
+  updated_at: string;
+  is_new: boolean;
+  url: string;
+}
+
+export interface KwicCabinetReference {
+  title: string;
+  items: KwicCabinetItem[];
+  raw_html_debug?: string;
+}
+
 export async function lunaCheckSession(): Promise<boolean> {
   if (_isDemo()) return true;
   return invoke<boolean>("luna_check_session");
@@ -948,6 +964,19 @@ export async function kwicFetchSubportal(tagCd: string): Promise<KwicSubportalDa
     return demoKwicSubportal(tagCd);
   }
   return kwicInvoke<KwicSubportalData>("kwic_fetch_subportal", { tagCd });
+}
+
+export async function kwicFetchCabinetReference(): Promise<KwicCabinetReference> {
+  if (_isDemo()) {
+    const { demoKwicCabinetReference } = await import("./demo");
+    return demoKwicCabinetReference();
+  }
+  return kwicInvoke<KwicCabinetReference>("kwic_fetch_cabinet_reference");
+}
+
+export async function kwicOpenCabinetReference(title = "学生キャビネット"): Promise<void> {
+  if (_isDemo()) return;
+  return invoke<void>("kwic_open_cabinet_window", { title });
 }
 
 export async function kwicOpenLink(url: string, title: string): Promise<void> {

@@ -5,6 +5,7 @@
 //! narrow so a 2B model can reliably pick among them.
 
 use serde_json::{json, Value};
+use std::sync::LazyLock;
 use tauri::Manager;
 
 use crate::db::Database;
@@ -71,6 +72,10 @@ enum ArgSchema {
     DownloadUrl,
     /// Browser click action.
     BrowserClick,
+    /// Browser viewport coordinate click.
+    BrowserMouseClick,
+    /// Browser viewport coordinate drag.
+    BrowserMouseDrag,
     /// Browser fill action.
     BrowserFill,
     /// Browser select action.
@@ -81,6 +86,14 @@ enum ArgSchema {
     BrowserScroll,
     /// Browser wait action.
     BrowserWait,
+    /// Screenshot of a window or target.
+    ComputerScreenshot,
+    /// System-level mouse click.
+    ComputerMouseClick,
+    /// System-level mouse drag.
+    ComputerMouseDrag,
+    /// System-level scroll wheel.
+    ComputerScroll,
     /// Google Calendar single-event creation.
     CalendarEvent,
     /// Google Calendar event update (event_id required, rest optional).
@@ -441,6 +454,20 @@ const TOOL_SPECS: &[ToolSpec] = &[
         schema: ArgSchema::BrowserClick,
     },
     ToolSpec {
+        name: "browser_mouse_click",
+        category: "ブラウザ",
+        signature: "browser_mouse_click(target?: string, x: number, y: number)",
+        purpose: "可視ビューポート内の座標をマウスクリックする。text/label/selectorで届かない時だけ使う",
+        schema: ArgSchema::BrowserMouseClick,
+    },
+    ToolSpec {
+        name: "browser_mouse_drag",
+        category: "ブラウザ",
+        signature: "browser_mouse_drag(target?: string, from_x: number, from_y: number, to_x: number, to_y: number, steps?: number)",
+        purpose: "可視ビューポート内でマウスドラッグする。スライダーやキャンバス等の座標操作用",
+        schema: ArgSchema::BrowserMouseDrag,
+    },
+    ToolSpec {
         name: "browser_fill",
         category: "ブラウザ",
         signature: "browser_fill(target?: string, label?: string, selector?: string, value: string, index?: number)",
@@ -486,6 +513,34 @@ const TOOL_SPECS: &[ToolSpec] = &[
         },
     },
     ToolSpec {
+        name: "computer_screenshot",
+        category: "コンピュータ操作",
+        signature: "computer_screenshot(target?: string)",
+        purpose: "対象ウィンドウを実際のPNGスクリーンショットとして取得する",
+        schema: ArgSchema::ComputerScreenshot,
+    },
+    ToolSpec {
+        name: "computer_mouse_click",
+        category: "コンピュータ操作",
+        signature: "computer_mouse_click(target?: string, x: number, y: number, coordinate_space?: screenshot|screen|webview|viewport)",
+        purpose: "実際のOSマウスイベントで指定座標をクリックする",
+        schema: ArgSchema::ComputerMouseClick,
+    },
+    ToolSpec {
+        name: "computer_mouse_drag",
+        category: "コンピュータ操作",
+        signature: "computer_mouse_drag(target?: string, from_x: number, from_y: number, to_x: number, to_y: number, steps?: number, coordinate_space?: screenshot|screen|webview|viewport)",
+        purpose: "実際のOSマウスイベントで指定座標間をドラッグする",
+        schema: ArgSchema::ComputerMouseDrag,
+    },
+    ToolSpec {
+        name: "computer_scroll",
+        category: "コンピュータ操作",
+        signature: "computer_scroll(target?: string, delta_y: number, x?: number, y?: number, coordinate_space?: screenshot|screen|webview|viewport)",
+        purpose: "実際のOSスクロールイベントを送る。target指定時は対象ウィンドウ中央へマウスを移してからスクロールする",
+        schema: ArgSchema::ComputerScroll,
+    },
+    ToolSpec {
         name: "get_today_brief",
         category: "学生情報・その他",
         signature: "get_today_brief()",
@@ -520,6 +575,65 @@ const TOOL_SPECS: &[ToolSpec] = &[
         purpose: "Agentが登録したGoogle Calendarイベントを編集する。event_id必須、他は変更したフィールドのみ指定。",
         schema: ArgSchema::CalendarUpdate,
     },
+];
+
+const TOOL_ALIASES: &[(&str, &str)] = &[
+    ("read_file", "read_downloaded_file"),
+    ("view_file", "read_downloaded_file"),
+    ("view_downloaded_file", "read_downloaded_file"),
+    ("view_downloaded", "read_downloaded_file"),
+    ("show_file", "read_downloaded_file"),
+    ("display_file", "read_downloaded_file"),
+    ("get_file", "read_downloaded_file"),
+    ("get_file_content", "read_downloaded_file"),
+    ("read_file_content", "read_downloaded_file"),
+    ("read_downloaded", "read_downloaded_file"),
+    ("read_downloaded_files", "read_downloaded_file"),
+    ("inspect_downloaded_file", "read_downloaded_file"),
+    ("open_file", "open_downloaded_file"),
+    ("open_downloaded", "open_downloaded_file"),
+    ("open_downloaded_files", "open_downloaded_file"),
+    ("list_files", "list_downloaded_files"),
+    ("list_downloads", "list_downloaded_files"),
+    ("search_downloaded_files", "list_downloaded_files"),
+    ("fetch_lms_course_resources", "list_luna_announcements"),
+    ("get_lms_course_resources", "list_luna_announcements"),
+    ("list_lms_course_resources", "list_luna_announcements"),
+    ("fetch_lms_resources", "list_luna_announcements"),
+    ("get_lms_resources", "list_luna_announcements"),
+    ("list_lms_resources", "list_luna_announcements"),
+    ("fetch_luna_course_resources", "list_luna_announcements"),
+    ("get_luna_course_resources", "list_luna_announcements"),
+    ("list_luna_course_resources", "list_luna_announcements"),
+    ("list_course_resources", "list_luna_announcements"),
+    ("get_course_resources", "list_luna_announcements"),
+    ("get_luna_detail", "get_luna_activity_detail"),
+    ("read_luna_activity", "get_luna_activity_detail"),
+    ("get_activity_detail", "get_luna_activity_detail"),
+    ("download_attachment", "download_luna_attachment"),
+    ("download_material", "download_luna_attachment"),
+    ("download_file_by_name", "download_course_material"),
+    ("download_material_file", "download_course_material"),
+    ("download_course_material_file", "download_course_material"),
+    ("download_luna_material", "download_course_material"),
+    ("download_luna_file", "download_course_material"),
+    ("kg_canvas_download_luna_file", "download_course_material"),
+    ("browser_reload", "browser_reload_page"),
+    ("reload_browser", "browser_reload_page"),
+    ("mouse_click", "browser_mouse_click"),
+    ("click_at", "browser_mouse_click"),
+    ("browser_click_at", "browser_mouse_click"),
+    ("mouse_drag", "browser_mouse_drag"),
+    ("drag_mouse", "browser_mouse_drag"),
+    ("browser_drag", "browser_mouse_drag"),
+    ("select_browser_option", "browser_select_option"),
+    ("browser_wait", "browser_wait_for"),
+    ("wait_for_browser", "browser_wait_for"),
+    ("close_browser", "browser_close"),
+    ("calendar_list_events", "list_google_calendar_events"),
+    ("calendar_create_event", "create_google_calendar_event"),
+    ("calendar_delete_event", "delete_google_calendar_event"),
+    ("calendar_update_event", "update_google_calendar_event"),
 ];
 
 #[cfg(test)]
@@ -569,12 +683,18 @@ const DISPATCH_TOOL_NAMES: &[&str] = &[
     "browser_forward",
     "browser_reload_page",
     "browser_click",
+    "browser_mouse_click",
+    "browser_mouse_drag",
     "browser_fill",
     "browser_select_option",
     "browser_press",
     "browser_scroll",
     "browser_wait_for",
     "browser_close",
+    "computer_screenshot",
+    "computer_mouse_click",
+    "computer_mouse_drag",
+    "computer_scroll",
     "get_today_brief",
     "create_google_calendar_event",
     "list_google_calendar_events",
@@ -598,6 +718,18 @@ pub fn dispatched_tool_names() -> &'static [&'static str] {
     DISPATCH_TOOL_NAMES
 }
 
+pub fn exact_tool_name(name: &str) -> Option<&'static str> {
+    let trimmed = name
+        .trim()
+        .trim_matches('`')
+        .trim_matches('"')
+        .trim_matches('\'');
+    TOOL_SPECS
+        .iter()
+        .find(|spec| spec.name == trimmed)
+        .map(|spec| spec.name)
+}
+
 pub fn canonical_tool_name(name: &str) -> Option<&'static str> {
     let trimmed = name
         .trim()
@@ -615,54 +747,9 @@ pub fn canonical_tool_name(name: &str) -> Option<&'static str> {
     if let Some(spec) = TOOL_SPECS.iter().find(|s| s.name == trimmed) {
         return Some(spec.name);
     }
-    match trimmed {
-        "read_file"
-        | "view_file"
-        | "view_downloaded_file"
-        | "view_downloaded"
-        | "show_file"
-        | "display_file"
-        | "get_file"
-        | "get_file_content"
-        | "read_file_content"
-        | "read_downloaded"
-        | "read_downloaded_files"
-        | "inspect_downloaded_file" => Some("read_downloaded_file"),
-        "open_file" | "open_downloaded" | "open_downloaded_files" => Some("open_downloaded_file"),
-        "list_files" | "list_downloads" | "search_downloaded_files" => {
-            Some("list_downloaded_files")
-        }
-        "fetch_lms_course_resources"
-        | "get_lms_course_resources"
-        | "list_lms_course_resources"
-        | "fetch_lms_resources"
-        | "get_lms_resources"
-        | "list_lms_resources"
-        | "fetch_luna_course_resources"
-        | "get_luna_course_resources"
-        | "list_luna_course_resources"
-        | "list_course_resources"
-        | "get_course_resources" => Some("list_luna_announcements"),
-        "get_luna_detail" | "read_luna_activity" | "get_activity_detail" => {
-            Some("get_luna_activity_detail")
-        }
-        "download_attachment" | "download_material" => Some("download_luna_attachment"),
-        "download_file_by_name"
-        | "download_material_file"
-        | "download_course_material_file"
-        | "download_luna_material"
-        | "download_luna_file"
-        | "kg_canvas_download_luna_file" => Some("download_course_material"),
-        "browser_reload" | "reload_browser" => Some("browser_reload_page"),
-        "select_browser_option" => Some("browser_select_option"),
-        "browser_wait" | "wait_for_browser" => Some("browser_wait_for"),
-        "close_browser" => Some("browser_close"),
-        "calendar_list_events" => Some("list_google_calendar_events"),
-        "calendar_create_event" => Some("create_google_calendar_event"),
-        "calendar_delete_event" => Some("delete_google_calendar_event"),
-        "calendar_update_event" => Some("update_google_calendar_event"),
-        _ => None,
-    }
+    TOOL_ALIASES
+        .iter()
+        .find_map(|(alias, target)| (*alias == trimmed).then_some(*target))
 }
 
 /// Dispatch a single tool call.  Returns a JSON value even on failure so the
@@ -716,12 +803,18 @@ pub async fn dispatch(app: &tauri::AppHandle, name: &str, args: &Value) -> Value
         "browser_forward" => browser_forward(app, args).await,
         "browser_reload_page" => browser_reload_page(app, args).await,
         "browser_click" => browser_click(app, args).await,
+        "browser_mouse_click" => browser_mouse_click(app, args).await,
+        "browser_mouse_drag" => browser_mouse_drag(app, args).await,
         "browser_fill" => browser_fill(app, args).await,
         "browser_select_option" => browser_select_option(app, args).await,
         "browser_press" => browser_press(app, args).await,
         "browser_scroll" => browser_scroll(app, args).await,
         "browser_wait_for" => browser_wait_for(app, args).await,
         "browser_close" => browser_close_tool(app, args).await,
+        "computer_screenshot" => computer_screenshot(app, args).await,
+        "computer_mouse_click" => computer_mouse_click(app, args).await,
+        "computer_mouse_drag" => computer_mouse_drag(app, args).await,
+        "computer_scroll" => computer_scroll(app, args).await,
         "get_today_brief" => get_today_brief(app).await,
         "create_google_calendar_event" => create_google_calendar_event(app, args).await,
         "list_google_calendar_events" => list_google_calendar_events(app).await,
@@ -744,7 +837,12 @@ pub async fn dispatch(app: &tauri::AppHandle, name: &str, args: &Value) -> Value
 }
 
 /// Static description given to the model during the planning phase.
-pub fn tool_catalog_prompt() -> String {
+pub fn tool_catalog_prompt() -> &'static str {
+    static TOOL_CATALOG_PROMPT: LazyLock<String> = LazyLock::new(build_tool_catalog_prompt);
+    &TOOL_CATALOG_PROMPT
+}
+
+fn build_tool_catalog_prompt() -> String {
     let mut out = String::new();
     let mut current_category = "";
     for spec in TOOL_SPECS {
@@ -939,11 +1037,17 @@ fn sanitize_by_schema(schema: ArgSchema, args: &Value) -> Option<Value> {
             Some(Value::Object(out))
         }
         ArgSchema::BrowserClick => sanitize_browser_click_args(args),
+        ArgSchema::BrowserMouseClick => sanitize_browser_mouse_click_args(args),
+        ArgSchema::BrowserMouseDrag => sanitize_browser_mouse_drag_args(args),
         ArgSchema::BrowserFill => sanitize_browser_fill_args(args),
         ArgSchema::BrowserSelect => sanitize_browser_select_args(args),
         ArgSchema::BrowserPress => sanitize_browser_press_args(args),
         ArgSchema::BrowserScroll => sanitize_browser_scroll_args(args),
         ArgSchema::BrowserWait => sanitize_browser_wait_args(args),
+        ArgSchema::ComputerScreenshot => sanitize_computer_screenshot_args(args),
+        ArgSchema::ComputerMouseClick => sanitize_computer_mouse_click_args(args),
+        ArgSchema::ComputerMouseDrag => sanitize_computer_mouse_drag_args(args),
+        ArgSchema::ComputerScroll => sanitize_computer_scroll_args(args),
         ArgSchema::CalendarEvent => sanitize_calendar_event_args(args),
         ArgSchema::CalendarUpdate => sanitize_calendar_update_args(args),
         ArgSchema::CalendarEventId => {
@@ -1049,6 +1153,12 @@ fn sanitize_small_index(args: &Value, key: &str, max: u64) -> Option<u64> {
     args.get(key).and_then(|v| v.as_u64()).map(|v| v.min(max))
 }
 
+fn sanitize_browser_coord(args: &Value, key: &str) -> Option<u64> {
+    args.get(key)
+        .and_then(|v| v.as_u64())
+        .map(|v| v.min(20_000))
+}
+
 fn sanitize_browser_click_args(args: &Value) -> Option<Value> {
     let target = sanitize_browser_target_arg(args);
     let selector = sanitize_selector_arg(args, "selector", 240);
@@ -1074,6 +1184,46 @@ fn sanitize_browser_click_args(args: &Value) -> Option<Value> {
     if index > 0 {
         out.insert("index".into(), Value::Number(index.into()));
     }
+    Some(Value::Object(out))
+}
+
+fn sanitize_browser_mouse_click_args(args: &Value) -> Option<Value> {
+    let target = sanitize_browser_target_arg(args);
+    let x = sanitize_browser_coord(args, "x")?;
+    let y = sanitize_browser_coord(args, "y")?;
+    let mut out = serde_json::Map::new();
+    if let Some(target) = target {
+        out.insert("target".into(), Value::String(target));
+    }
+    out.insert("x".into(), Value::Number(x.into()));
+    out.insert("y".into(), Value::Number(y.into()));
+    Some(Value::Object(out))
+}
+
+fn sanitize_browser_mouse_drag_args(args: &Value) -> Option<Value> {
+    let target = sanitize_browser_target_arg(args);
+    let from_x =
+        sanitize_browser_coord(args, "from_x").or_else(|| sanitize_browser_coord(args, "fromX"))?;
+    let from_y =
+        sanitize_browser_coord(args, "from_y").or_else(|| sanitize_browser_coord(args, "fromY"))?;
+    let to_x =
+        sanitize_browser_coord(args, "to_x").or_else(|| sanitize_browser_coord(args, "toX"))?;
+    let to_y =
+        sanitize_browser_coord(args, "to_y").or_else(|| sanitize_browser_coord(args, "toY"))?;
+    let steps = args
+        .get("steps")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(8)
+        .clamp(2, 24);
+    let mut out = serde_json::Map::new();
+    if let Some(target) = target {
+        out.insert("target".into(), Value::String(target));
+    }
+    out.insert("from_x".into(), Value::Number(from_x.into()));
+    out.insert("from_y".into(), Value::Number(from_y.into()));
+    out.insert("to_x".into(), Value::Number(to_x.into()));
+    out.insert("to_y".into(), Value::Number(to_y.into()));
+    out.insert("steps".into(), Value::Number(steps.into()));
     Some(Value::Object(out))
 }
 
@@ -1202,6 +1352,86 @@ fn sanitize_browser_wait_args(args: &Value) -> Option<Value> {
     Some(Value::Object(out))
 }
 
+fn sanitize_coordinate_space_arg(args: &Value) -> Option<String> {
+    args.get("coordinate_space")
+        .or_else(|| args.get("coordinateSpace"))
+        .and_then(|v| v.as_str())
+        .map(|v| v.trim().to_ascii_lowercase())
+        .filter(|v| {
+            matches!(
+                v.as_str(),
+                "screenshot" | "target" | "screen" | "webview" | "viewport"
+            )
+        })
+}
+
+fn sanitize_computer_screenshot_args(args: &Value) -> Option<Value> {
+    let target = sanitize_browser_target_arg(args);
+    let mut out = serde_json::Map::new();
+    if let Some(target) = target {
+        out.insert("target".into(), Value::String(target));
+    }
+    Some(Value::Object(out))
+}
+
+fn sanitize_computer_mouse_click_args(args: &Value) -> Option<Value> {
+    let target = sanitize_browser_target_arg(args);
+    let x = sanitize_browser_coord(args, "x")?;
+    let y = sanitize_browser_coord(args, "y")?;
+    let mut out = serde_json::Map::new();
+    if let Some(target) = target {
+        out.insert("target".into(), Value::String(target));
+    }
+    out.insert("x".into(), Value::Number(x.into()));
+    out.insert("y".into(), Value::Number(y.into()));
+    if let Some(space) = sanitize_coordinate_space_arg(args) {
+        out.insert("coordinate_space".into(), Value::String(space));
+    }
+    Some(Value::Object(out))
+}
+
+fn sanitize_computer_mouse_drag_args(args: &Value) -> Option<Value> {
+    let mut out = sanitize_browser_mouse_drag_args(args)?;
+    if let (Value::Object(map), Some(space)) = (&mut out, sanitize_coordinate_space_arg(args)) {
+        map.insert("coordinate_space".into(), Value::String(space));
+    }
+    Some(out)
+}
+
+fn sanitize_computer_scroll_args(args: &Value) -> Option<Value> {
+    let target = sanitize_browser_target_arg(args);
+    let delta_y = args
+        .get("delta_y")
+        .or_else(|| args.get("deltaY"))
+        .and_then(|v| v.as_i64())
+        .or_else(|| {
+            args.get("direction").and_then(|v| v.as_str()).map(|dir| {
+                match dir.trim().to_ascii_lowercase().as_str() {
+                    "up" => 700,
+                    "down" => -700,
+                    _ => 0,
+                }
+            })
+        })
+        .unwrap_or(-700)
+        .clamp(-5000, 5000);
+    let mut out = serde_json::Map::new();
+    if let Some(target) = target {
+        out.insert("target".into(), Value::String(target));
+    }
+    out.insert("delta_y".into(), Value::Number(delta_y.into()));
+    let x = args.get("x").and_then(|v| v.as_i64());
+    let y = args.get("y").and_then(|v| v.as_i64());
+    if let (Some(x), Some(y)) = (x, y) {
+        out.insert("x".into(), Value::Number(x.clamp(-200_000, 200_000).into()));
+        out.insert("y".into(), Value::Number(y.clamp(-200_000, 200_000).into()));
+    }
+    if let Some(space) = sanitize_coordinate_space_arg(args) {
+        out.insert("coordinate_space".into(), Value::String(space));
+    }
+    Some(Value::Object(out))
+}
+
 fn sanitize_calendar_event_args(args: &Value) -> Option<Value> {
     // title, date, start_time, end_time are required.
     let title = sanitize_text_arg(args, "title", 200)?;
@@ -1273,7 +1503,7 @@ fn sanitize_calendar_update_args(args: &Value) -> Option<Value> {
 
 /// Map simplified Chinese characters to their Japanese kanji equivalents
 /// so cross-lingual course searches work.
-fn normalize_cjk_char(c: char) -> char {
+pub(crate) fn normalize_cjk_char(c: char) -> char {
     match c {
         '际' => '際',
         '关' => '関',
@@ -1362,5 +1592,36 @@ fn normalize_cjk_char(c: char) -> char {
         '满' => '満',
         '难' => '難',
         _ => c,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::BTreeSet;
+
+    #[test]
+    fn tool_aliases_point_to_registered_tools() {
+        let registered = TOOL_SPECS
+            .iter()
+            .map(|spec| spec.name)
+            .collect::<BTreeSet<_>>();
+        let mut aliases = BTreeSet::new();
+        for (alias, target) in TOOL_ALIASES {
+            assert!(aliases.insert(*alias), "duplicate alias: {alias}");
+            assert!(
+                registered.contains(target),
+                "alias {alias} points to missing tool {target}"
+            );
+            assert_eq!(canonical_tool_name(alias), Some(*target));
+        }
+    }
+
+    #[test]
+    fn tool_catalog_prompt_is_cached() {
+        let first = tool_catalog_prompt().as_ptr();
+        let second = tool_catalog_prompt().as_ptr();
+        assert_eq!(first, second);
+        assert!(tool_catalog_prompt().contains("open_browser_url(url: string)"));
     }
 }

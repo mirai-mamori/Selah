@@ -247,6 +247,10 @@ pub fn cancel_inference(gen_id: &str) {
     }
 }
 
+pub fn clear_inference_cancel(gen_id: &str) {
+    clear_cancel(gen_id);
+}
+
 fn is_cancelled(gen_id: &str) -> bool {
     CANCEL_FLAGS
         .lock()

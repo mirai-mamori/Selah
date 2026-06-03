@@ -288,26 +288,48 @@
     return msg.from.emailAddress.name || msg.from.emailAddress.address || "不明";
   }
 
-  function senderInitial(msg: MailHeaderLike): string {
-    const name = senderName(msg);
-    if (!name || name === "不明") return "?";
-    // Use first char — handles CJK, latin, etc.
-    return name.charAt(0).toUpperCase();
+  function senderAddress(msg: MailHeaderLike): string {
+    return (msg.from?.emailAddress?.address || "").trim().toLowerCase();
   }
 
-  // Avatar colour is purely a function of the sender's address — cache so
+  function senderDomain(msg: MailHeaderLike): string {
+    const addr = senderAddress(msg);
+    const at = addr.lastIndexOf("@");
+    return at >= 0 ? addr.slice(at + 1) : addr;
+  }
+
+  function domainAvatarText(domain: string): string {
+    if (!domain) return "?";
+    if (domain.includes("luna")) return "Luna";
+    const parts = domain.split(".").filter(Boolean);
+    const main = parts.length >= 2 ? parts[parts.length - 2] : parts[0];
+    if (!main) return "?";
+    return main.slice(0, 2).toUpperCase();
+  }
+
+  // Avatar colour is purely a function of the sender's domain — cache so
   // the per-row hash isn't recomputed on every reactive re-render of the list.
   const avatarColorCache = new Map<string, string>();
   function avatarColor(msg: MailHeaderLike): string {
-    const addr = msg.from?.emailAddress?.address || senderName(msg);
-    const cached = avatarColorCache.get(addr);
+    const key = senderDomain(msg) || senderAddress(msg) || senderName(msg);
+    if (key.includes("luna")) return "#fff4bd";
+    const cached = avatarColorCache.get(key);
     if (cached !== undefined) return cached;
     let h = 0;
-    for (let i = 0; i < addr.length; i++) h = ((h << 5) - h + addr.charCodeAt(i)) | 0;
+    for (let i = 0; i < key.length; i++) h = ((h << 5) - h + key.charCodeAt(i)) | 0;
     const hue = ((h % 360) + 360) % 360;
     const out = `hsl(${hue}, 45%, 55%)`;
-    avatarColorCache.set(addr, out);
+    avatarColorCache.set(key, out);
     return out;
+  }
+
+  function avatarStyle(msg: MailHeaderLike): string {
+    const domain = senderDomain(msg);
+    const bg = avatarColor(msg);
+    if (domain.includes("luna")) {
+      return `background:${bg};color:#735700;font-family:"Hiragino Maru Gothic ProN","YuKyokasho","Yu Gothic",system-ui,sans-serif;font-weight:700;`;
+    }
+    return `background:${bg};`;
   }
 
   let lastFetchTs = $state<number | null>(null);
@@ -418,8 +440,8 @@
             <h3 class="detail-subject">{detailHeaderMessage?.subject || "メールを開いています"}</h3>
             <div class="detail-sender-row">
               {#if detailHeaderMessage?.from}
-                <div class="detail-avatar" style="background:{avatarColor(detailHeaderMessage)}">
-                  {senderInitial(detailHeaderMessage)}
+                <div class="detail-avatar" style={avatarStyle(detailHeaderMessage)}>
+                  {domainAvatarText(senderDomain(detailHeaderMessage))}
                 </div>
                 <div class="detail-sender-info">
                   <div class="detail-from-name">{senderName(detailHeaderMessage)}</div>
@@ -454,8 +476,8 @@
           <div class="detail-header">
             <h3 class="detail-subject">{selectedMessage.subject || "(件名なし)"}</h3>
             <div class="detail-sender-row">
-              <div class="detail-avatar" style="background:{avatarColor(selectedMessage)}">
-                {(selectedMessage.from?.emailAddress?.name || "?").charAt(0).toUpperCase()}
+              <div class="detail-avatar" style={avatarStyle(selectedMessage)}>
+                {domainAvatarText(senderDomain(selectedMessage))}
               </div>
               <div class="detail-sender-info">
                 <div class="detail-from-name">
@@ -547,8 +569,8 @@
               class:unread={!msg.isRead}
               onclick={() => openMessage(msg)}
             >
-              <div class="avatar" style="background:{avatarColor(msg)}">
-                {senderInitial(msg)}
+              <div class="avatar" style={avatarStyle(msg)}>
+                {domainAvatarText(senderDomain(msg))}
               </div>
               <div class="mail-content">
                 <div class="mail-top-row">

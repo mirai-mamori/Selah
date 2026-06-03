@@ -132,6 +132,9 @@
     background:var(--border-strong);
   }
   .window-titlebar .luna-open-btn svg { opacity:0.55; }
+  .window-titlebar .agent-open-btn {
+    color:var(--accent);
+  }
 
   /* Loading / Error */
   .loading { display:flex; flex-direction:column; align-items:center; justify-content:center; min-height:300px; color:var(--text-tertiary); gap:12px; }
@@ -438,6 +441,9 @@
   .attachment.downloaded .att-redownload { display:inline; opacity:0.4; font-size:11px; cursor:pointer; margin-left:4px; }
   .attachment.downloaded .att-redownload:hover { opacity:0.8; }
   .attachment.link-item { color:var(--text-primary); }
+  .cabinet-reference-list .attachment { color:var(--text-primary); }
+  .cabinet-item-title { font-weight:600; margin-right:6px; }
+  .cabinet-item-date { display:inline-block; color:var(--text-tertiary); font-size:11px; margin-left:8px; }
   .sec-grid.live-notes-grid { grid-template-columns:repeat(4,1fr); }
   .live-note-card {
     height:40px;
