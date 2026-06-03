@@ -64,7 +64,25 @@ macro_rules! sel {
 
 sel!(SEL_NOTICE_A, ".portal-notice-li a.portal-notice-li-a");
 sel!(SEL_MAINLINK_A, ".portal-mainlink-li a");
-sel!(SEL_INFO_A, "a.portal-info-content-li-a");
+sel!(SEL_INFO_A, "a.portal-info-content-li-a, a[data1]");
+sel!(SEL_INFO_LI, "li.portal-info-content-li");
+sel!(SEL_INFO_LIST_ROW, "#information_list .result-list");
+sel!(
+    SEL_INFO_LIST_TITLE,
+    ".portal-information-list-title.sp-contents-hidden span.link-txt[data1], span.link-txt[data1]"
+);
+sel!(
+    SEL_INFO_LIST_DATE,
+    ".portal-information-list-date.sp-contents-hidden span, .portal-information-list-date span"
+);
+sel!(
+    SEL_INFO_LIST_DIVISION,
+    ".portal-information-list-division.sp-contents-hidden, .portal-information-list-division"
+);
+sel!(
+    SEL_INFO_TYPE_SELECTED,
+    r#"select#informationType option[selected]"#
+);
 sel!(SEL_INFO_DATE, ".portal-subblock-infolist-left-item2 > div");
 sel!(
     SEL_INFO_TITLE,
@@ -219,7 +237,51 @@ pub async fn kwic_fetch_home(
                     }
                 }
 
-                let sections = parse_portal_home(&html);
+                let mut sections = parse_portal_home(&html);
+                let information_list_pages = [
+                    ("/portal/home/information/list", "10"),
+                    (
+                        "/portal/home/information/list?informationType=12&categoryCd=0",
+                        "12",
+                    ),
+                ];
+                for (path, fallback_information_type) in information_list_pages {
+                    match kwic_get(&http, path).await {
+                        Ok(list_html) => {
+                            #[cfg(debug_assertions)]
+                            {
+                                if crate::should_dump_debug_html() {
+                                    let dump_name = format!(
+                                        "kwic-portal-information-list-{}.html",
+                                        fallback_information_type
+                                    );
+                                    let _ = std::fs::write(
+                                        std::env::temp_dir().join(dump_name),
+                                        &list_html,
+                                    );
+                                }
+                            }
+                            let (parsed, added) = merge_information_list_sections(
+                                &mut sections,
+                                &list_html,
+                                Some(fallback_information_type),
+                            );
+                            log::info!(
+                                "kwic_home: information list {} parsed {} item(s), added {} item(s)",
+                                fallback_information_type,
+                                parsed,
+                                added
+                            );
+                        }
+                        Err(e) => {
+                            log::info!(
+                                "kwic_home: information list {} fetch skipped ({})",
+                                fallback_information_type,
+                                e
+                            );
+                        }
+                    }
+                }
 
                 let result = KwicPortalHome {
                     sections,
@@ -839,6 +901,247 @@ fn parse_portal_home(html: &str) -> Vec<KwicPortalSection> {
     sections
 }
 
+fn notification_tab_selectors() -> [(&'static scraper::Selector, &'static str); 4] {
+    [
+        (&*SEL_TAB1_LI, "呼出し・重要なお知らせ"),
+        (&*SEL_TAB2_LI, "学部・研究科からのお知らせ"),
+        (&*SEL_TAB3_LI, "授業のお知らせ"),
+        (&*SEL_TAB4_LI, "その他"),
+    ]
+}
+
+fn section_allows_kwic_list_merge(title: &str) -> bool {
+    matches!(
+        title,
+        "呼出し・重要なお知らせ" | "学部・研究科からのお知らせ" | "その他"
+    )
+}
+
+fn information_type_section_title(information_type: &str) -> Option<&'static str> {
+    match information_type {
+        "10" => Some("呼出し・重要なお知らせ"),
+        "12" => Some("その他"),
+        _ => None,
+    }
+}
+
+fn apply_info_item_data(
+    mut item: KwicPortalItem,
+    data2: String,
+    data3: String,
+    data4: String,
+) -> KwicPortalItem {
+    item.information_type = data2;
+    item.person_category_cd = data3;
+    item.category_cd = data4;
+    item
+}
+
+fn notification_item_key(item: &KwicPortalItem) -> String {
+    if !item.id.trim().is_empty() {
+        return format!("id:{}", item.id.trim());
+    }
+    format!("text:{}|{}", item.title.trim(), item.date.trim())
+}
+
+fn push_unique_notification_item(section: &mut KwicPortalSection, item: KwicPortalItem) -> bool {
+    let key = notification_item_key(&item);
+    if section
+        .items
+        .iter()
+        .any(|existing| notification_item_key(existing) == key)
+    {
+        return false;
+    }
+    section.items.push(item);
+    true
+}
+
+fn merge_items_into_section(
+    sections: &mut Vec<KwicPortalSection>,
+    title: &str,
+    items: Vec<KwicPortalItem>,
+) -> usize {
+    if items.is_empty() {
+        return 0;
+    }
+    if let Some(section) = sections.iter_mut().find(|section| section.title == title) {
+        let mut added = 0;
+        for item in items {
+            if push_unique_notification_item(section, item) {
+                added += 1;
+            }
+        }
+        added
+    } else {
+        let count = items.len();
+        sections.push(KwicPortalSection {
+            title: title.to_string(),
+            items,
+        });
+        count
+    }
+}
+
+fn selected_information_type(document: &scraper::Html, fallback: Option<&str>) -> String {
+    document
+        .select(&SEL_INFO_TYPE_SELECTED)
+        .next()
+        .and_then(|option| option.value().attr("value"))
+        .filter(|value| !value.trim().is_empty())
+        .or(fallback)
+        .unwrap_or_default()
+        .trim()
+        .to_string()
+}
+
+fn parse_information_list_items(
+    document: &scraper::Html,
+    fallback_information_type: Option<&str>,
+) -> Option<(&'static str, Vec<KwicPortalItem>)> {
+    let information_type = selected_information_type(document, fallback_information_type);
+    let section_title = information_type_section_title(&information_type)?;
+    let mut items = Vec::new();
+
+    for row in document.select(&SEL_INFO_LIST_ROW) {
+        let Some(title_el) = row.select(&SEL_INFO_LIST_TITLE).next() else {
+            continue;
+        };
+        let id = title_el
+            .value()
+            .attr("data1")
+            .unwrap_or_default()
+            .trim()
+            .to_string();
+        let category_cd = title_el
+            .value()
+            .attr("data2")
+            .unwrap_or_default()
+            .trim()
+            .to_string();
+        let title = normalize_text(&title_el.text().collect::<Vec<_>>().join(" "));
+        if id.is_empty() || title.is_empty() {
+            continue;
+        }
+
+        let date = row
+            .select(&SEL_INFO_LIST_DATE)
+            .next()
+            .map(|el| normalize_text(&el.text().collect::<Vec<_>>().join(" ")))
+            .unwrap_or_default();
+        let category = row
+            .select(&SEL_INFO_LIST_DIVISION)
+            .next()
+            .map(|el| normalize_text(&el.text().collect::<Vec<_>>().join(" ")))
+            .unwrap_or_default();
+
+        items.push(KwicPortalItem {
+            id: id.clone(),
+            title,
+            date,
+            category,
+            url: format!(
+                "{}/portal/home/information/detail?informationId={}&directLink=1",
+                config::KWIC_BASE,
+                id
+            ),
+            important: false,
+            information_type: information_type.clone(),
+            person_category_cd: "0".to_string(),
+            category_cd,
+        });
+    }
+
+    Some((section_title, items))
+}
+
+fn merge_information_list_sections(
+    sections: &mut Vec<KwicPortalSection>,
+    html: &str,
+    fallback_information_type: Option<&str>,
+) -> (usize, usize) {
+    use scraper::Html;
+    let document = Html::parse_document(html);
+
+    let mut merged_from_tabs = false;
+    let mut parsed_count = 0;
+    let mut merged_count = 0;
+    for (selector, title) in notification_tab_selectors() {
+        if !section_allows_kwic_list_merge(title) {
+            continue;
+        }
+        let items: Vec<KwicPortalItem> = document
+            .select(selector)
+            .filter_map(|li| {
+                parse_info_item(&li)
+                    .map(|(item, d2, d3, d4)| apply_info_item_data(item, d2, d3, d4))
+            })
+            .collect();
+        if items.is_empty() {
+            continue;
+        }
+        merged_from_tabs = true;
+        parsed_count += items.len();
+        if let Some(section) = sections.iter_mut().find(|section| section.title == title) {
+            for item in items {
+                if push_unique_notification_item(section, item) {
+                    merged_count += 1;
+                }
+            }
+        } else {
+            merged_count += items.len();
+            sections.push(KwicPortalSection {
+                title: title.to_string(),
+                items,
+            });
+        }
+    }
+    if merged_from_tabs {
+        return (parsed_count, merged_count);
+    }
+
+    if let Some((section_title, items)) =
+        parse_information_list_items(&document, fallback_information_type)
+    {
+        let parsed = items.len();
+        let merged = merge_items_into_section(sections, section_title, items);
+        if parsed > 0 {
+            return (parsed, merged);
+        }
+    }
+
+    let category_to_section = sections
+        .iter()
+        .filter(|section| section_allows_kwic_list_merge(&section.title))
+        .flat_map(|section| {
+            section
+                .items
+                .iter()
+                .filter(|item| !item.category_cd.is_empty())
+                .map(|item| (item.category_cd.clone(), section.title.clone()))
+        })
+        .collect::<std::collections::HashMap<_, _>>();
+
+    for li in document.select(&SEL_INFO_LI) {
+        let Some((item, d2, d3, d4)) = parse_info_item(&li) else {
+            continue;
+        };
+        let Some(section_title) = category_to_section.get(&d4).cloned() else {
+            continue;
+        };
+        let item = apply_info_item_data(item, d2, d3, d4);
+        if let Some(section) = sections
+            .iter_mut()
+            .find(|section| section.title == section_title)
+        {
+            if push_unique_notification_item(section, item) {
+                merged_count += 1;
+            }
+        }
+    }
+    (merged_count, merged_count)
+}
+
 /// Parse a single notification item from li.portal-info-content-li
 /// Returns (KwicPortalItem, data2, data3, data4)
 fn parse_info_item(li: &scraper::ElementRef) -> Option<(KwicPortalItem, String, String, String)> {
@@ -857,11 +1160,14 @@ fn parse_info_item(li: &scraper::ElementRef) -> Option<(KwicPortalItem, String, 
         .unwrap_or_default();
 
     // Title: .portal-subblock-infolist-left-item2 > span
-    let title = li
+    let mut title = li
         .select(&SEL_INFO_TITLE)
         .next()
         .map(|el| el.text().collect::<Vec<_>>().join("").trim().to_string())
         .unwrap_or_default();
+    if title.is_empty() {
+        title = normalize_text(&a.text().collect::<Vec<_>>().join(" "));
+    }
 
     if title.is_empty() {
         return None;
@@ -1241,6 +1547,165 @@ fn parse_subportal(html: &str) -> KwicSubportalData {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parses_kwic_information_list_rows() {
+        let html = r#"
+        <div id="information_list">
+          <select id="informationType" name="informationType">
+            <option value="10" selected="selected">呼び出し・重要なお知らせ</option>
+            <option value="11">授業のお知らせ</option>
+            <option value="12">その他</option>
+          </select>
+          <div class="contents-list">
+            <div class="contents-display-flex-exchange-sp contents-display-flex-padding-sp result-list">
+              <div class="portal-information-list-title sp-contents-hidden">
+                <span id="title_1667108" class="link-txt break" data1="1667108" data2="02">6月3日（水）のシャトルバスの運行について</span>
+                <span class="portal-information-priority portal-information-priority-urgency-color">NEW</span>
+              </div>
+              <div class="portal-information-list-date sp-contents-hidden">
+                <span>2026/06/02 17:05</span>
+                <span class="contents-time-to"></span>
+                <span>2026/06/04 00:00</span>
+              </div>
+              <div class="portal-information-list-division sp-contents-hidden">学生課</div>
+            </div>
+            <div class="contents-display-flex-exchange-sp contents-display-flex-padding-sp result-list">
+              <div class="portal-information-list-title sp-contents-hidden">
+                <span id="title_1662480" class="link-txt break" data1="1662480" data2="04">【保健館より】尿の再検査が必要です</span>
+              </div>
+              <div class="portal-information-list-date sp-contents-hidden">
+                <span>2026/05/28 09:00</span>
+                <span class="contents-time-to"></span>
+                <span>2026/06/30 00:00</span>
+              </div>
+              <div class="portal-information-list-division sp-contents-hidden">保健館</div>
+            </div>
+          </div>
+        </div>
+        "#;
+
+        let document = scraper::Html::parse_document(html);
+        let (section, items) = parse_information_list_items(&document, Some("10")).unwrap();
+
+        assert_eq!(section, "呼出し・重要なお知らせ");
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0].id, "1667108");
+        assert_eq!(items[0].information_type, "10");
+        assert_eq!(items[0].category_cd, "02");
+        assert_eq!(items[0].date, "2026/06/02 17:05");
+        assert_eq!(items[0].category, "学生課");
+        assert_eq!(items[1].category_cd, "04");
+    }
+
+    #[test]
+    fn parses_kwic_other_information_list_rows() {
+        let html = r#"
+        <div id="information_list">
+          <select id="informationType" name="informationType">
+            <option value="10">呼び出し・重要なお知らせ</option>
+            <option value="11">授業のお知らせ</option>
+            <option value="12" selected="selected">その他</option>
+          </select>
+          <div class="contents-list">
+            <div class="contents-display-flex-exchange-sp contents-display-flex-padding-sp result-list">
+              <div class="portal-information-list-title sp-contents-hidden">
+                <span id="title_1660000" class="link-txt break" data1="1660000" data2="0">その他のお知らせ</span>
+              </div>
+              <div class="portal-information-list-date sp-contents-hidden">
+                <span>2026/06/03 10:00</span>
+                <span class="contents-time-to"></span>
+                <span>2026/06/30 00:00</span>
+              </div>
+              <div class="portal-information-list-division sp-contents-hidden">学生課</div>
+            </div>
+          </div>
+        </div>
+        "#;
+
+        let document = scraper::Html::parse_document(html);
+        let (section, items) = parse_information_list_items(&document, Some("12")).unwrap();
+
+        assert_eq!(section, "その他");
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].information_type, "12");
+        assert_eq!(items[0].category_cd, "0");
+    }
+
+    #[test]
+    fn merges_information_list_without_duplicate_ids() {
+        let html = r#"
+        <div id="information_list">
+          <select id="informationType" name="informationType">
+            <option value="10" selected="selected">呼び出し・重要なお知らせ</option>
+          </select>
+          <div class="contents-list">
+            <div class="contents-display-flex-exchange-sp contents-display-flex-padding-sp result-list">
+              <div class="portal-information-list-title sp-contents-hidden">
+                <span id="title_1667108" class="link-txt break" data1="1667108" data2="02">既存のお知らせ</span>
+              </div>
+              <div class="portal-information-list-date sp-contents-hidden"><span>2026/06/02 17:05</span></div>
+              <div class="portal-information-list-division sp-contents-hidden">学生課</div>
+            </div>
+            <div class="contents-display-flex-exchange-sp contents-display-flex-padding-sp result-list">
+              <div class="portal-information-list-title sp-contents-hidden">
+                <span id="title_1667109" class="link-txt break" data1="1667109" data2="02">新しいお知らせ</span>
+              </div>
+              <div class="portal-information-list-date sp-contents-hidden"><span>2026/06/03 10:00</span></div>
+              <div class="portal-information-list-division sp-contents-hidden">学生課</div>
+            </div>
+          </div>
+        </div>
+        "#;
+        let mut sections = vec![KwicPortalSection {
+            title: "呼出し・重要なお知らせ".to_string(),
+            items: vec![KwicPortalItem {
+                id: "1667108".to_string(),
+                title: "既存のお知らせ".to_string(),
+                date: "2026/06/02 17:05".to_string(),
+                category: "学生課".to_string(),
+                url: String::new(),
+                important: false,
+                information_type: "10".to_string(),
+                person_category_cd: "0".to_string(),
+                category_cd: "02".to_string(),
+            }],
+        }];
+
+        let (parsed, added) = merge_information_list_sections(&mut sections, html, Some("10"));
+
+        assert_eq!(parsed, 2);
+        assert_eq!(added, 1);
+        assert_eq!(sections[0].items.len(), 2);
+        assert!(sections[0].items.iter().any(|item| item.id == "1667109"));
+    }
+
+    #[test]
+    fn skips_kwic_class_information_list_rows() {
+        let html = r#"
+        <div id="information_list">
+          <select id="informationType" name="informationType">
+            <option value="11" selected="selected">授業のお知らせ</option>
+          </select>
+          <div class="contents-list">
+            <div class="contents-display-flex-exchange-sp contents-display-flex-padding-sp result-list">
+              <div class="portal-information-list-title sp-contents-hidden">
+                <span id="title_1667110" class="link-txt break" data1="1667110" data2="0">授業のお知らせ</span>
+              </div>
+              <div class="portal-information-list-date sp-contents-hidden"><span>2026/06/03 11:00</span></div>
+              <div class="portal-information-list-division sp-contents-hidden">教務課</div>
+            </div>
+          </div>
+        </div>
+        "#;
+        let mut sections = Vec::new();
+
+        let (parsed, added) = merge_information_list_sections(&mut sections, html, Some("11"));
+
+        assert_eq!(parsed, 0);
+        assert_eq!(added, 0);
+        assert!(sections.is_empty());
+    }
 
     #[test]
     fn parses_kwic_cabinet_reference_rows() {

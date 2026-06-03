@@ -491,7 +491,7 @@ const CACHE_TTLS: Record<string, number> = {
   // Mail
   mail_inbox: 5 * 60 * 1000,
   // KWIC
-  kwic_home: 12 * 60 * 60 * 1000,
+  kwic_home: 5 * 60 * 1000,
 };
 
 // Keys eligible for disk persistence (survive app restart, stale-while-revalidate)

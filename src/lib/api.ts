@@ -2506,7 +2506,7 @@ const BACKEND_TASKS: Array<{ key: string; tier: "volatile" | "stable" | "system"
   { key: "grades", tier: "stable", intervalMs: 72 * 60 * 60 * 1000 },
   { key: "exams", tier: "stable", intervalMs: 12 * 60 * 60 * 1000 },
   { key: "registration", tier: "stable", intervalMs: 72 * 60 * 60 * 1000 },
-  { key: "kwic_home", tier: "stable", intervalMs: 12 * 60 * 60 * 1000 },
+  { key: "kwic_home", tier: "volatile", intervalMs: 5 * 60 * 1000 },
   { key: "preemptive_renewal", tier: "system", intervalMs: 5 * 60 * 1000 },
 ];
 

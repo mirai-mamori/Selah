@@ -5,6 +5,7 @@
   import { cachedBackendFetch, getCached, onCacheUpdate, lunaAuthState, kwicAuthState, mailAuthState, activeTab, readIdsStore, notifKey, markRead, markBatchRead, requestedMailMessageId } from "../stores";
   import type { NotificationsData } from "../stores";
   import type { KwicPortalHome } from "../api";
+  import { compareNotificationDatesDesc } from "../date";
   import ViewLoader from "../ViewLoader.svelte";
   import type { LunaNotification } from "../types";
 
@@ -196,11 +197,7 @@
     }
     // Sort each group by date descending
     for (const [, items] of map) {
-      items.sort((a, b) => {
-        const da = new Date(a.date.replace(/\//g, "-")).getTime() || 0;
-        const db = new Date(b.date.replace(/\//g, "-")).getTime() || 0;
-        return db - da;
-      });
+      items.sort((a, b) => compareNotificationDatesDesc(a.date, b.date));
     }
     return map;
   });

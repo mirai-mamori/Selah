@@ -1,6 +1,7 @@
 import type { NotificationEntry } from "../../stores";
 import type { KwicPortalHome } from "../../api";
 import type { LunaNotification } from "../../types";
+import { compareNotificationDatesDesc } from "../../date";
 
 export interface UnifiedNotif {
   source: "kgc" | "luna" | "kwic";
@@ -127,7 +128,7 @@ export function getRecentNotifications(
 
   if (kwicHome) {
     const notifSections = kwicHome.sections.filter(
-      section => section.title !== "メインリンク" && section.title !== "注目コンテンツ",
+      section => section.title !== "メインリンク" && section.title !== "注目コンテンツ" && section.title !== "授業のお知らせ",
     );
     for (const section of notifSections) {
       for (const item of section.items) {
@@ -146,11 +147,7 @@ export function getRecentNotifications(
     }
   }
 
-  merged.sort((a, b) => {
-    const dateA = new Date(a.date.replace(/\//g, "-")).getTime() || 0;
-    const dateB = new Date(b.date.replace(/\//g, "-")).getTime() || 0;
-    return dateB - dateA;
-  });
+  merged.sort((a, b) => compareNotificationDatesDesc(a.date, b.date));
 
   return merged.slice(0, 3);
 }
