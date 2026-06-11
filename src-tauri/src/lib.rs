@@ -11,6 +11,8 @@ mod agent_text;
 mod agent_tools;
 pub mod ai;
 mod ai_refresh;
+#[cfg(target_os = "macos")]
+mod app_menu;
 mod app_updates;
 mod auth;
 mod background_refresh;
@@ -251,6 +253,13 @@ pub fn run() {
                 let _ = win.set_focus();
             }
         }));
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        builder = builder
+            .menu(app_menu::build)
+            .on_menu_event(app_menu::handle_event);
     }
 
     builder

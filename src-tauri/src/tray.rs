@@ -84,7 +84,7 @@ pub fn setup_tray(app: &AppHandle) -> tauri::Result<()> {
     Ok(())
 }
 
-fn show_main_window_with_tab(app: &AppHandle, tab: Option<&str>) -> Result<(), String> {
+pub(crate) fn show_main_window_with_tab(app: &AppHandle, tab: Option<&str>) -> Result<(), String> {
     if let Some(w) = app.get_webview_window("main") {
         let _ = w.unminimize();
         let _ = w.show();
