@@ -8,31 +8,7 @@ pub async fn open_external_url(
     url: String,
     title: Option<String>,
 ) -> Result<crate::webview_toolbar::BrowserWindowInfo, String> {
-    use std::sync::atomic::{AtomicU32, Ordering};
-    static COUNTER: AtomicU32 = AtomicU32::new(0);
-
-    let parsed_url: url::Url = url.parse().map_err(|e| format!("URL parse error: {}", e))?;
-
-    let scheme = parsed_url.scheme();
-    if scheme != "http" && scheme != "https" {
-        return Err(format!("Unsupported URL scheme: {}", scheme));
-    }
-
-    let id = COUNTER.fetch_add(1, Ordering::Relaxed);
-    let label = format!("ext-{}", id);
-    let win_title = title.unwrap_or_else(|| parsed_url.host_str().unwrap_or("Web").to_string());
-
-    let mut info = crate::webview_toolbar::create_browser_window(
-        &app,
-        &label,
-        tauri::WebviewUrl::External(parsed_url),
-        &win_title,
-        900.0,
-        640.0,
-        &[],
-    )?;
-    info.url = url;
-    Ok(info)
+    crate::document_tabs::open_external_tab(&app, url, title)
 }
 
 /// Open a URL in the system default browser (Safari, Chrome, etc.)
@@ -61,15 +37,7 @@ pub async fn open_profile_edit_window(app: tauri::AppHandle) -> Result<(), Strin
         .parse()
         .map_err(|e| format!("URL parse error: {}", e))?;
 
-    crate::webview_toolbar::create_browser_window(
-        &app,
-        "profile-edit",
-        tauri::WebviewUrl::External(url),
-        "個人情報編集",
-        1000.0,
-        720.0,
-        &[],
-    )?;
+    crate::document_tabs::open_external_tab(&app, url.to_string(), Some("個人情報編集".into()))?;
 
     Ok(())
 }
@@ -85,15 +53,7 @@ pub async fn open_facility_reservation(app: tauri::AppHandle) -> Result<(), Stri
         .parse()
         .map_err(|e| format!("URL parse error: {}", e))?;
 
-    crate::webview_toolbar::create_browser_window(
-        &app,
-        "facility-rsv",
-        tauri::WebviewUrl::External(url),
-        "施設予約",
-        1100.0,
-        780.0,
-        &[],
-    )?;
+    crate::document_tabs::open_external_tab(&app, url.to_string(), Some("施設予約".into()))?;
 
     Ok(())
 }
@@ -109,21 +69,19 @@ pub async fn open_registration_window(app: tauri::AppHandle) -> Result<(), Strin
         .parse()
         .map_err(|e| format!("URL parse error: {}", e))?;
 
-    crate::webview_toolbar::create_browser_window(
-        &app,
-        "registration",
-        tauri::WebviewUrl::External(url),
-        "履修登録",
-        1100.0,
-        780.0,
-        &[],
-    )?;
+    crate::document_tabs::open_external_tab(&app, url.to_string(), Some("履修登録".into()))?;
 
     Ok(())
 }
 
 #[tauri::command]
-pub async fn open_downloads_window(
+pub async fn open_detective_tab(app: tauri::AppHandle) -> Result<(), String> {
+    crate::document_tabs::open_detective_tab(&app)?;
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn open_files_tab(
     app: tauri::AppHandle,
     focus_course: Option<String>,
 ) -> Result<(), String> {
@@ -135,36 +93,18 @@ pub async fn open_downloads_window(
         .map(|s| super::downloads::simplify_course_name(s).trim().to_string())
         .filter(|s| !s.is_empty());
 
-    if let Some(win) = app.get_webview_window("downloads") {
-        let _ = win.set_focus();
-        if let Some(c) = &course {
-            let _ = win.emit_to("downloads", "focus-course", c);
-        } else {
-            let _ = win.emit_to("downloads", "focus-course", "");
-        }
-        return Ok(());
-    }
+    let info = crate::document_tabs::open_files_tab(&app, course.clone(), "ファイル".to_string())?;
 
-    // Encode the course name into the URL hash so the page can read it
-    // synchronously on first paint without waiting on an event.
-    let url_with_hash = if let Some(c) = &course {
-        let encoded = url::form_urlencoded::byte_serialize(c.as_bytes()).collect::<String>();
-        format!("downloads.html#course={}", encoded)
-    } else {
-        "downloads.html".to_string()
-    };
-
-    tauri::WebviewWindowBuilder::new(
-        &app,
-        "downloads",
-        tauri::WebviewUrl::App(url_with_hash.into()),
-    )
-    .title("資料管理")
-    .inner_size(900.0, 600.0)
-    .min_inner_size(640.0, 380.0)
-    .resizable(true)
-    .build()
-    .map_err(|e| format!("Failed to open downloads window: {}", e))?;
+    // The course is encoded in the tab URL on first creation, but when the tab
+    // already exists open_files_tab just re-focuses it — re-emit focus-course so
+    // the surface narrows to (or clears) the requested course either way.
+    let _ = app.emit_to(
+        tauri::EventTarget::AnyLabel {
+            label: info.target,
+        },
+        "focus-course",
+        course.unwrap_or_default(),
+    );
 
     Ok(())
 }

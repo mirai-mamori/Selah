@@ -358,33 +358,16 @@ pub async fn open_syllabus_detail(
     class_code: String,
     course_name: String,
 ) -> Result<(), String> {
-    use std::sync::atomic::{AtomicU32, Ordering};
-    static COUNTER: AtomicU32 = AtomicU32::new(1000);
-    let id = COUNTER.fetch_add(1, Ordering::Relaxed);
-    let label = format!("syllabus-detail-{}", id);
-
     // 1. Create the window first so the user gets instant visual feedback.
     let encoded_name = urlencoding::encode(&course_name);
-    let encoded_label = urlencoding::encode(&label);
-    let url_str = format!(
-        "university-detail.html?mode=syllabus&name={}&wlabel={}",
-        encoded_name, encoded_label
-    );
-
-    tauri::WebviewWindowBuilder::new(&app, &label, tauri::WebviewUrl::App(url_str.into()))
-        .initialization_script(crate::webview_toolbar::browser_bridge_script())
-        .title(&course_name)
-        .inner_size(480.0, 560.0)
-        .resizable(true)
-        .build()
-        .map_err(|e| format!("ウィンドウ作成失敗: {}", e))?;
-    crate::webview_toolbar::register_readable_window(&app, &label, &label);
+    let params = format!("mode=syllabus&name={}", encoded_name);
+    let tab = crate::document_tabs::open_university_detail_tab(&app, params, course_name)?;
 
     // 2. Spawn the actual KGC fetch in the background. When it finishes (or
     //    errors out), emit an event to the window so it can swap loading →
     //    rendered content.
     let app_clone = app.clone();
-    let label_clone = label.clone();
+    let label_clone = tab.target.clone();
     tauri::async_runtime::spawn(async move {
         let kgc_state = app_clone.state::<KgcState>();
         let result = fetch_syllabus_detail(&kgc_state, &class_code).await;

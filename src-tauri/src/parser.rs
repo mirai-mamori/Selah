@@ -1416,6 +1416,10 @@ pub struct CourseDetail {
 }
 
 /// Parse course detail page: extract all th/td pairs from the first table that yields results.
+///
+/// Values preserve the cell's inner HTML so KGC detail links survive through to
+/// the frontend and can be intercepted there instead of being flattened into
+/// plain text during parsing.
 /// Tries selectors in order: table.output → table.form → table.tbl → table
 pub fn parse_course_detail(html: &str) -> CourseDetail {
     let doc = Html::parse_document(html);
@@ -1445,7 +1449,7 @@ pub fn parse_course_detail(html: &str) -> CourseDetail {
                     }
                     let value = tds
                         .get(ti)
-                        .map(|td| td.text().collect::<String>().trim().to_string())
+                        .map(|td| td.inner_html().trim().to_string())
                         .unwrap_or_default();
                     if !label.is_empty() {
                         fields.push((label, value));
@@ -2066,6 +2070,23 @@ mod session_plan_tests {
         assert_eq!(detail.attachments.len(), 1);
         assert_eq!(detail.attachments[0].name, "notice.pdf");
     }
+
+        #[test]
+        fn test_parse_course_detail_preserves_detail_link_html() {
+                let html = r#"
+                <table class="output">
+                    <tr>
+                        <th>関連資料</th>
+                        <td><a href="/uniasv2/ARF020PVI01Action.do?LSN_CD=28550600">授業詳細を見る</a></td>
+                    </tr>
+                </table>
+                "#;
+                let detail = parse_course_detail(html);
+                assert_eq!(detail.fields.len(), 1);
+                assert_eq!(detail.fields[0].0, "関連資料");
+                assert!(detail.fields[0].1.contains("href=\"/uniasv2/ARF020PVI01Action.do?LSN_CD=28550600\""));
+                assert!(detail.fields[0].1.contains("授業詳細を見る"));
+        }
 
     #[test]
     fn test_expand_fullwidth_digits() {

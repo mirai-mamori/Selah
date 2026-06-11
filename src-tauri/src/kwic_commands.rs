@@ -1,16 +1,11 @@
 use serde::{Deserialize, Serialize};
-use std::sync::{
-    atomic::{AtomicU32, Ordering},
-    LazyLock,
-};
-use tauri::{Manager, State};
+use std::sync::LazyLock;
+use tauri::State;
 
 use crate::client;
 use crate::config;
 use crate::kwic_client;
 use crate::KwicState;
-
-static KWIC_DETAIL_COUNTER: AtomicU32 = AtomicU32::new(0);
 
 /// Briefly lock KWIC client, check auth and clone http. Releases lock immediately.
 async fn kwic_http(state: &KwicState) -> Result<reqwest::Client, String> {
@@ -617,41 +612,28 @@ pub async fn kwic_fetch_cabinet_reference(
 #[tauri::command]
 pub async fn kwic_open_detail_window(
     app: tauri::AppHandle,
+    webview: tauri::Webview,
     title: String,
     information_id: String,
     information_type: String,
     person_category_cd: String,
     category_cd: String,
+    split: Option<bool>,
 ) -> Result<(), String> {
-    let existing = app
-        .webview_windows()
-        .keys()
-        .filter(|k| k.starts_with("kwic-detail-"))
-        .count();
-    if existing >= 10 {
-        return Err(config::TOO_MANY_WINDOWS_MSG.into());
-    }
-    let id = KWIC_DETAIL_COUNTER.fetch_add(1, Ordering::Relaxed);
-    let label = format!("kwic-detail-{}", id);
-
     let encoded_id = urlencoding::encode(&information_id);
     let encoded_type = urlencoding::encode(&information_type);
     let encoded_person = urlencoding::encode(&person_category_cd);
     let encoded_cat = urlencoding::encode(&category_cd);
     let encoded_title = urlencoding::encode(&title);
-    let url_str = format!(
-        "university-detail.html?mode=kwic&informationId={}&informationType={}&personCategoryCd={}&categoryCd={}&title={}",
+    let params = format!(
+        "mode=kwic&informationId={}&informationType={}&personCategoryCd={}&categoryCd={}&title={}",
         encoded_id, encoded_type, encoded_person, encoded_cat, encoded_title,
     );
-
-    tauri::WebviewWindowBuilder::new(&app, &label, tauri::WebviewUrl::App(url_str.into()))
-        .initialization_script(crate::webview_toolbar::browser_bridge_script())
-        .title(&title)
-        .inner_size(520.0, 600.0)
-        .resizable(true)
-        .build()
-        .map_err(|e| format!("ウィンドウ作成失敗: {}", e))?;
-    crate::webview_toolbar::register_readable_window(&app, &label, &label);
+    if split.unwrap_or(false) {
+        crate::document_tabs::open_child_detail(&app, params, title, webview.label())?;
+    } else {
+        crate::document_tabs::open_university_detail_tab(&app, params, title)?;
+    }
 
     Ok(())
 }
@@ -661,31 +643,10 @@ pub async fn kwic_open_cabinet_window(
     app: tauri::AppHandle,
     title: Option<String>,
 ) -> Result<(), String> {
-    let existing = app
-        .webview_windows()
-        .keys()
-        .filter(|k| k.starts_with("kwic-detail-"))
-        .count();
-    if existing >= 10 {
-        return Err(config::TOO_MANY_WINDOWS_MSG.into());
-    }
-    let id = KWIC_DETAIL_COUNTER.fetch_add(1, Ordering::Relaxed);
-    let label = format!("kwic-detail-{}", id);
     let title = title.unwrap_or_else(|| "学生キャビネット".to_string());
     let encoded_title = urlencoding::encode(&title);
-    let url_str = format!(
-        "university-detail.html?mode=kwicCabinet&title={}",
-        encoded_title
-    );
-
-    tauri::WebviewWindowBuilder::new(&app, &label, tauri::WebviewUrl::App(url_str.into()))
-        .initialization_script(crate::webview_toolbar::browser_bridge_script())
-        .title(&title)
-        .inner_size(640.0, 720.0)
-        .resizable(true)
-        .build()
-        .map_err(|e| format!("ウィンドウ作成失敗: {}", e))?;
-    crate::webview_toolbar::register_readable_window(&app, &label, &label);
+    let params = format!("mode=kwicCabinet&title={}", encoded_title);
+    crate::document_tabs::open_university_detail_tab(&app, params, title)?;
 
     Ok(())
 }
@@ -709,9 +670,6 @@ pub async fn kwic_open_link(
     let is_kwic = url.contains("kwic.kwansei.ac.jp");
 
     if is_kwansei {
-        let id = KWIC_DETAIL_COUNTER.fetch_add(1, Ordering::Relaxed);
-        let label = format!("kwic-detail-{}", id);
-
         if is_kwic {
             // KWIC Portal: needs special handling because KWIC shows its own login page
             // instead of redirecting to Okta SSO directly.
@@ -745,13 +703,10 @@ pub async fn kwic_open_link(
                 escaped_url
             );
 
-            crate::webview_toolbar::create_browser_window(
+            crate::document_tabs::open_external_tab_with_scripts(
                 &app,
-                &label,
-                tauri::WebviewUrl::External(saml_url),
-                &title,
-                1000.0,
-                750.0,
+                saml_url.to_string(),
+                Some(title),
                 &[&redirect_script],
             )?;
         } else {
@@ -760,15 +715,7 @@ pub async fn kwic_open_link(
             // via shared WKWebView cookies. No special handling needed.
             let parsed: url::Url = url.parse().map_err(|e| format!("URL parse error: {}", e))?;
 
-            crate::webview_toolbar::create_browser_window(
-                &app,
-                &label,
-                tauri::WebviewUrl::External(parsed),
-                &title,
-                1000.0,
-                750.0,
-                &[],
-            )?;
+            crate::document_tabs::open_external_tab(&app, parsed.to_string(), Some(title))?;
         }
     } else {
         // External link → in-app browser webview

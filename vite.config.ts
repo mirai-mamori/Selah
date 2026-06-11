@@ -52,6 +52,6 @@ export default defineConfig({
       },
     },
     modulePreload: false,
-    cssCodeSplit: false,
+    cssCodeSplit: true,
   },
 });

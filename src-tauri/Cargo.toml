@@ -120,6 +120,11 @@ tauri-plugin-single-instance = "2"
 sherpa-onnx = { version = "1.12.39", default-features = false }
 llama-cpp-2 = { version = "0.1" }
 
+[profile.dev]
+# rustc 1.93 on macOS can ICE in incremental mode while rebuilding the native
+# agent panel. Keep dev builds non-incremental until the compiler bug is gone.
+incremental = false
+
 [profile.release]
 opt-level = "s"
 lto = true

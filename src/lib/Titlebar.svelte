@@ -1,7 +1,7 @@
 <script lang="ts">
   import { authState, theme, cachedBackendFetch, sessionExpired, reloginInProgress, cacheStatus, activeTab, agentReady } from "./stores";
   import type { StudentInfo, RefreshItemStatus } from "./stores";
-  import { logout, openDownloadsWindow, openSettingsWindow, openProfileEditWindow, initiateRelogin, refreshAllData, updateAiReadiness } from "./api";
+  import { logout, openSettingsWindow, openProfileEditWindow, initiateRelogin, refreshAllData, updateAiReadiness } from "./api";
   import { emit } from "@tauri-apps/api/event";
   import { getCurrentWindow } from "@tauri-apps/api/window";
   import { setAppTheme } from "./system";
@@ -169,9 +169,6 @@
       {:else}
         <Icon name="sun" size={14} />
       {/if}
-    </button>
-    <button class="tb-btn" onclick={() => openDownloadsWindow()} title="ダウンロード" aria-label="ダウンロード">
-      <Icon name="arrow.down.circle" size={14} />
     </button>
     <button
       class="tb-btn"

@@ -2432,13 +2432,18 @@ export async function openSettingsWindow(panel?: string): Promise<void> {
   activeTab.set("settings");
 }
 
-export async function openDownloadsWindow(focusCourse?: string): Promise<void> {
+export async function openFilesTab(focusCourse?: string): Promise<void> {
   if (_isDemo()) {
     activeSettingsPanel.set("download");
     activeTab.set("settings");
     return;
   }
-  return invoke<void>("open_downloads_window", { focusCourse: focusCourse ?? null });
+  return invoke<void>("open_files_tab", { focusCourse: focusCourse ?? null });
+}
+
+/** Open the new-tab (home) page in the document-tabs window. */
+export async function openNewTabPage(): Promise<void> {
+  await invoke("document_tabs_new_tab");
 }
 
 export async function openProfileEditWindow(): Promise<void> {

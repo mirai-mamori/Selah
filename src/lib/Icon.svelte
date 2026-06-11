@@ -27,8 +27,24 @@
     | "exclamationmark.triangle"
     | "arrow.down.circle"
     | "folder"
+    | "folder.open"
     | "trash"
-    | "sparkles";
+    | "sparkles"
+    | "scales"
+    | "arrow.up.right.square"
+    | "minus"
+    | "plus"
+    | "textformat"
+    | "sidebar"
+    | "pencil"
+    | "square.and.arrow.up"
+    | "doc"
+    | "save"
+    | "globe"
+    | "microphone"
+    | "paperplane"
+    | "copilot"
+    | "stop";
 </script>
 
 <script lang="ts">
@@ -153,6 +169,9 @@
     <line x1="12" y1="8" x2="12" y2="16" />
   {:else if name === "folder"}
     <path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z" />
+  {:else if name === "folder.open"}
+    <path d="M3 7V5a2 2 0 0 1 2-2h5l2 3h7a2 2 0 0 1 2 2v2" />
+    <path d="M3 8h18l-2 11a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2L1.7 10.5A2 2 0 0 1 3 8z" />
   {:else if name === "trash"}
     <polyline points="3 6 5 6 21 6" />
     <path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2" />
@@ -160,6 +179,67 @@
     <path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z" />
     <circle cx="18" cy="6" r="1" fill="currentColor" stroke="none" />
     <circle cx="20.5" cy="9.5" r="0.5" fill="currentColor" stroke="none" />
+  {:else if name === "scales"}
+    <!-- Scales of justice — top knob, crossbeam, two suspended pans, base. -->
+    <circle cx="12" cy="4" r="0.9" fill="currentColor" stroke="none" />
+    <line x1="12" y1="5" x2="12" y2="19" />
+    <line x1="4" y1="7" x2="20" y2="7" />
+    <line x1="5" y1="7" x2="5" y2="10" />
+    <line x1="19" y1="7" x2="19" y2="10" />
+    <path d="M2 10h6a3 3 0 0 1-6 0z" />
+    <path d="M16 10h6a3 3 0 0 1-6 0z" />
+    <line x1="8" y1="19" x2="16" y2="19" />
+  {:else if name === "arrow.up.right.square"}
+    <path d="M14 3h7v7" />
+    <path d="M21 3l-9 9" />
+    <path d="M11 5H5a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-6" />
+  {:else if name === "minus"}
+    <line x1="5" y1="12" x2="19" y2="12" />
+  {:else if name === "plus"}
+    <line x1="12" y1="5" x2="12" y2="19" />
+    <line x1="5" y1="12" x2="19" y2="12" />
+  {:else if name === "textformat"}
+    <path d="M4 7V4h16v3" />
+    <line x1="12" y1="4" x2="12" y2="20" />
+    <line x1="8" y1="20" x2="16" y2="20" />
+  {:else if name === "sidebar"}
+    <rect x="3" y="4" width="18" height="16" rx="2" />
+    <line x1="9" y1="4" x2="9" y2="20" />
+  {:else if name === "pencil"}
+    <path d="M17 3a2.83 2.83 0 0 1 4 4L7.5 20.5 2 22l1.5-5.5L17 3z" />
+  {:else if name === "square.and.arrow.up"}
+    <path d="M12 3v12" />
+    <path d="M8 7l4-4 4 4" />
+    <path d="M5 11v8a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2v-8" />
+  {:else if name === "doc"}
+    <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z" />
+    <path d="M14 2v6h6" />
+    <line x1="8" y1="13" x2="16" y2="13" />
+    <line x1="8" y1="17" x2="14" y2="17" />
+  {:else if name === "save"}
+    <path d="M19 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11l5 5v11a2 2 0 0 1-2 2z" />
+    <path d="M17 21v-8H7v8" />
+    <path d="M7 3v5h8" />
+  {:else if name === "globe"}
+    <circle cx="12" cy="12" r="10" />
+    <line x1="2" y1="12" x2="22" y2="12" />
+    <path d="M12 2a15 15 0 0 1 0 20" />
+    <path d="M12 2a15 15 0 0 0 0 20" />
+  {:else if name === "microphone"}
+    <rect x="9" y="3" width="6" height="11" rx="3" />
+    <path d="M5 11a7 7 0 0 0 14 0" />
+    <path d="M12 18v3M8 21h8" />
+  {:else if name === "paperplane"}
+    <path d="M22 2 11 13" />
+    <path d="m22 2-7 20-4-9-9-4Z" />
+  {:else if name === "stop"}
+    <rect x="6" y="6" width="12" height="12" rx="2" fill="currentColor" stroke="none" />
+  {:else if name === "copilot"}
+    <rect x="4" y="8" width="16" height="11" rx="4" />
+    <line x1="12" y1="4.5" x2="12" y2="8" />
+    <circle cx="12" cy="4" r="1.2" fill="currentColor" stroke="none" />
+    <circle cx="9.3" cy="13.5" r="1.25" fill="currentColor" stroke="none" />
+    <circle cx="14.7" cy="13.5" r="1.25" fill="currentColor" stroke="none" />
   {/if}
 </svg>
 

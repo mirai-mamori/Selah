@@ -8,7 +8,48 @@ pub(in crate::luna_parser) fn extract_named_quill_text(
     // Pattern: _QuillUtil.varName.setJsonData("...", ...)
     let pattern = format!("{}.setJsonData(\"", var_name);
     let pos = html.find(&pattern)?;
-    let after = &html[pos + pattern.len()..];
+    extract_quill_call_payload(&html[pos + pattern.len()..])
+}
+
+/// Extract the first Quill payload in an HTML fragment.
+///
+/// Useful when the variable name is unstable but the row still contains a
+/// single inline `_QuillUtil.*.setJsonData(...)` call for its body.
+pub(in crate::luna_parser) fn extract_first_quill_rich_html(html: &str) -> Option<String> {
+    let pattern = ".setJsonData(\"";
+    let pos = html.find(pattern)?;
+    extract_quill_call_payload(&html[pos + pattern.len()..])
+}
+
+/// Extract all named Quill payloads in occurrence order.
+pub(in crate::luna_parser) fn extract_named_quill_payloads(
+    html: &str,
+) -> Vec<(String, String)> {
+    let mut payloads = Vec::new();
+    let marker = "_QuillUtil.";
+    let call = ".setJsonData(\"";
+    let mut offset = 0usize;
+
+    while let Some(marker_pos) = html[offset..].find(marker) {
+        let start = offset + marker_pos + marker.len();
+        let Some(call_pos_rel) = html[start..].find(call) else {
+            break;
+        };
+        let name_end = start + call_pos_rel;
+        let var_name = html[start..name_end].trim();
+        let after = &html[name_end + call.len()..];
+        if !var_name.is_empty() {
+            if let Some(payload) = extract_quill_call_payload(after) {
+                payloads.push((var_name.to_string(), payload));
+            }
+        }
+        offset = name_end + call.len();
+    }
+
+    payloads
+}
+
+fn extract_quill_call_payload(after: &str) -> Option<String> {
     // Byte-level scan for closing unescaped ": safe because ASCII 0x22/0x5C
     // cannot appear as UTF-8 continuation bytes (continuation bytes are 0x80–0xBF).
     let bytes = after.as_bytes();

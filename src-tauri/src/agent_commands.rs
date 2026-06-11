@@ -171,13 +171,8 @@ pub fn open_agent_popup(
     kind: Option<String>,
 ) -> Result<(), String> {
     if owner_label.as_deref().is_some() || target.as_deref().is_some() {
-        return crate::webview_toolbar::open_agent_side_panel(
-            &app,
-            owner_label.as_deref(),
-            target.as_deref(),
-            title.as_deref(),
-            kind.as_deref(),
-        );
+        let _ = (title, kind);
+        return crate::document_tabs::open_agent_workspace(&app);
     }
 
     const LABEL: &str = "agent-popup";
@@ -191,7 +186,10 @@ pub fn open_agent_popup(
     let builder = tauri::WebviewWindowBuilder::new(
         &app,
         LABEL,
-        tauri::WebviewUrl::App("agent-popup.html".into()),
+        tauri::WebviewUrl::App(
+            "index.html#surface=agent-panel&owner=agent-popup&target=agent-popup&title=%E3%82%A8%E3%83%BC%E3%82%B8%E3%82%A7%E3%83%B3%E3%83%88&kind=agent"
+                .into(),
+        ),
     )
     .title("Agent")
     .inner_size(420.0, 620.0)
@@ -207,11 +205,6 @@ pub fn open_agent_popup(
         .build()
         .map(|_| ())
         .map_err(|e| format!("Agent popup を開けませんでした: {}", e))
-}
-
-#[tauri::command]
-pub fn close_agent_popup(app: AppHandle, owner_label: String) -> Result<(), String> {
-    crate::webview_toolbar::close_agent_side_panel(&app, &owner_label)
 }
 
 #[tauri::command]

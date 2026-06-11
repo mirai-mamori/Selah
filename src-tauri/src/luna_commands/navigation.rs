@@ -1,7 +1,6 @@
-use super::{luna_http, UNIVERSITY_DETAIL_COUNTER};
+use super::luna_http;
 use crate::{config, luna_client, LunaState};
-use std::sync::atomic::Ordering;
-use tauri::{Manager, State};
+use tauri::State;
 
 /// Infer `(mode, idnumber, info_id)` from a Luna detail URL when the caller
 /// did not pass an explicit `mode`.
@@ -120,6 +119,7 @@ fn infer_luna_window_target(
 #[tauri::command]
 pub async fn university_open_detail_window(
     app: tauri::AppHandle,
+    webview: tauri::Webview,
     path: String,
     title: String,
     mode: Option<String>,
@@ -129,17 +129,8 @@ pub async fn university_open_detail_window(
     info_id: Option<String>,
     kgc_path: Option<String>,
     course_name: Option<String>,
+    split: Option<bool>,
 ) -> Result<(), String> {
-    let existing = app
-        .webview_windows()
-        .keys()
-        .filter(|k| k.starts_with("university-detail-"))
-        .count();
-    if existing >= 10 {
-        return Err(config::TOO_MANY_WINDOWS_MSG.into());
-    }
-    let id = UNIVERSITY_DETAIL_COUNTER.fetch_add(1, Ordering::Relaxed);
-    let label = format!("university-detail-{}", id);
     let (mode, idnumber, info_id) = infer_luna_window_target(
         &path,
         mode.as_deref(),
@@ -150,7 +141,7 @@ pub async fn university_open_detail_window(
     let url_str = match mode.as_deref() {
         Some("material") => {
             let mut parts = format!(
-                "university-detail.html?mode=material&title={}",
+                "mode=material&title={}",
                 urlencoding::encode(&title)
             );
             if let Some(p) = &period {
@@ -172,7 +163,7 @@ pub async fn university_open_detail_window(
         }
         Some("announcement") => {
             let mut parts = format!(
-                "university-detail.html?mode=announcement&title={}&idnumber={}&infoId={}",
+                "mode=announcement&title={}&idnumber={}&infoId={}",
                 urlencoding::encode(&title),
                 urlencoding::encode(idnumber.as_deref().unwrap_or("")),
                 urlencoding::encode(info_id.as_deref().unwrap_or(""))
@@ -184,7 +175,7 @@ pub async fn university_open_detail_window(
         }
         Some("discussion") => {
             let mut parts = format!(
-                "university-detail.html?mode=discussion&path={}&title={}",
+                "mode=discussion&path={}&title={}",
                 urlencoding::encode(&path),
                 urlencoding::encode(&title)
             );
@@ -195,7 +186,7 @@ pub async fn university_open_detail_window(
         }
         Some("inquiry") => {
             let mut parts = format!(
-                "university-detail.html?mode=inquiry&path={}&title={}",
+                "mode=inquiry&path={}&title={}",
                 urlencoding::encode(&path),
                 urlencoding::encode(&title)
             );
@@ -206,7 +197,7 @@ pub async fn university_open_detail_window(
         }
         Some("report") => {
             let mut parts = format!(
-                "university-detail.html?mode=report&path={}&title={}",
+                "mode=report&path={}&title={}",
                 urlencoding::encode(&path),
                 urlencoding::encode(&title)
             );
@@ -226,7 +217,7 @@ pub async fn university_open_detail_window(
         }
         Some("survey") | Some("questionnaire") => {
             let mut parts = format!(
-                "university-detail.html?mode=survey&path={}&title={}",
+                "mode=survey&path={}&title={}",
                 urlencoding::encode(&path),
                 urlencoding::encode(&title)
             );
@@ -237,7 +228,7 @@ pub async fn university_open_detail_window(
         }
         Some("thread") => {
             let mut parts = format!(
-                "university-detail.html?mode=thread&path={}&title={}",
+                "mode=thread&path={}&title={}",
                 urlencoding::encode(&path),
                 urlencoding::encode(&title)
             );
@@ -248,7 +239,7 @@ pub async fn university_open_detail_window(
         }
         Some("course") => {
             let mut parts = format!(
-                "university-detail.html?mode=course&idnumber={}&title={}",
+                "mode=course&idnumber={}&title={}",
                 urlencoding::encode(idnumber.as_deref().unwrap_or("")),
                 urlencoding::encode(&title)
             );
@@ -262,7 +253,7 @@ pub async fn university_open_detail_window(
         }
         Some("attendance") => {
             let mut parts = format!(
-                "university-detail.html?mode=attendance&idnumber={}&title={}",
+                "mode=attendance&idnumber={}&title={}",
                 urlencoding::encode(idnumber.as_deref().unwrap_or("")),
                 urlencoding::encode(&title)
             );
@@ -273,7 +264,7 @@ pub async fn university_open_detail_window(
         }
         _ => {
             let mut parts = format!(
-                "university-detail.html?path={}&title={}",
+                "path={}&title={}",
                 urlencoding::encode(&path),
                 urlencoding::encode(&title)
             );
@@ -284,23 +275,11 @@ pub async fn university_open_detail_window(
         }
     };
 
-    let builder =
-        tauri::WebviewWindowBuilder::new(&app, &label, tauri::WebviewUrl::App(url_str.into()))
-            .initialization_script(crate::webview_toolbar::browser_bridge_script())
-            .title(&title)
-            .inner_size(720.0, 780.0)
-            .min_inner_size(560.0, 480.0)
-            .resizable(true);
-
-    #[cfg(target_os = "macos")]
-    let builder = builder
-        .title_bar_style(tauri::TitleBarStyle::Overlay)
-        .hidden_title(true);
-
-    builder
-        .build()
-        .map_err(|e| format!("ウィンドウ作成失敗: {}", e))?;
-    crate::webview_toolbar::register_readable_window(&app, &label, &label);
+    if split.unwrap_or(false) {
+        crate::document_tabs::open_child_detail(&app, url_str, title, webview.label())?;
+    } else {
+        crate::document_tabs::open_university_detail_tab(&app, url_str, title)?;
+    }
 
     Ok(())
 }
@@ -310,6 +289,7 @@ pub async fn university_open_detail_window(
 #[tauri::command]
 pub async fn luna_open_detail_window(
     app: tauri::AppHandle,
+    webview: tauri::Webview,
     path: String,
     title: String,
     mode: Option<String>,
@@ -319,9 +299,11 @@ pub async fn luna_open_detail_window(
     info_id: Option<String>,
     kgc_path: Option<String>,
     course_name: Option<String>,
+    split: Option<bool>,
 ) -> Result<(), String> {
     university_open_detail_window(
         app,
+        webview,
         path,
         title,
         mode,
@@ -331,6 +313,7 @@ pub async fn luna_open_detail_window(
         info_id,
         kgc_path,
         course_name,
+        split,
     )
     .await
 }

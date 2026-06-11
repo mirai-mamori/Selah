@@ -1,12 +1,9 @@
 use serde::Deserialize;
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
-use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{LazyLock, Mutex};
-use tauri::{Emitter, Manager};
+use tauri::Manager;
 
-const TOOLBAR_HEIGHT: f64 = 46.0;
-const AGENT_PANEL_WIDTH: f64 = 360.0;
 const BROWSER_BRIDGE_SCRIPT: &str = r#"
 (function () {
   if (window.__selahBrowserBridgeInstalled) return;
@@ -958,14 +955,12 @@ static BROWSER_WINDOW_LABELS: LazyLock<Mutex<HashSet<String>>> =
     LazyLock::new(|| Mutex::new(HashSet::new()));
 static BROWSER_WINDOW_TARGETS: LazyLock<Mutex<HashMap<String, String>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
+static BROWSER_WINDOW_OWNERS: LazyLock<Mutex<HashMap<String, String>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
 static BROWSER_WINDOW_TITLES: LazyLock<Mutex<HashMap<String, String>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 static BROWSER_WINDOW_KINDS: LazyLock<Mutex<HashMap<String, String>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
-static BROWSER_AGENT_PANELS: LazyLock<Mutex<HashSet<String>>> =
-    LazyLock::new(|| Mutex::new(HashSet::new()));
-static BROWSER_NEW_WINDOW_COUNTER: AtomicU32 = AtomicU32::new(0);
-
 #[derive(Debug, Clone, serde::Serialize, Deserialize)]
 pub struct BrowserWindowInfo {
     pub label: String,
@@ -989,29 +984,19 @@ pub fn browser_window_label_from_target(target: &str) -> String {
         .to_string()
 }
 
-pub fn browser_toolbar_label_from_target(target: &str) -> String {
-    format!("{}-tb", browser_window_label_from_target(target))
-}
-
 pub fn emit_browser_agent_status(app: &tauri::AppHandle, target: &str, active: bool, action: &str) {
-    let toolbar_label = browser_toolbar_label_from_target(target);
-    let _ = app.emit_to(
-        tauri::EventTarget::AnyLabel {
-            label: toolbar_label,
-        },
-        "browser-agent-status",
-        serde_json::json!({
-            "active": active,
-            "action": action,
-        }),
-    );
+    crate::document_tabs::emit_agent_status(app, target, active, action);
 }
 
-pub fn register_readable_window(app: &tauri::AppHandle, label: &str, target: &str) {
-    let Some(window) = app.get_window(label) else {
-        return;
-    };
-    if app.get_webview(target).is_none() {
+pub fn register_readable_child(
+    app: &tauri::AppHandle,
+    owner_label: &str,
+    label: &str,
+    target: &str,
+    title: &str,
+    kind: &str,
+) {
+    if app.get_window(owner_label).is_none() || app.get_webview(target).is_none() {
         return;
     }
     BROWSER_WINDOW_LABELS
@@ -1022,31 +1007,56 @@ pub fn register_readable_window(app: &tauri::AppHandle, label: &str, target: &st
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .insert(label.to_string(), target.to_string());
+    BROWSER_WINDOW_OWNERS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(label.to_string(), owner_label.to_string());
+    BROWSER_WINDOW_TITLES
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(label.to_string(), title.to_string());
     BROWSER_WINDOW_KINDS
         .lock()
         .unwrap_or_else(|e| e.into_inner())
-        .entry(label.to_string())
-        .or_insert_with(|| {
-            if label.contains("detail") || target.contains("detail") {
-                "detail".to_string()
-            } else {
-                "browser".to_string()
-            }
-        });
-    let app_resize = app.clone();
-    let owner_label_resize = label.to_string();
-    let win_for_scale = window.clone();
-    window.on_window_event(move |event| {
-        if let tauri::WindowEvent::Resized(phys_size) = event {
-            let scale = win_for_scale.scale_factor().unwrap_or(1.0);
-            resize_browser_children(
-                &app_resize,
-                &owner_label_resize,
-                phys_size.width as f64 / scale,
-                phys_size.height as f64 / scale,
-            );
-        }
-    });
+        .insert(label.to_string(), kind.to_string());
+}
+
+pub fn unregister_readable_label(label: &str) {
+    BROWSER_WINDOW_LABELS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(label);
+    BROWSER_WINDOW_TARGETS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(label);
+    BROWSER_WINDOW_OWNERS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(label);
+    BROWSER_WINDOW_TITLES
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(label);
+    BROWSER_WINDOW_KINDS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(label);
+}
+
+pub fn set_owner_active_target(owner_label: &str, target: &str, title: &str, kind: &str) {
+    BROWSER_WINDOW_TARGETS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(owner_label.to_string(), target.to_string());
+    BROWSER_WINDOW_TITLES
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(owner_label.to_string(), title.to_string());
+    BROWSER_WINDOW_KINDS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(owner_label.to_string(), kind.to_string());
 }
 
 fn browser_popup_title(url: &url::Url) -> String {
@@ -1064,211 +1074,8 @@ fn open_browser_popup_window(
     if scheme != "http" && scheme != "https" {
         return Err(format!("Unsupported popup URL scheme: {}", scheme));
     }
-    let id = BROWSER_NEW_WINDOW_COUNTER.fetch_add(1, Ordering::Relaxed);
-    let label = format!("ext-popup-{}", id);
     let title = browser_popup_title(&url);
-    let mut info = create_browser_window(
-        app,
-        &label,
-        tauri::WebviewUrl::External(url.clone()),
-        &title,
-        980.0,
-        700.0,
-        &[],
-    )?;
-    info.url = url.to_string();
-    if let Some(window) = app.get_window(&label) {
-        let _ = window.set_focus();
-    }
-    Ok(info)
-}
-
-fn browser_agent_panel_label(owner_label: &str) -> String {
-    format!("{}-agent", owner_label)
-}
-
-fn browser_owner_for_target(target: &str) -> String {
-    browser_window_label_from_target(target)
-}
-
-fn resize_browser_children(app: &tauri::AppHandle, owner_label: &str, width: f64, height: f64) {
-    let toolbar_label = format!("{}-tb", owner_label);
-    let content_label = BROWSER_WINDOW_TARGETS
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .get(owner_label)
-        .cloned()
-        .unwrap_or_else(|| format!("{}-ct", owner_label));
-    let panel_label = browser_agent_panel_label(owner_label);
-    let panel_open = BROWSER_AGENT_PANELS
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .contains(owner_label)
-        && app.get_webview(&panel_label).is_some();
-    let panel_width = if panel_open {
-        AGENT_PANEL_WIDTH.min((width * 0.42).max(300.0))
-    } else {
-        0.0
-    };
-    let content_width = (width - panel_width).max(260.0);
-
-    if let Some(tb) = app.get_webview(&toolbar_label) {
-        let _ = tb.set_size(tauri::Size::Logical(tauri::LogicalSize::new(
-            content_width,
-            TOOLBAR_HEIGHT,
-        )));
-    }
-    if let Some(ct) = app.get_webview(&content_label) {
-        let y = if content_label.ends_with("-ct") {
-            TOOLBAR_HEIGHT
-        } else {
-            0.0
-        };
-        let h = if content_label.ends_with("-ct") {
-            (height - TOOLBAR_HEIGHT).max(0.0)
-        } else {
-            height.max(0.0)
-        };
-        let _ = ct.set_size(tauri::Size::Logical(tauri::LogicalSize::new(
-            content_width,
-            h,
-        )));
-        let _ = ct.set_position(tauri::Position::Logical(tauri::LogicalPosition::new(
-            0.0, y,
-        )));
-    }
-    if panel_open {
-        if let Some(panel) = app.get_webview(&panel_label) {
-            let _ = panel.set_position(tauri::Position::Logical(tauri::LogicalPosition::new(
-                content_width,
-                0.0,
-            )));
-            let _ = panel.set_size(tauri::Size::Logical(tauri::LogicalSize::new(
-                panel_width,
-                height.max(0.0),
-            )));
-        }
-    }
-}
-
-pub fn open_agent_side_panel(
-    app: &tauri::AppHandle,
-    owner_label: Option<&str>,
-    target: Option<&str>,
-    title: Option<&str>,
-    kind: Option<&str>,
-) -> Result<(), String> {
-    let target = target.unwrap_or("").trim();
-    let owner = owner_label
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(str::to_string)
-        .unwrap_or_else(|| browser_owner_for_target(target));
-    let target = if target.is_empty() {
-        BROWSER_WINDOW_TARGETS
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .get(&owner)
-            .cloned()
-            .unwrap_or_else(|| owner.clone())
-    } else {
-        target.to_string()
-    };
-    let window = app
-        .get_window(&owner)
-        .ok_or_else(|| format!("ウィンドウが見つかりません: {}", owner))?;
-    if let Some(title) = title.map(str::trim).filter(|s| !s.is_empty()) {
-        BROWSER_WINDOW_TITLES
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .insert(owner.clone(), title.to_string());
-    }
-    if let Some(kind) = kind.map(str::trim).filter(|s| !s.is_empty()) {
-        BROWSER_WINDOW_KINDS
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .insert(owner.clone(), kind.to_string());
-    }
-    let panel_label = browser_agent_panel_label(&owner);
-    if app.get_webview(&panel_label).is_none() {
-        let mut panel_url = format!(
-            "agent-popup.html?embedded=1&owner={}&target={}",
-            urlencoding::encode(&owner),
-            urlencoding::encode(&target)
-        );
-        if let Some(title) = title.map(str::trim).filter(|s| !s.is_empty()) {
-            panel_url.push_str("&title=");
-            panel_url.push_str(&urlencoding::encode(title));
-        }
-        if let Some(kind) = kind.map(str::trim).filter(|s| !s.is_empty()) {
-            panel_url.push_str("&kind=");
-            panel_url.push_str(&urlencoding::encode(kind));
-        }
-        let panel_builder = tauri::webview::WebviewBuilder::new(
-            &panel_label,
-            tauri::WebviewUrl::App(panel_url.into()),
-        )
-        .auto_resize();
-        let size = window.inner_size().map_err(|e| e.to_string())?;
-        let scale = window.scale_factor().unwrap_or(1.0);
-        let width = size.width as f64 / scale;
-        let height = size.height as f64 / scale;
-        window
-            .add_child(
-                panel_builder,
-                tauri::Position::Logical(tauri::LogicalPosition::new(
-                    (width - AGENT_PANEL_WIDTH).max(260.0),
-                    0.0,
-                )),
-                tauri::Size::Logical(tauri::LogicalSize::new(
-                    AGENT_PANEL_WIDTH.min((width * 0.42).max(300.0)),
-                    height,
-                )),
-            )
-            .map_err(|e| format!("Agent パネル作成失敗: {}", e))?;
-    }
-    BROWSER_AGENT_PANELS
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .insert(owner.clone());
-    let size = window.inner_size().map_err(|e| e.to_string())?;
-    let scale = window.scale_factor().unwrap_or(1.0);
-    resize_browser_children(
-        app,
-        &owner,
-        size.width as f64 / scale,
-        size.height as f64 / scale,
-    );
-    Ok(())
-}
-
-pub fn close_agent_side_panel(app: &tauri::AppHandle, owner_label: &str) -> Result<(), String> {
-    let owner = owner_label.trim();
-    if owner.is_empty() {
-        return Err("owner_label is empty".into());
-    }
-    BROWSER_AGENT_PANELS
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .remove(owner);
-    let window = app
-        .get_window(owner)
-        .ok_or_else(|| format!("ウィンドウが見つかりません: {}", owner))?;
-    if let Some(panel) = app.get_webview(&browser_agent_panel_label(owner)) {
-        let _ = panel.set_position(tauri::Position::Logical(tauri::LogicalPosition::new(
-            50_000.0, 0.0,
-        )));
-        let _ = panel.set_size(tauri::Size::Logical(tauri::LogicalSize::new(0.0, 0.0)));
-    }
-    let size = window.inner_size().map_err(|e| e.to_string())?;
-    let scale = window.scale_factor().unwrap_or(1.0);
-    resize_browser_children(
-        app,
-        owner,
-        size.width as f64 / scale,
-        size.height as f64 / scale,
-    );
-    Ok(())
+    crate::document_tabs::open_external_tab(app, url.to_string(), Some(title))
 }
 
 pub struct BrowserAgentStatusGuard {
@@ -1428,9 +1235,7 @@ pub struct BrowserMouseSelftestReport {
     href: String,
 }
 
-/// Create a browser-style window with a native toolbar webview + content webview.
-/// The toolbar is a local HTML page with back/forward/reload/URL/open-in-browser.
-/// The content webview loads the external URL.
+/// Create a standalone content window used only by the browser mouse selftest.
 pub fn create_browser_window(
     app: &tauri::AppHandle,
     label: &str,
@@ -1440,7 +1245,6 @@ pub fn create_browser_window(
     height: f64,
     init_scripts: &[&str],
 ) -> Result<BrowserWindowInfo, String> {
-    let toolbar_label = format!("{}-tb", label);
     let content_label = format!("{}-ct", label);
 
     let builder = tauri::window::WindowBuilder::new(app, label)
@@ -1464,49 +1268,16 @@ pub fn create_browser_window(
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .insert(label.to_string(), content_label.clone());
+    BROWSER_WINDOW_OWNERS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(label.to_string(), label.to_string());
 
-    // --- Toolbar webview (local HTML) ---
-    let toolbar_url = format!(
-        "browser-toolbar.html?target={}",
-        urlencoding::encode(&content_label)
-    );
-    let toolbar_builder = tauri::webview::WebviewBuilder::new(
-        &toolbar_label,
-        tauri::WebviewUrl::App(toolbar_url.into()),
-    )
-    .auto_resize();
-
-    window
-        .add_child(
-            toolbar_builder,
-            tauri::Position::Logical(tauri::LogicalPosition::new(0.0, 0.0)),
-            tauri::Size::Logical(tauri::LogicalSize::new(width, TOOLBAR_HEIGHT)),
-        )
-        .map_err(|e| format!("ツールバー作成失敗: {}", e))?;
-
-    // --- Content webview ---
     let mut content_builder = tauri::webview::WebviewBuilder::new(&content_label, url)
         .initialization_script(BROWSER_BRIDGE_SCRIPT);
     for script in init_scripts {
         content_builder = content_builder.initialization_script(*script);
     }
-
-    // Emit URL changes to the toolbar
-    let app_for_event = app.clone();
-    let tb_label_event = toolbar_label.clone();
-    content_builder = content_builder.on_page_load(move |_webview, payload| {
-        use tauri::webview::PageLoadEvent;
-        if matches!(payload.event(), PageLoadEvent::Finished) {
-            let url_str = payload.url().to_string();
-            let _ = app_for_event.emit_to(
-                tauri::EventTarget::AnyLabel {
-                    label: tb_label_event.clone(),
-                },
-                "browser-url-changed",
-                &url_str,
-            );
-        }
-    });
 
     let app_for_new_window = app.clone();
     content_builder = content_builder.on_new_window(move |popup_url, _features| {
@@ -1527,23 +1298,10 @@ pub fn create_browser_window(
     window
         .add_child(
             content_builder,
-            tauri::Position::Logical(tauri::LogicalPosition::new(0.0, TOOLBAR_HEIGHT)),
-            tauri::Size::Logical(tauri::LogicalSize::new(width, height - TOOLBAR_HEIGHT)),
+            tauri::Position::Logical(tauri::LogicalPosition::new(0.0, 0.0)),
+            tauri::Size::Logical(tauri::LogicalSize::new(width, height)),
         )
         .map_err(|e| format!("コンテンツ作成失敗: {}", e))?;
-
-    // --- Handle window resize ---
-    let app_resize = app.clone();
-    let owner_label_resize = label.to_string();
-    let win_for_scale = window.clone();
-    window.on_window_event(move |event| {
-        if let tauri::WindowEvent::Resized(phys_size) = event {
-            let scale = win_for_scale.scale_factor().unwrap_or(1.0);
-            let w = phys_size.width as f64 / scale;
-            let h = phys_size.height as f64 / scale;
-            resize_browser_children(&app_resize, &owner_label_resize, w, h);
-        }
-    });
 
     Ok(BrowserWindowInfo {
         label: label.to_string(),
@@ -1578,6 +1336,21 @@ pub async fn browser_reload(app: tauri::AppHandle, target: String) -> Result<(),
 pub async fn browser_get_url(app: tauri::AppHandle, target: String) -> Result<String, String> {
     let wv = app.get_webview(&target).ok_or("Webview not found")?;
     wv.url().map(|u| u.to_string()).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub async fn browser_navigate(
+    app: tauri::AppHandle,
+    target: String,
+    url: String,
+) -> Result<(), String> {
+    let parsed: url::Url = url.parse().map_err(|e| format!("URL parse error: {}", e))?;
+    let scheme = parsed.scheme();
+    if scheme != "http" && scheme != "https" {
+        return Err(format!("Unsupported URL scheme: {}", scheme));
+    }
+    let wv = app.get_webview(&target).ok_or("Webview not found")?;
+    wv.navigate(parsed).map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -1643,7 +1416,7 @@ pub async fn browser_close(app: tauri::AppHandle, target: String) -> Result<Stri
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .remove(&label);
-    BROWSER_AGENT_PANELS
+    BROWSER_WINDOW_OWNERS
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .remove(&label);
@@ -1715,7 +1488,13 @@ pub fn list_browser_windows(app: &tauri::AppHandle) -> Vec<BrowserWindowInfo> {
                 .get(&label)
                 .cloned()
                 .unwrap_or_else(|| format!("{}-ct", &label));
-            app.get_window(&label)?;
+            let owner = BROWSER_WINDOW_OWNERS
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get(&label)
+                .cloned()
+                .unwrap_or_else(|| label.clone());
+            app.get_window(&owner)?;
             if app.get_webview(&target).is_none() {
                 return None;
             }

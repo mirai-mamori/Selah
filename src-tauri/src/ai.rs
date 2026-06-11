@@ -638,12 +638,6 @@ pub fn delete_local_model(app: tauri::AppHandle, model_id: String) -> Result<(),
     Ok(())
 }
 
-#[tauri::command]
-pub async fn request_ai_refresh(app: tauri::AppHandle) -> Result<(), String> {
-    log::info!("[ai] request_ai_refresh called, delegating to backend AI refresh");
-    crate::ai_refresh::backend_ai_refresh_now(app, true, None).await?;
-    Ok(())
-}
 
 #[tauri::command]
 pub async fn test_notification(
@@ -700,45 +694,3 @@ pub async fn debug_test_notification(title: String, body: String) -> Result<Stri
     }
 }
 
-#[tauri::command]
-pub async fn open_ai_result_window(
-    app: tauri::AppHandle,
-    result: String,
-    error: Option<String>,
-) -> Result<(), String> {
-    use tauri::Emitter;
-
-    let payload = serde_json::json!({
-        "result": result,
-        "error": error,
-    });
-
-    // If window already exists, just send new data and focus
-    if let Some(win) = app.get_webview_window("ai-result") {
-        let _ = win.emit_to("ai-result", "ai-result", &payload);
-        let _ = win.set_focus();
-        return Ok(());
-    }
-
-    let win = tauri::WebviewWindowBuilder::new(
-        &app,
-        "ai-result",
-        tauri::WebviewUrl::App("ai-result.html".into()),
-    )
-    .title("AI 選課分析")
-    .inner_size(520.0, 620.0)
-    .min_inner_size(400.0, 400.0)
-    .resizable(true)
-    .build()
-    .map_err(|e| format!("ウィンドウ作成失敗: {}", e))?;
-
-    // Wait for window to be ready, then emit data
-    let payload_clone = payload.clone();
-    let win_clone = win.clone();
-    tauri::async_runtime::spawn(async move {
-        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-        let _ = win_clone.emit_to("ai-result", "ai-result", &payload_clone);
-    });
-
-    Ok(())
-}

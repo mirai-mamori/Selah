@@ -5,9 +5,11 @@
   "windows": [
     "main",
     "agent-popup",
-    "*-agent",
     "login",
     "luna-login",
+    "document-tabs",
+    "document-tabs-strip",
+    "document-tabs-agent",
     "detail-*",
     "university-detail-*",
     "luna-web-*",
@@ -27,13 +29,17 @@
     "facility-rsv-tb",
     "facility-rsv-ct",
     "settings",
-    "downloads",
-    "ai-result",
     "md-reader-*",
     "mail-login",
     "gcal-login",
     "tray-popup",
     "ext-*"
+  ],
+  "webviews": [
+    "document-tabs-strip",
+    "document-tabs-agent",
+    "document-tab-*",
+    "md-reader-*-ct"
   ],
   "permissions": [
     "core:default",

@@ -13,7 +13,12 @@ pub(super) use links::classify_link;
 pub use model::{LunaAttachment, LunaDetailPage, LunaDetailSection};
 pub(crate) use notice_filter::is_blacklisted_system_notice_text;
 use notice_filter::sanitize_blacklisted_notice_body;
-pub(super) use quill::{extract_named_quill_text, extract_quill_rich_html};
+pub(super) use quill::{
+    extract_first_quill_rich_html,
+    extract_named_quill_payloads,
+    extract_named_quill_text,
+    extract_quill_rich_html,
+};
 
 fn normalize_detail_text(s: &str) -> String {
     s.split_whitespace().collect::<String>()

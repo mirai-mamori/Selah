@@ -823,7 +823,7 @@ fn markdown_payload_for_file(canonical: &std::path::Path, filename: &str) -> ser
 }
 
 fn queue_markdown_payload_emit(
-    win: tauri::WebviewWindow,
+    app: tauri::AppHandle,
     label: String,
     canonical: std::path::PathBuf,
     filename: String,
@@ -848,14 +848,24 @@ fn queue_markdown_payload_emit(
         if let Ok(mut map) = PENDING_MARKDOWN_PAYLOADS.lock() {
             map.insert(label.clone(), payload.clone());
         }
-        let _ = win.emit_to(&label, "markdown-content", &payload);
+        let _ = app.emit_to(
+            tauri::EventTarget::AnyLabel {
+                label: label.clone(),
+            },
+            "markdown-content",
+            &payload,
+        );
 
         let payload_clone = payload.clone();
         let label_clone = label.clone();
-        let win_clone = win.clone();
+        let app_clone = app.clone();
         tauri::async_runtime::spawn(async move {
             tokio::time::sleep(std::time::Duration::from_millis(1200)).await;
-            let _ = win_clone.emit_to(&label_clone, "markdown-content", &payload_clone);
+            let _ = app_clone.emit_to(
+                tauri::EventTarget::AnyLabel { label: label_clone },
+                "markdown-content",
+                &payload_clone,
+            );
         });
     });
 }
@@ -863,7 +873,6 @@ fn queue_markdown_payload_emit(
 /// Open (or focus) the in-app Markdown reader window for the given file.
 #[tauri::command]
 pub async fn open_markdown_file_window(app: tauri::AppHandle, path: String) -> Result<(), String> {
-    use tauri::Manager;
     let canonical = validate_downloads_path(&path)?;
     let meta = std::fs::metadata(&canonical).map_err(|e| format!("読み込み失敗: {}", e))?;
     if meta.len() > MARKDOWN_MAX_BYTES {
@@ -878,29 +887,13 @@ pub async fn open_markdown_file_window(app: tauri::AppHandle, path: String) -> R
         .to_string();
     let label = markdown_window_label(&canonical);
 
-    if let Some(win) = app.get_webview_window(&label) {
-        let _ = win.set_focus();
-        queue_markdown_payload_emit(win, label, canonical, filename);
-        return Ok(());
-    }
+    let source_path = canonical.to_string_lossy().to_string();
+    let tab =
+        crate::document_tabs::open_markdown_reader_tab(&app, label, filename.clone(), Some(source_path))?;
 
-    let win = tauri::WebviewWindowBuilder::new(
-        &app,
-        &label,
-        tauri::WebviewUrl::App("markdown-reader.html".into()),
-    )
-    .title(&filename)
-    // Wide enough for the 220px TOC + the document's full 760px max-width, so
-    // body text and embedded whiteboards render at their intended width.
-    .inner_size(1020.0, 770.0)
-    .min_inner_size(420.0, 360.0)
-    .resizable(true)
-    .build()
-    .map_err(|e| format!("ウィンドウ作成失敗: {}", e))?;
-
-    // Read and parse the file payload after the window is created so opening a
+    // Read and parse the file payload after the tab is created so opening a
     // large-but-supported note does not block the native window from appearing.
-    queue_markdown_payload_emit(win, label, canonical, filename);
+    queue_markdown_payload_emit(app, tab.target, canonical, filename);
 
     Ok(())
 }

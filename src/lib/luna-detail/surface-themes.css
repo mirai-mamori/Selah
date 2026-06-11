@@ -1,0 +1,249 @@
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) .luna-detail {
+      --detail-bg: #15161a;
+      --detail-surface: #1f2025;
+      --detail-card: rgba(255,255,255,0.065);
+      --detail-card-hover: rgba(255,255,255,0.095);
+      --detail-border: rgba(255,255,255,0.12);
+      --detail-border-soft: rgba(255,255,255,0.08);
+      --detail-text: #f5f5f7;
+      --detail-muted: #c7c7cc;
+      --detail-faint: #8e8e93;
+      --detail-accent: #fbbf24;
+      --detail-accent-contrast: #1d1d1f;
+      --detail-shadow: none;
+    }
+
+    :root:not([data-theme="light"]) body {
+      background: #15161a;
+      color: #f5f5f7;
+    }
+
+    :root:not([data-theme="light"]) .luna-detail {
+      background: var(--detail-bg);
+      color: var(--detail-text);
+    }
+
+    :root:not([data-theme="light"]) .chips span,
+    :root:not([data-theme="light"]) .item-card,
+    :root:not([data-theme="light"]) .material-card,
+    :root:not([data-theme="light"]) .task-card,
+    :root:not([data-theme="light"]) .attendance-card,
+    :root:not([data-theme="light"]) .body-section,
+    :root:not([data-theme="light"]) .question,
+    :root:not([data-theme="light"]) .post,
+    :root:not([data-theme="light"]) .thread-card,
+    :root:not([data-theme="light"]) .meta-table,
+    :root:not([data-theme="light"]) .attachments,
+    :root:not([data-theme="light"]) .lead {
+      background: rgba(255,255,255,0.06);
+      border-color: rgba(255,255,255,0.1);
+    }
+
+    :root:not([data-theme="light"]) .hero {
+      background: var(--detail-surface);
+      border-bottom-color: var(--detail-border-soft);
+    }
+
+    :root:not([data-theme="light"]) .hero-meta span {
+      background: transparent;
+      border: 0;
+    }
+
+    :root:not([data-theme="light"]) .hero-action.default {
+      background: rgba(251,191,36,0.11);
+      border-color: rgba(251,191,36,0.2);
+      color: #fbbf24;
+    }
+
+    :root:not([data-theme="light"]) .hero-action.syllabus {
+      background: rgba(251,191,36,0.16);
+      border-color: rgba(251,191,36,0.26);
+      color: #fbbf24;
+    }
+
+    :root:not([data-theme="light"]) .back-btn {
+      color: var(--detail-accent);
+    }
+
+    :root:not([data-theme="light"]) .back-btn:hover {
+      background: rgba(251,191,36,0.1);
+    }
+
+    :root:not([data-theme="light"]) .item-title,
+    :root:not([data-theme="light"]) h1,
+    :root:not([data-theme="light"]) h2,
+    :root:not([data-theme="light"]) .rich {
+      color: #f5f5f7;
+    }
+
+    :root:not([data-theme="light"]) .item-sub,
+    :root:not([data-theme="light"]) .hero-meta,
+    :root:not([data-theme="light"]) .course-label,
+    :root:not([data-theme="light"]) .eyebrow,
+    :root:not([data-theme="light"]) .task-main small,
+    :root:not([data-theme="light"]) .post-meta {
+      color: var(--detail-muted);
+    }
+
+    :root:not([data-theme="light"]) input,
+    :root:not([data-theme="light"]) textarea,
+    :root:not([data-theme="light"]) select,
+    :root:not([data-theme="light"]) .modal {
+      background: #24262b;
+      border-color: rgba(255,255,255,0.12);
+      color: #f5f5f7;
+    }
+  }
+
+  [data-theme="dark"] .luna-detail {
+    --detail-bg: #15161a;
+    --detail-surface: #1f2025;
+    --detail-card: rgba(255,255,255,0.065);
+    --detail-card-hover: rgba(255,255,255,0.095);
+    --detail-border: rgba(255,255,255,0.12);
+    --detail-border-soft: rgba(255,255,255,0.08);
+    --detail-text: #f5f5f7;
+    --detail-muted: #c7c7cc;
+    --detail-faint: #8e8e93;
+    --detail-accent: #fbbf24;
+    --detail-accent-contrast: #1d1d1f;
+    --detail-shadow: none;
+  }
+
+  [data-theme="dark"] body {
+    background: #15161a;
+    color: #f5f5f7;
+  }
+
+  [data-theme="dark"] .luna-detail {
+    background: var(--detail-bg);
+    color: var(--detail-text);
+  }
+
+  [data-theme="dark"] .chips span,
+  [data-theme="dark"] .item-card,
+  [data-theme="dark"] .material-card,
+  [data-theme="dark"] .task-card,
+  [data-theme="dark"] .attendance-card,
+  [data-theme="dark"] .body-section,
+  [data-theme="dark"] .question,
+  [data-theme="dark"] .post,
+  [data-theme="dark"] .thread-card,
+  [data-theme="dark"] .meta-table,
+  [data-theme="dark"] .attachments,
+  [data-theme="dark"] .lead {
+    background: rgba(255,255,255,0.06);
+    border-color: rgba(255,255,255,0.1);
+  }
+
+  [data-theme="dark"] .hero {
+    background: var(--detail-surface);
+    border-bottom-color: var(--detail-border-soft);
+  }
+
+  [data-theme="dark"] .hero-meta span {
+    background: transparent;
+    border: 0;
+  }
+
+  [data-theme="dark"] .hero-action.default {
+    background: rgba(251,191,36,0.11);
+    border-color: rgba(251,191,36,0.2);
+    color: #fbbf24;
+  }
+
+  [data-theme="dark"] .hero-action.syllabus {
+    background: rgba(251,191,36,0.16);
+    border-color: rgba(251,191,36,0.26);
+    color: #fbbf24;
+  }
+
+  [data-theme="dark"] .back-btn {
+    color: var(--detail-accent);
+  }
+
+  [data-theme="dark"] .back-btn:hover {
+    background: rgba(251,191,36,0.1);
+  }
+
+  [data-theme="dark"] .item-title,
+  [data-theme="dark"] h1,
+  [data-theme="dark"] h2,
+  [data-theme="dark"] .rich {
+    color: #f5f5f7;
+  }
+
+  [data-theme="dark"] .item-sub,
+  [data-theme="dark"] .hero-meta,
+  [data-theme="dark"] .course-label,
+  [data-theme="dark"] .eyebrow,
+  [data-theme="dark"] .task-main small,
+  [data-theme="dark"] .post-meta {
+    color: var(--detail-muted);
+  }
+
+  [data-theme="dark"] input,
+  [data-theme="dark"] textarea,
+  [data-theme="dark"] select,
+  [data-theme="dark"] .modal {
+    background: #24262b;
+    border-color: rgba(255,255,255,0.12);
+    color: #f5f5f7;
+  }
+
+  @media (max-width: 760px) {
+    .hero,
+    .section.two {
+      display: grid;
+      grid-template-columns: 1fr;
+    }
+
+    .hero {
+      padding: 20px 16px 22px;
+      margin-bottom: 20px;
+    }
+
+    .section {
+      margin-inline: 14px;
+      margin-bottom: 20px;
+    }
+
+    .hero h1,
+    .detail-wrap > h1 {
+      font-size: 24px;
+    }
+
+    .hero-meta .teacher {
+      padding-left: 0;
+      border-left: 0;
+    }
+
+    .meta-table div {
+      grid-template-columns: 1fr;
+    }
+  }
+
+  /* Unified responsive logic for every item grid: 3 columns by default, 2 on
+     narrower panes, 1 on very narrow ones. The same breakpoints are mirrored on
+     .note-grid in CourseSupplemental so all detail grids behave identically. */
+  @media (max-width: 640px) {
+    .grid,
+    .materials {
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+    }
+
+    /* Task (2-col) and attendance (3-col) collapse straight to one column at the
+       same breakpoint where the other grids drop to two. */
+    .task-list,
+    .attendance-list {
+      grid-template-columns: 1fr;
+    }
+  }
+
+  @media (max-width: 420px) {
+    .grid,
+    .materials {
+      grid-template-columns: 1fr;
+    }
+  }

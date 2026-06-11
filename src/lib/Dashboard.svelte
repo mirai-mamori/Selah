@@ -7,6 +7,7 @@
   import Icon from "./Icon.svelte";
   import type { IconName } from "./Icon.svelte";
   import Titlebar from "./Titlebar.svelte";
+  import CopilotDock from "./CopilotDock.svelte";
   import HomePage from "./views/HomePage.svelte";
   import type { MailMessage, KwicPortalHome } from "./api";
   import { updateAiReadiness } from "./api";
@@ -194,6 +195,7 @@
         </button>
       {/each}
     </div>
+    <CopilotDock />
   </nav>
 
   <div class="main-area">

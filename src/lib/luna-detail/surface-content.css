@@ -1,0 +1,1102 @@
+  .item-card,
+  .material-card,
+  .task-card,
+  .attendance-card,
+  .body-section,
+  .question,
+  .post,
+  .thread-card {
+    border: 0.5px solid rgba(0,0,0,0.08);
+    border-radius: 8px;
+    background: var(--detail-card);
+    box-shadow: var(--detail-shadow);
+    transition: background 0.15s ease, border-color 0.15s ease, box-shadow 0.15s ease, transform 0.1s ease;
+  }
+
+  .item-card,
+  .task-card,
+  .thread-card {
+    width: 100%;
+    text-align: left;
+    color: inherit;
+  }
+
+  .item-card {
+    min-height: 80px;
+    display: flex;
+    flex-direction: column;
+    justify-content: space-between;
+    gap: 10px;
+    padding: 14px 16px;
+    border-color: transparent;
+    transition: background 0.15s ease, border-color 0.15s ease, box-shadow 0.15s ease, transform 0.1s ease;
+  }
+
+  .item-card:hover,
+  .material-card:hover,
+  .task-card:hover,
+  .attendance-card:hover,
+  .thread-card:hover {
+    background: var(--detail-card-hover);
+    border-color: var(--detail-border-soft);
+    box-shadow: 0 2px 8px rgba(0,0,0,0.055);
+  }
+
+  .item-card:active,
+  .task-card:active,
+  .hero-action:active {
+    transform: scale(0.99);
+  }
+
+  .item-row {
+    min-width: 0;
+    display: flex;
+    align-items: flex-start;
+    gap: 10px;
+  }
+
+  .item-title {
+    color: #111827;
+    min-width: 0;
+    flex: 1 1 auto;
+    display: -webkit-box;
+    -webkit-line-clamp: 2;
+    -webkit-box-orient: vertical;
+    overflow: hidden;
+    word-break: break-word;
+    font-size: 14px;
+    font-weight: 800;
+    line-height: 1.35;
+  }
+
+  .item-sub {
+    color: var(--detail-faint);
+    font-size: 12px;
+    font-weight: 650;
+  }
+
+  .item-badge {
+    flex: 0 0 auto;
+    border-radius: 999px;
+    padding: 2px 8px;
+    font-size: 11px;
+    font-weight: 820;
+    line-height: 1.35;
+  }
+
+  .item-badge.new {
+    background: rgba(255,59,48,0.1);
+    color: #ff3b30;
+  }
+
+  .materials {
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+  }
+
+  .material-card {
+    display: flex;
+    flex-direction: column;
+    border-color: transparent;
+    cursor: pointer;
+  }
+
+  .material-card:focus-visible {
+    outline: 2px solid color-mix(in srgb, var(--detail-accent, #173b68) 45%, transparent);
+    outline-offset: -2px;
+  }
+
+  /* Clamp the description to exactly 4 lines. Flatten every child to one inline
+     flow with a uniform line-height so the cut always lands on a line boundary
+     (never a half-cut line), regardless of the source HTML tags. */
+  .material-card .rich.compact {
+    display: -webkit-box;
+    -webkit-line-clamp: 4;
+    -webkit-box-orient: vertical;
+    overflow: hidden;
+    line-height: 1.7;
+    max-height: calc(1.7em * 4);
+    padding-bottom: 0;
+  }
+
+  .material-card .rich.compact * {
+    display: inline !important;
+    margin: 0 !important;
+    padding: 0 !important;
+    line-height: 1.7 !important;
+  }
+
+  .material-card .rich.compact br {
+    display: none !important;
+  }
+
+  /* Keep the file area anchored to the bottom while preserving a single row. */
+  .material-card .file-list {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) auto;
+    align-items: center;
+    margin-top: auto;
+  }
+
+  .material-card .rich.compact + .file-list {
+    padding-top: 10px;
+  }
+
+  .material-card .file-list > button:first-child {
+    width: 100%;
+    min-width: 0;
+  }
+
+  /* Short hint shown when a material has more than one downloadable file. */
+  .more-files {
+    flex: 0 0 auto;
+    min-height: 30px;
+    border: 0;
+    border-radius: 7px;
+    background: transparent;
+    color: var(--detail-muted);
+    padding: 4px 8px;
+    font-size: 12px;
+    font-weight: 700;
+    white-space: nowrap;
+    justify-self: end;
+    text-align: left;
+    cursor: pointer;
+  }
+
+  .more-files:hover {
+    background: var(--detail-card-hover);
+    color: var(--detail-text);
+  }
+
+  .card-hit {
+    width: 100%;
+    border: 0;
+    background: transparent;
+    display: flex;
+    justify-content: space-between;
+    gap: 8px;
+    padding: 14px 16px 10px;
+    text-align: left;
+  }
+
+  /* Fixed close button for a split child pane (top-right of the pane). */
+  .split-pane-close {
+    position: fixed;
+    top: 10px;
+    right: 10px;
+    z-index: 60;
+    width: 28px;
+    height: 28px;
+    flex: 0 0 auto;
+    margin: 0;
+    padding: 0;
+    box-sizing: border-box;
+    display: grid;
+    place-items: center;
+    border: 0.5px solid var(--detail-border);
+    border-radius: 999px;
+    background: var(--detail-surface);
+    color: var(--detail-muted);
+    box-shadow: 0 2px 10px rgba(0,0,0,0.14);
+    cursor: pointer;
+    transition: background 0.15s ease, color 0.15s ease, transform 0.1s ease;
+  }
+
+  .split-pane-close:hover {
+    background: var(--detail-card-hover);
+    color: var(--detail-text);
+  }
+
+  .split-pane-close:active {
+    transform: scale(0.94);
+  }
+
+  .rich {
+    color: #30343b;
+    font-size: 14px;
+    line-height: 1.72;
+  }
+
+  .rich.compact {
+    max-height: 72px;
+    overflow: hidden;
+    padding: 0 16px 10px;
+    color: var(--detail-muted);
+    font-size: 12.5px;
+  }
+
+  .rich p {
+    margin: 0 0 0.75em;
+  }
+
+  .rich a {
+    color: #1d4ed8;
+    text-decoration: underline;
+    word-break: break-all;
+  }
+
+  .rich ul,
+  .rich ol {
+    margin: 0.35em 0 0.75em 1.25em;
+    padding: 0;
+  }
+
+  .rich li {
+    margin: 0.15em 0;
+  }
+
+  .rich code {
+    border-radius: 4px;
+    background: var(--detail-hover);
+    padding: 1px 4px;
+    font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+    font-size: 0.92em;
+  }
+
+  .rich pre {
+    margin: 0.6em 0;
+    overflow: auto;
+    border-radius: 8px;
+    background: var(--detail-hover);
+    padding: 9px 10px;
+    white-space: pre-wrap;
+    scrollbar-width: none;
+    -ms-overflow-style: none;
+  }
+
+  .rich pre::-webkit-scrollbar {
+    width: 0;
+    height: 0;
+  }
+
+  .rich pre code {
+    background: transparent;
+    padding: 0;
+  }
+
+  .rich blockquote {
+    margin: 0.6em 0;
+    border-left: 3px solid var(--detail-border);
+    color: var(--detail-muted);
+    padding-left: 10px;
+  }
+
+  .rich img {
+    max-width: 100%;
+    height: auto;
+    display: block;
+    margin: 10px 0;
+    border-radius: 8px;
+    cursor: zoom-in;
+  }
+
+  .rich table {
+    width: 100%;
+    margin: 0.6em 0;
+    border-collapse: collapse;
+    font-size: 0.95em;
+  }
+
+  .rich th,
+  .rich td {
+    border: 0.5px solid var(--detail-border);
+    padding: 6px 8px;
+    text-align: left;
+  }
+
+  .file-list,
+  .attachments,
+  .attachments.inline {
+    display: flex;
+    flex-direction: column;
+    gap: 7px;
+  }
+
+  .file-list {
+    padding: 0 16px 14px;
+  }
+
+  .file-list button,
+  .attachments button {
+    min-height: 34px;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    border: 0.5px solid rgba(0,0,0,0.08);
+    border-radius: 8px;
+    background: rgba(248,250,252,0.88);
+    color: #334155;
+    padding: 7px 10px;
+    text-align: left;
+    font-size: 12.5px;
+  }
+
+  .file-list button span,
+  .attachments button span {
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+
+  .file-list button span {
+    white-space: nowrap;
+  }
+
+  .attachment-download-row {
+    min-width: 0;
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) auto;
+    gap: 5px;
+  }
+
+  .attachments .attachment-download-row .attachment-main {
+    width: 100%;
+  }
+
+  .attachments .attachment-download-row .attachment-redownload {
+    width: 34px;
+    justify-content: center;
+    padding: 7px;
+    color: var(--detail-muted);
+    background: transparent;
+  }
+
+  .attachments .attachment-download-row .attachment-redownload:hover {
+    color: var(--detail-accent);
+    background: var(--detail-hover);
+  }
+
+  .task-list,
+  .attendance-list,
+  .post-list,
+  .thread-list,
+  .question-list {
+    display: grid;
+    gap: 10px;
+  }
+
+  /* Task lists (課題 / テスト) show two columns; collapses to one at the shared
+     narrow breakpoint (see surface-themes.css). */
+  .task-list {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 10px 14px;
+  }
+
+  /* Attendance shows three columns, collapsing straight to one when narrow. */
+  .attendance-list {
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+    gap: 10px 14px;
+  }
+
+  /* Task cards replicate the main TODO view: a vertical urgency bar with a fill,
+     a two-line title, a meta sub-line and an urgency-tinted remaining pill. */
+  .task-card {
+    display: flex;
+    align-items: center;
+    gap: 14px;
+    min-height: 56px;
+    padding: 12px 14px;
+    border-color: transparent;
+    width: 100%;
+    color: inherit;
+    text-align: left;
+  }
+
+  .task-card .urgency-bar {
+    position: relative;
+    flex-shrink: 0;
+    width: 4px;
+    height: 36px;
+    align-self: stretch;
+    margin: 2px 0;
+    border-radius: 2px;
+    background: rgba(120,120,128,0.18);
+    overflow: hidden;
+  }
+
+  .task-card .urgency-fill {
+    position: absolute;
+    left: 0;
+    bottom: 0;
+    width: 100%;
+    border-radius: 2px;
+    background: #94a3b8;
+  }
+
+  .task-card .urgency-bar.overdue { background: rgba(255,59,48,0.16); }
+  .task-card .urgency-bar.overdue .urgency-fill { background: #ff3b30; }
+  .task-card .urgency-bar.critical { background: rgba(255,149,0,0.16); }
+  .task-card .urgency-bar.critical .urgency-fill { background: #ff9500; }
+  .task-card .urgency-bar.soon { background: rgba(245,197,66,0.18); }
+  .task-card .urgency-bar.soon .urgency-fill { background: #e6b800; }
+  .task-card .urgency-bar.done .urgency-fill { background: #16a34a; }
+
+  .task-card .task-body {
+    flex: 1 1 auto;
+    min-width: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+  }
+
+  .task-card .task-name {
+    color: var(--detail-text);
+    font-size: 14px;
+    font-weight: 700;
+    line-height: 1.35;
+    display: -webkit-box;
+    -webkit-line-clamp: 2;
+    -webkit-box-orient: vertical;
+    overflow: hidden;
+  }
+
+  .task-card .task-sub {
+    display: flex;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: 5px;
+    color: var(--detail-muted);
+    font-size: 12px;
+  }
+
+  .task-card .task-sep {
+    flex-shrink: 0;
+    width: 2px;
+    height: 2px;
+    border-radius: 50%;
+    background: currentColor;
+    opacity: 0.5;
+  }
+
+  .task-card .task-date {
+    white-space: nowrap;
+    font-variant-numeric: tabular-nums;
+  }
+
+  .task-card .remaining {
+    flex-shrink: 0;
+    border-radius: 6px;
+    background: rgba(120,120,128,0.14);
+    color: var(--detail-muted);
+    padding: 2px 8px;
+    font-size: 11px;
+    font-weight: 700;
+    white-space: nowrap;
+    font-variant-numeric: tabular-nums;
+  }
+
+  .task-card .remaining.overdue { background: rgba(255,59,48,0.1); color: #ff3b30; }
+  .task-card .remaining.critical { background: rgba(255,149,0,0.1); color: #ff9500; }
+  .task-card .remaining.soon { background: rgba(245,197,66,0.14); color: #b8900a; }
+
+  .task-card .task-ext {
+    flex-shrink: 0;
+    display: inline-grid;
+    place-items: center;
+    color: var(--detail-faint);
+  }
+
+  .badge.pending {
+    background: #f97316;
+    color: #fff;
+  }
+
+  .badge.done {
+    background: #16a34a;
+    color: #fff;
+  }
+
+  .badge.open {
+    background: #2563eb;
+    color: #fff;
+  }
+
+  /* Attendance states */
+  .badge.present {
+    background: #16a34a;
+    color: #fff;
+  }
+
+  .badge.absent {
+    background: #dc2626;
+    color: #fff;
+  }
+
+  .badge.late {
+    background: #eab308;
+    color: #1d1d1f;
+  }
+
+  .badge.inactive {
+    background: rgba(120,120,128,0.16);
+    color: var(--detail-muted);
+  }
+
+  .attendance-card {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    gap: 14px;
+    min-height: 58px;
+    padding: 10px 14px 10px 18px;
+    border-color: transparent;
+  }
+
+  .attendance-card div:first-child {
+    display: grid;
+    gap: 3px;
+    min-width: 0;
+  }
+
+  .attendance-card strong {
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    font-size: 14px;
+  }
+
+  .attendance-card span {
+    color: var(--detail-faint);
+    font-size: 12px;
+  }
+
+  .attendance-right {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+  }
+
+  .badge {
+    border-radius: 999px;
+    background: #e5e7eb;
+    color: #475569;
+    padding: 4px 8px;
+    font-size: 11px;
+    font-weight: 800;
+    white-space: nowrap;
+  }
+
+  .detail-wrap {
+    max-width: 980px;
+    margin: 24px auto 0;
+    padding: 0 clamp(18px, 3vw, 34px);
+    display: grid;
+    gap: 14px;
+  }
+
+  .body-section {
+    padding: 16px;
+  }
+
+  .body-section h2 {
+    margin-bottom: 8px;
+  }
+
+  .meta-table {
+    display: grid;
+    border: 0.5px solid rgba(0,0,0,0.08);
+    border-radius: 8px;
+    overflow: hidden;
+    background: rgba(255,255,255,0.82);
+  }
+
+  .meta-table > div {
+    display: grid;
+    grid-template-columns: minmax(120px, 220px) minmax(0, 1fr);
+    border-top: 0.5px solid rgba(0,0,0,0.06);
+  }
+
+  .meta-table > div:first-child {
+    border-top: 0;
+  }
+
+  .meta-table > div > span,
+  .meta-table > div > strong,
+  .meta-table > div > .kgc-field-value {
+    padding: 10px 12px;
+    font-size: 13px;
+  }
+
+  .meta-table .kgc-field-value {
+    min-width: 0;
+    color: var(--detail-text);
+    font-size: 13px;
+    line-height: 1.5;
+  }
+
+  .meta-table .kgc-field-value p {
+    margin: 0 0 0.65em;
+  }
+
+  .meta-table .kgc-field-value p:last-child {
+    margin-bottom: 0;
+  }
+
+  .meta-table .kgc-field-value.table-value {
+    overflow-x: auto;
+    scrollbar-width: none;
+    -ms-overflow-style: none;
+  }
+
+  .meta-table .kgc-field-value.table-value::-webkit-scrollbar {
+    width: 0;
+    height: 0;
+  }
+
+  .meta-table .kgc-field-value.table-value table {
+    min-width: 560px;
+    margin: 0;
+  }
+
+  .meta-table span {
+    color: #64748b;
+    background: rgba(248,250,252,0.86);
+  }
+
+  .meta-table .std-year-row > span,
+  .meta-table .std-year-row > strong,
+  .meta-table .std-year-row > .kgc-field-value {
+    background: rgba(23,59,104,0.06);
+  }
+
+  .year-range-badge,
+  .new-inline {
+    display: inline-flex;
+    align-items: center;
+    min-height: 18px;
+    margin-left: 8px;
+    padding: 1px 7px;
+    border-radius: 999px;
+    background: rgba(23,59,104,0.1);
+    color: #173b68;
+    font-size: 11px;
+    font-style: normal;
+    font-weight: 800;
+    white-space: nowrap;
+  }
+
+  .new-inline {
+    background: rgba(249,115,22,0.12);
+    color: #c2410c;
+  }
+
+  .attachments button small {
+    display: block;
+    margin-top: 2px;
+    color: #64748b;
+    font-size: 11px;
+    font-weight: 600;
+  }
+
+  .attachments {
+    padding: 16px;
+    border: 0.5px solid rgba(0,0,0,0.08);
+    border-radius: 8px;
+    background: rgba(255,255,255,0.82);
+  }
+
+  .attachments.inline {
+    padding: 8px 0 0;
+    border: 0;
+    background: transparent;
+  }
+
+  .link-badge {
+    display: inline-flex;
+    align-items: center;
+    margin-right: 7px;
+    border-radius: 5px;
+    background: color-mix(in srgb, var(--detail-accent) 10%, transparent);
+    color: var(--detail-accent);
+    padding: 2px 5px;
+    font-size: 10px;
+    font-weight: 800;
+  }
+
+  .empty-state {
+    min-height: 72px;
+    display: grid;
+    place-items: center;
+    border: 0.5px dashed var(--detail-border);
+    border-radius: 8px;
+    color: var(--detail-faint);
+    padding: 16px;
+    text-align: center;
+    font-size: 13px;
+  }
+
+  .error-status {
+    color: var(--detail-danger, #dc2626);
+  }
+
+  .lead {
+    padding: 14px 16px;
+    border: 0.5px solid rgba(0,0,0,0.08);
+    border-radius: 8px;
+    background: rgba(255,255,255,0.82);
+  }
+
+  .question,
+  .post {
+    padding: 14px;
+  }
+
+  .question-head,
+  .post-meta {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin-bottom: 8px;
+    color: #64748b;
+    font-size: 12px;
+  }
+
+  .post-list-header {
+    border-bottom: 0.5px solid var(--detail-border);
+    color: var(--detail-muted);
+    padding-bottom: 7px;
+    font-size: 13px;
+    font-weight: 750;
+  }
+
+  .question-head span,
+  .post-meta em {
+    color: #173b68;
+    font-weight: 800;
+    font-style: normal;
+  }
+
+  .post-meta em {
+    border-radius: 4px;
+    background: var(--detail-accent);
+    color: var(--detail-accent-contrast);
+    padding: 1px 5px;
+    font-size: 10px;
+  }
+
+  .post-meta em.teacher {
+    background: #16a34a;
+  }
+
+  .question-head strong {
+    color: #b42318;
+    font-size: 11px;
+  }
+
+  input,
+  textarea,
+  select {
+    width: 100%;
+    border: 0.5px solid rgba(0,0,0,0.12);
+    border-radius: 8px;
+    background: #fff;
+    color: inherit;
+    padding: 9px 10px;
+    box-sizing: border-box;
+    resize: vertical;
+  }
+
+  .option-list {
+    display: grid;
+    gap: 8px;
+    margin-top: 10px;
+  }
+
+  .option-list label {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    font-size: 13px;
+  }
+
+  .option-list input {
+    width: auto;
+  }
+
+  .submit-row,
+  .modal-actions {
+    display: flex;
+    align-items: center;
+    justify-content: flex-end;
+    gap: 10px;
+  }
+
+  .submit-row > span {
+    min-width: 0;
+    margin-right: auto;
+    color: var(--detail-muted);
+    font-size: 12px;
+    font-weight: 650;
+  }
+
+  .thread-card {
+    display: grid;
+    gap: 6px;
+    padding: 12px;
+  }
+
+  .thread-card span,
+  .thread-card small {
+    color: #64748b;
+  }
+
+  .back-btn {
+    justify-self: start;
+    min-height: 30px;
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    border: 0;
+    border-radius: 7px;
+    background: transparent;
+    color: #173b68;
+    padding: 0 8px 0 5px;
+    font-size: 12px;
+    font-weight: 800;
+  }
+
+  .back-btn:hover {
+    background: rgba(23,59,104,0.07);
+  }
+
+  .post-self {
+    border-color: rgba(37,99,235,0.18);
+    background: rgba(239,246,255,0.85);
+  }
+
+  .post-teacher {
+    border-color: rgba(180,83,9,0.18);
+  }
+
+  .toast {
+    position: fixed;
+    left: 50%;
+    bottom: 20px;
+    transform: translateX(-50%);
+    border-radius: 999px;
+    background: rgba(17,24,39,0.92);
+    color: #fff;
+    padding: 9px 14px;
+    font-size: 12px;
+    font-weight: 750;
+    box-shadow: 0 8px 24px rgba(0,0,0,0.18);
+  }
+
+  .modal-backdrop {
+    position: fixed;
+    inset: 0;
+    display: grid;
+    place-items: center;
+    background: rgba(15,23,42,0.28);
+  }
+
+  .modal {
+    width: min(420px, calc(100vw - 32px));
+    display: grid;
+    gap: 10px;
+    border-radius: 12px;
+    background: #fff;
+    box-shadow: 0 20px 60px rgba(0,0,0,0.22);
+    padding: 18px;
+  }
+
+  .modal h2,
+  .modal p {
+    margin: 0;
+  }
+
+  .modal-error {
+    color: #b42318;
+    font-size: 12px;
+  }
+
+  .attendance-modal-backdrop {
+    z-index: 1000;
+    padding: 24px;
+    background: rgba(0,0,0,0.4);
+    backdrop-filter: blur(6px);
+    -webkit-backdrop-filter: blur(6px);
+    box-sizing: border-box;
+  }
+
+  .attendance-modal {
+    /* Block (not the generic .modal grid): an implicit auto-sized grid column
+       was growing past the fixed width on long course names / timestamps and
+       getting clipped by overflow:hidden. */
+    display: block;
+    width: min(380px, calc(100vw - 32px));
+    overflow: hidden;
+    border: 0.5px solid var(--detail-border);
+    border-radius: 18px;
+    background: var(--detail-surface);
+    padding: 0;
+    box-sizing: border-box;
+  }
+
+  .attendance-modal-header {
+    display: flex;
+    align-items: flex-start;
+    justify-content: space-between;
+    gap: 12px;
+    padding: 16px 18px 0;
+  }
+
+  .attendance-modal-titles {
+    min-width: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+  }
+
+  .attendance-modal-header h2 {
+    color: var(--detail-text);
+    font-size: 16px;
+    font-weight: 800;
+    line-height: 1.3;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    display: -webkit-box;
+    -webkit-line-clamp: 2;
+    -webkit-box-orient: vertical;
+  }
+
+  .attendance-modal-course {
+    font-size: 12px;
+    font-weight: 600;
+    color: var(--detail-muted);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .attendance-modal-close {
+    width: 26px;
+    height: 26px;
+    flex: 0 0 auto;
+    display: grid;
+    place-items: center;
+    border: 0;
+    border-radius: 50%;
+    background: color-mix(in srgb, var(--detail-text) 6%, transparent);
+    color: var(--detail-muted);
+    padding: 0;
+  }
+
+  .attendance-modal-close:hover:not(:disabled) {
+    background: color-mix(in srgb, var(--detail-text) 11%, transparent);
+    color: var(--detail-text);
+  }
+
+  .attendance-modal-close:disabled {
+    opacity: 0.45;
+    cursor: default;
+  }
+
+  .attendance-modal-meta {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    margin: 12px 18px 0;
+    padding: 10px 12px;
+    border-radius: 10px;
+    background: color-mix(in srgb, var(--detail-text) 4%, transparent);
+    font-size: 12px;
+  }
+
+  .attendance-modal-meta div {
+    display: flex;
+    gap: 8px;
+  }
+
+  .attendance-modal-meta span {
+    min-width: 70px;
+    flex: 0 0 auto;
+    color: var(--detail-faint);
+    font-weight: 700;
+  }
+
+  .attendance-modal-meta strong {
+    min-width: 0;
+    color: var(--detail-muted);
+    font-weight: 600;
+    overflow-wrap: anywhere;
+  }
+
+  .attendance-modal-body {
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+    padding: 14px 18px 0;
+  }
+
+  .attendance-field {
+    display: grid;
+    gap: 5px;
+  }
+
+  .attendance-field-label {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+    color: var(--detail-muted);
+    font-size: 12px;
+    font-weight: 700;
+  }
+
+  .attendance-required {
+    border-radius: 4px;
+    background: rgba(180,35,24,0.1);
+    color: #b42318;
+    padding: 1px 5px;
+    font-size: 10px;
+    font-weight: 800;
+  }
+
+  .attendance-char-count {
+    color: var(--detail-faint);
+    font-size: 11px;
+    font-weight: 600;
+  }
+
+  .attendance-field input,
+  .attendance-field textarea {
+    width: 100%;
+    border: 0.5px solid color-mix(in srgb, var(--detail-text) 16%, transparent);
+    border-radius: 10px;
+    background: color-mix(in srgb, var(--detail-text) 4%, transparent);
+    color: var(--detail-text);
+    padding: 8px 12px;
+    box-sizing: border-box;
+    outline: none;
+    font-size: 13px;
+  }
+
+  .attendance-field textarea {
+    min-height: 76px;
+    resize: none;
+  }
+
+  .attendance-field input:focus,
+  .attendance-field textarea:focus {
+    border-color: var(--detail-accent);
+    box-shadow: 0 0 0 3px color-mix(in srgb, var(--detail-accent) 11%, transparent);
+  }
+
+  .attendance-field input.error {
+    border-color: #b42318;
+  }
+
+  .attendance-field input::placeholder,
+  .attendance-field textarea::placeholder {
+    color: var(--detail-faint);
+  }
+
+  .attendance-modal .modal-error {
+    margin: 9px 18px 0;
+  }
+
+  .attendance-modal .modal-actions {
+    padding: 14px 18px 18px;
+  }

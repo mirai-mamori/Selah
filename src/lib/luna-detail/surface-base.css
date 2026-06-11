@@ -1,0 +1,314 @@
+html,
+  body {
+    height: 100%;
+    margin: 0;
+    overflow: hidden;
+    background: #f5f6f8;
+  }
+
+  body {
+    color: #1d1d1f;
+    font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Helvetica Neue", "Noto Sans JP", sans-serif;
+    -webkit-font-smoothing: antialiased;
+  }
+
+  .luna-detail {
+    --detail-bg: #f4f5f7;
+    --detail-surface: #ffffff;
+    --detail-card: rgba(255,255,255,0.92);
+    --detail-card-hover: #ffffff;
+    --detail-border: rgba(0,0,0,0.075);
+    --detail-border-soft: rgba(0,0,0,0.055);
+    --detail-text: #1d1d1f;
+    --detail-muted: #686e78;
+    --detail-faint: #a3a7ae;
+    --detail-accent: #173b68;
+    --detail-accent-contrast: #ffffff;
+    --detail-shadow: 0 1px 2px rgba(0,0,0,0.035);
+    height: 100vh;
+    overflow: auto;
+    background: var(--detail-bg);
+    color: var(--detail-text);
+    padding: 0 0 42px;
+    box-sizing: border-box;
+    scrollbar-width: none;
+    -ms-overflow-style: none;
+  }
+
+  .luna-detail::-webkit-scrollbar {
+    width: 0;
+    height: 0;
+  }
+
+  button,
+  input,
+  textarea,
+  select {
+    font: inherit;
+  }
+
+  button {
+    cursor: pointer;
+  }
+
+  .state {
+    min-height: 70vh;
+    display: grid;
+    place-items: center;
+    align-content: center;
+    gap: 12px;
+    color: #6b7280;
+    font-size: 13px;
+  }
+
+  .state.small {
+    min-height: 120px;
+  }
+
+  .error-state {
+    color: #b42318;
+  }
+
+  .spinner {
+    width: 22px;
+    height: 22px;
+    border: 2px solid rgba(23,59,104,0.14);
+    border-top-color: #173b68;
+    border-radius: 50%;
+    animation: spin 0.8s linear infinite;
+  }
+
+  @keyframes spin {
+    to { transform: rotate(360deg); }
+  }
+
+  .hero,
+  .section,
+  .detail-wrap {
+    max-width: none;
+  }
+
+  .hero {
+    display: grid;
+    gap: 15px;
+    margin: 0 0 28px;
+    padding: 26px clamp(24px, 3.2vw, 44px) 30px;
+    background: var(--detail-surface);
+    border-bottom: 0.5px solid var(--detail-border-soft);
+  }
+
+  .attendance-title {
+    margin: 0 0 14px;
+    padding: 12px calc(clamp(24px, 3.2vw, 44px) + 2px);
+    font-size: 14px;
+    font-weight: 700;
+    line-height: 1.3;
+    color: var(--detail-text);
+    border-bottom: 0.5px solid var(--detail-border-soft);
+  }
+
+  .eyebrow,
+  .course-label {
+    color: var(--detail-muted);
+    font-size: 12px;
+    font-weight: 750;
+    letter-spacing: 0;
+  }
+
+  .hero-main {
+    min-width: 0;
+    max-width: 1260px;
+  }
+
+  .hero h1,
+  .detail-wrap > h1 {
+    margin: 0 0 10px;
+    font-size: clamp(24px, 2.45vw, 34px);
+    line-height: 1.16;
+    letter-spacing: 0;
+    font-weight: 820;
+  }
+
+  h2 {
+    margin: 0;
+    font-size: 17px;
+    font-weight: 800;
+    letter-spacing: 0;
+  }
+
+  .hero-meta,
+  .chips {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 6px 13px;
+    color: var(--detail-muted);
+    font-size: 13px;
+    min-width: 0;
+  }
+
+  .hero-meta span,
+  .chips span {
+    min-width: 0;
+    background: transparent;
+    border: 0;
+    padding: 0;
+  }
+
+  .hero-meta .semester {
+    color: var(--detail-faint);
+    font-size: 16px;
+    font-weight: 780;
+  }
+
+  .hero-meta .teacher {
+    display: inline-flex;
+    align-items: center;
+    gap: 7px;
+    padding-left: 15px;
+    border-left: 0.5px solid var(--detail-border);
+    color: var(--detail-muted);
+    font-size: 15px;
+    font-weight: 720;
+  }
+
+  .hero-meta .teacher svg {
+    color: var(--detail-faint);
+  }
+
+  .hero-meta .staff {
+    flex-basis: 100%;
+    display: inline-flex;
+    gap: 9px;
+    color: var(--detail-muted);
+    font-size: 13px;
+    line-height: 1.45;
+  }
+
+  .hero-meta .staff strong {
+    color: var(--detail-faint);
+    font-size: 12px;
+    font-weight: 820;
+  }
+
+  .hero-actions,
+  .submit-row,
+  .modal-actions {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 8px 10px;
+  }
+
+  .hero-action,
+  .small-link,
+  .attendance-right button,
+  .primary-btn,
+  .modal-actions button {
+    min-height: 30px;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    gap: 6px;
+    border: 0.5px solid transparent;
+    border-radius: 8px;
+    background: rgba(255,255,255,0.72);
+    color: var(--detail-accent);
+    padding: 0 11px;
+    font-size: 12px;
+    font-weight: 750;
+  }
+
+  .hero-action {
+    min-height: 34px;
+    padding: 0 15px;
+    color: #fff;
+    font-size: 14px;
+    box-shadow: none;
+  }
+
+  .hero-action.zoom {
+    background: #2d8cff;
+    border-color: #2d8cff;
+  }
+
+  .hero-action.panopto {
+    background: #00a651;
+    border-color: #00a651;
+  }
+
+  .hero-action.syllabus {
+    background: #173b68;
+    border-color: #173b68;
+    color: #ffd60a;
+  }
+
+  .hero-action.default {
+    background: rgba(23,59,104,0.08);
+    border-color: rgba(23,59,104,0.12);
+    color: var(--detail-accent);
+  }
+
+  .hero-action:hover,
+  .small-link:hover,
+  .attendance-right button:hover {
+    filter: brightness(0.97);
+  }
+
+  .primary-btn {
+    background: var(--detail-accent);
+    border-color: var(--detail-accent);
+    color: var(--detail-accent-contrast);
+  }
+
+  .primary-btn:disabled {
+    opacity: 0.45;
+    cursor: default;
+  }
+
+  .section-head {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin: 0 0 11px;
+    padding: 0 2px;
+  }
+
+  .section {
+    margin: 0 clamp(24px, 3.2vw, 44px) 24px;
+  }
+
+  .section-head span {
+    min-width: 0;
+    height: auto;
+    display: inline;
+    border-radius: 0;
+    background: transparent;
+    color: var(--detail-faint);
+    font-size: 16px;
+    font-weight: 800;
+  }
+
+  .small-link {
+    margin-left: auto;
+    min-height: 28px;
+    background: rgba(120,120,128,0.1);
+    border-color: transparent;
+    color: var(--detail-muted);
+  }
+
+  .section.two {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 18px;
+  }
+
+  .section.two > div {
+    min-width: 0;
+  }
+
+  .grid {
+    display: grid;
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+    gap: 10px 14px;
+  }

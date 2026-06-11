@@ -615,7 +615,6 @@
           {/if}
         </span>
       {/if}
-      <span class="header-id">{$authState.studentId}</span>
     </div>
     <div class="header-line2">
       {#if isAiSuggestion}
@@ -914,6 +913,7 @@
   }
 
   .header-line1 {
+    position: relative;
     display: flex;
     align-items: center;
     gap: 10px;
@@ -995,11 +995,6 @@
     color: var(--text-tertiary);
   }
 
-  .header-id {
-    font-size: 11px;
-    color: var(--text-tertiary);
-    margin-left: auto;
-  }
 
   /* ===== Notifications ===== */
   .notif-cards {

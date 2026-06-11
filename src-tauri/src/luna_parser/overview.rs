@@ -369,6 +369,16 @@ fn parse_discussion_file_attachments(
 ///   - Thread list: each thread has title, description (Quill: threadContentsN), author, date
 pub fn parse_luna_discussion_thread(html: &str) -> LunaDiscussionThread {
     let doc = Html::parse_document(html);
+    let thread_quill_payloads: Vec<String> = super::detail::extract_named_quill_payloads(html)
+        .into_iter()
+        .filter_map(|(name, payload)| {
+            let suffix = name.strip_prefix("threadContents")?;
+            if suffix.is_empty() || !suffix.chars().all(|ch| ch.is_ascii_digit()) {
+                return None;
+            }
+            Some(payload)
+        })
+        .collect();
 
     let course_name = try_selectors_text(
         &doc,
@@ -425,7 +435,15 @@ pub fn parse_luna_discussion_thread(html: &str) -> LunaDiscussionThread {
 
     // Themetop page: threads are in result-list divs with .theme-top-thread-* classes
     {
-        for (idx, row) in doc.select(&SEL_THEME_TOP).enumerate() {
+        // LUNA renders the thread list twice for responsive layouts (a desktop
+        // copy and an .sp-* mobile copy), and the broadened row selector matches
+        // both. Track which threads we've already emitted so each appears once.
+        // `kept` indexes into the (un-duplicated) Quill payloads, so it must only
+        // advance for rows we actually push — otherwise skipped duplicate rows
+        // would shift every later thread's body by one.
+        let mut seen_keys: Vec<String> = Vec::new();
+        let mut kept = 0usize;
+        for row in doc.select(&SEL_THEME_TOP) {
             let thread_title = row
                 .select(&SEL_THREAD_TITLE)
                 .next()
@@ -464,9 +482,89 @@ pub fn parse_luna_discussion_thread(html: &str) -> LunaDiscussionThread {
                 })
                 .unwrap_or_default();
 
-            // Extract thread content from threadContentsN Quill
-            let quill_name = format!("threadContents{}", idx);
-            let content = extract_named_quill_text(html, &quill_name).unwrap_or_default();
+            // Key on the unique threadId (viewthread id); fall back to the
+            // visible fields when a row carries no onclick.
+            let dedup_key = if !thread_id.is_empty() {
+                thread_id.clone()
+            } else {
+                format!("{}|{}|{}", thread_title, author, date)
+            };
+            if !dedup_key.is_empty() && seen_keys.iter().any(|k| k == &dedup_key) {
+                continue;
+            }
+
+            // Some themetop variants no longer keep stable threadContents{idx}
+            // variable names. Prefer the row-local Quill payload when present,
+            // then the positional payload list (document order, correct for both
+            // 0-based and 1-based threadContents{N} naming), then the legacy
+            // index-named lookups.
+            let row_html = row.html();
+            let quill_name = format!("threadContents{}", kept);
+            let content = super::detail::extract_first_quill_rich_html(&row_html)
+                .or_else(|| thread_quill_payloads.get(kept).cloned())
+                .or_else(|| extract_named_quill_text(html, &quill_name))
+                .or_else(|| extract_named_quill_text(html, &format!("threadContents{}", kept + 1)))
+                .unwrap_or_default();
+
+            if !thread_title.is_empty() || !content.is_empty() || !author.is_empty() {
+                if !dedup_key.is_empty() {
+                    seen_keys.push(dedup_key);
+                }
+                kept += 1;
+                posts.push(LunaDiscussionPost {
+                    title: thread_title,
+                    author,
+                    date,
+                    content,
+                    status,
+                    thread_id,
+                    attachments: Vec::new(),
+                });
+            }
+        }
+    }
+
+    if posts.is_empty() {
+        let titles: Vec<_> = doc.select(&SEL_THREAD_TITLE).collect();
+        let authors: Vec<String> = doc
+            .select(&SEL_THREAD_AUTHOR)
+            .map(|e| e.text().collect::<String>().trim().to_string())
+            .collect();
+        let dates: Vec<String> = doc
+            .select(&SEL_THREAD_DATE)
+            .map(|e| e.text().collect::<String>().trim().to_string())
+            .collect();
+        let statuses: Vec<String> = doc
+            .select(&SEL_THREAD_STATUS)
+            .map(|e| {
+                e.text()
+                    .map(|t| t.trim())
+                    .filter(|t| !t.is_empty())
+                    .collect::<Vec<_>>()
+                    .join(" / ")
+            })
+            .collect();
+
+        for (idx, title_el) in titles.iter().enumerate() {
+            let thread_title = title_el.text().collect::<String>().trim().to_string();
+            let thread_id = title_el
+                .value()
+                .attr("onclick")
+                .and_then(|onclick| {
+                    let start = onclick.find('(')? + 1;
+                    let end = onclick.find(')')?;
+                    Some(onclick[start..end].trim().to_string())
+                })
+                .unwrap_or_default();
+            let content = thread_quill_payloads
+                .get(idx)
+                .cloned()
+                .or_else(|| extract_named_quill_text(html, &format!("threadContents{}", idx)))
+                .or_else(|| extract_named_quill_text(html, &format!("threadContents{}", idx + 1)))
+                .unwrap_or_default();
+            let author = authors.get(idx).cloned().unwrap_or_default();
+            let date = dates.get(idx).cloned().unwrap_or_default();
+            let status = statuses.get(idx).cloned().unwrap_or_default();
 
             if !thread_title.is_empty() || !content.is_empty() || !author.is_empty() {
                 posts.push(LunaDiscussionPost {

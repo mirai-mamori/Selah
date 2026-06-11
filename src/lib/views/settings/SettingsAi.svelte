@@ -3,6 +3,7 @@
   import { listen } from "@tauri-apps/api/event";
   import { onMount, onDestroy } from "svelte";
   import { getAiConfig, isDemoActive, updateAiReadiness } from "../../api";
+  import { detectiveEnabled } from "../../stores";
   import CapabilityMatrix from "../../onboarding/CapabilityMatrix.svelte";
 
   interface LocalModel {
@@ -953,6 +954,28 @@
 
 {/if}
 
+<div class="card-label">AI 推理ゲーム</div>
+<div class="card">
+  <div class="row">
+    <span class="row-label">機能</span>
+    <div class="row-input">
+      <select
+        value={$detectiveEnabled ? "true" : "false"}
+        onchange={(e) => detectiveEnabled.set((e.currentTarget as HTMLSelectElement).value === "true")}
+      >
+        <option value="true">有効</option>
+        <option value="false">無効</option>
+      </select>
+      <div class="hint">
+        ホーム画面右上に「なるほど」の入口が表示され、AI で講義ノートからケースを生成します。初回生成は時間がかかります。
+        {#if $detectiveEnabled && aiEnabled !== "true"}
+          <br /><span class="detective-na">AI 機能が無効のため、ケース生成は実行できません。先に上の「AI 機能」を有効化してください。</span>
+        {/if}
+      </div>
+    </div>
+  </div>
+</div>
+
 <div class="card-label">Agent 音声ショートカット</div>
 <div class="card">
   <div class="row">
@@ -1212,6 +1235,10 @@
   .action-row .hint { margin-top: 0; }
   .action-row .hint.ok { color: var(--green, #34c759); }
   .action-row .hint.ng { color: var(--red); }
+
+  .detective-ok { color: color-mix(in srgb, var(--accent) 80%, transparent); }
+  .detective-na { color: var(--red); font-weight: 600; }
+
 
   .key-row { display: flex; align-items: center; gap: 6px; }
   .key-row input { flex: 1; }

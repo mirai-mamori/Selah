@@ -7,7 +7,6 @@ use serde::Serialize;
 use std::sync::LazyLock;
 #[cfg(debug_assertions)]
 use std::time::Instant;
-use tauri::Manager;
 use tauri::State;
 
 use crate::parser;
@@ -305,40 +304,19 @@ pub async fn fetch_course_detail(
 #[tauri::command]
 pub async fn open_detail_window(
     app: tauri::AppHandle,
+    webview: tauri::Webview,
     path: String,
     course_name: String,
+    split: Option<bool>,
 ) -> Result<(), String> {
-    use std::sync::atomic::{AtomicU32, Ordering};
-    static COUNTER: AtomicU32 = AtomicU32::new(0);
-
-    // Cap concurrent detail windows to prevent resource exhaustion
-    let existing = app
-        .webview_windows()
-        .keys()
-        .filter(|k| k.starts_with("detail-"))
-        .count();
-    if existing >= 10 {
-        return Err(config::TOO_MANY_WINDOWS_MSG.into());
-    }
-
-    let id = COUNTER.fetch_add(1, Ordering::Relaxed);
-    let label = format!("detail-{}", id);
-
     let encoded_path = urlencoding::encode(&path);
     let encoded_name = urlencoding::encode(&course_name);
-    let url_str = format!(
-        "university-detail.html?mode=kgc&path={}&name={}",
-        encoded_path, encoded_name
-    );
-
-    tauri::WebviewWindowBuilder::new(&app, &label, tauri::WebviewUrl::App(url_str.into()))
-        .initialization_script(crate::webview_toolbar::browser_bridge_script())
-        .title(&course_name)
-        .inner_size(480.0, 560.0)
-        .resizable(true)
-        .build()
-        .map_err(|e| format!("ウィンドウ作成失敗: {}", e))?;
-    crate::webview_toolbar::register_readable_window(&app, &label, &label);
+    let params = format!("mode=kgc&path={}&name={}", encoded_path, encoded_name);
+    if split.unwrap_or(false) {
+        crate::document_tabs::open_child_detail(&app, params, course_name, webview.label())?;
+    } else {
+        crate::document_tabs::open_university_detail_tab(&app, params, course_name)?;
+    }
 
     Ok(())
 }

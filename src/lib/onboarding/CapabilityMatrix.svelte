@@ -1,6 +1,7 @@
 <script lang="ts">
   import { onMount, onDestroy } from "svelte";
-  import { activeTab } from "../stores";
+  import { get } from "svelte/store";
+  import { activeTab, detectiveEnabled } from "../stores";
   import { reopenOnboarding } from "./onboardingState";
   import { getAiReadinessLabel, isSttReady } from "./onboardingChecks";
   import { listen } from "@tauri-apps/api/event";
@@ -17,6 +18,7 @@
   let chips = $state<Chip[]>([]);
   let loading = $state(true);
   let unlisten: (() => void) | null = null;
+  let unsubscribeDetective: (() => void) | null = null;
 
   async function compute() {
     const [{ ready: aiReady, note: aiNote }, sttReady] = await Promise.all([
@@ -29,6 +31,15 @@
     const liveStatus: Status = sttReady ? "ok" : "warn";
     const liveTitle = sttReady ? "利用可能" : "STT モデル未ダウンロード";
 
+    const detEnabled = get(detectiveEnabled);
+    const detReady = aiReady && detEnabled;
+    const detStatus: Status = detReady ? "ok" : "warn";
+    const detTitle = !detEnabled
+      ? "無効化中（設定で有効化）"
+      : !aiReady
+        ? `AI 機能が無効のため利用不可（${aiNote}）`
+        : "利用可能";
+
     chips = [
       { key: "agent", label: "Agent", status: aiStatus, title: aiTitle,
         run: () => aiReady ? activeTab.set("agent") : reopenOnboarding() },
@@ -40,17 +51,22 @@
         run: () => aiReady ? activeTab.set("timetable") : reopenOnboarding() },
       { key: "live", label: "LIVE 文字起こし", status: liveStatus, title: liveTitle,
         run: () => liveStatus === "ok" ? activeTab.set("live") : reopenOnboarding() },
+      { key: "detective", label: "AI 推理ゲーム", status: detStatus, title: detTitle,
+        run: () => detReady ? activeTab.set("detective") : reopenOnboarding() },
     ];
     loading = false;
   }
 
   onMount(async () => {
     void compute();
+    // Re-compute when the detective toggle changes (subscribe fires once
+    // immediately too — harmless, just re-renders with same state).
+    unsubscribeDetective = detectiveEnabled.subscribe(() => { void compute(); });
     try {
       unlisten = await listen("ai-config-changed", () => { void compute(); });
     } catch { /* ignore */ }
   });
-  onDestroy(() => { unlisten?.(); });
+  onDestroy(() => { unlisten?.(); unsubscribeDetective?.(); });
 </script>
 
 <div class="card-label">AI 機能の状態</div>

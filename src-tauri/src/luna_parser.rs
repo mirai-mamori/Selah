@@ -94,7 +94,7 @@ sel!(SEL_HIDDEN_INPUT, "input[type='hidden']");
 // ── Discussion selectors ──
 sel!(
     SEL_THEME_TOP,
-    "#themeTopList .result-list.sp-contents-hidden"
+    "#themeTopList .result-list, #themeTopList .contents-result-list"
 );
 sel!(SEL_THREAD_TITLE, ".theme-top-thread-title.link-txt");
 sel!(SEL_THREAD_AUTHOR, ".theme-top-thread-author");
@@ -810,6 +810,153 @@ mod tests {
             .iter()
             .any(|(k, v)| k == "scanStatus" && v == "1"));
     }
+
+        #[test]
+        fn test_parse_discussion_thread_falls_back_to_row_local_quill_payload() {
+                let html = r#"
+                        <div class="course-title-txt">日本語教育センター 51001004 日本語I 4</div>
+                        <div class="contents-title-txt">掲示板 テーマトップ</div>
+                        <div id="themeTopList">
+                            <div class="result-list sp-contents-hidden">
+                                <div class="theme-top-thread-title link-txt" onclick="viewthread(56777);">主題文（１）</div>
+                                <div class="theme-top-thread-author">榎本 可奈子</div>
+                                <div class="theme-top-thread-createdate">2026/05/27 16:05</div>
+                                <div class="theme-top-thread-postzyoukyou">未読0件 / 既読13件 / 投稿数1件</div>
+                                <script>
+                                    _QuillUtil.threadContents1.setJsonData("{\"ops\":[{\"insert\":\"ここには何も書かないでください。\\n\"}]}", 'reference');
+                                </script>
+                            </div>
+                        </div>
+                "#;
+
+                let result = parse_luna_discussion_thread(html);
+                assert_eq!(result.posts.len(), 1);
+                assert_eq!(result.posts[0].thread_id, "56777");
+                assert_eq!(result.posts[0].title, "主題文（１）");
+                assert!(result.posts[0]
+                        .content
+                        .contains("ここには何も書かないでください。"));
+        }
+
+        #[test]
+        fn test_parse_discussion_thread_uses_global_one_based_quill_payloads() {
+                let html = r#"
+                        <div class="course-title-txt">日本語教育センター 51001004 日本語I 4</div>
+                        <div class="contents-title-txt">掲示板 テーマトップ</div>
+                        <div id="themeTopList">
+                            <div class="result-list sp-contents-hidden">
+                                <div class="theme-top-thread-title link-txt" onclick="viewthread(56777);">主題文（１）</div>
+                                <div class="theme-top-thread-author">榎本 可奈子</div>
+                                <div class="theme-top-thread-createdate">2026/05/27 16:05</div>
+                                <div class="theme-top-thread-postzyoukyou">未読0件 / 既読13件 / 投稿数1件</div>
+                            </div>
+                        </div>
+                        <script>
+                            _QuillUtil.threadContents1.setJsonData("{\"ops\":[{\"insert\":\"テキストｐ60\\n\"}]}", 'reference');
+                        </script>
+                "#;
+
+                let result = parse_luna_discussion_thread(html);
+                assert_eq!(result.posts.len(), 1);
+                assert_eq!(result.posts[0].title, "主題文（１）");
+                assert!(result.posts[0].content.contains("テキストｐ60"));
+        }
+
+        #[test]
+        fn test_parse_discussion_thread_falls_back_when_row_container_differs() {
+                let html = r#"
+                        <div class="course-title-txt">国際学部 34134000 社会言語学基礎</div>
+                        <div class="contents-title-txt">掲示板 テーマトップ</div>
+                        <div id="themeTopList">
+                            <div class="thread-entry-alt">
+                                <div class="theme-top-thread-title link-txt" onclick="viewthread(59001);">第3回投稿課題</div>
+                                <div class="theme-top-thread-author">田中 花子</div>
+                                <div class="theme-top-thread-createdate">2026/06/08 15:40</div>
+                                <div class="theme-top-thread-postzyoukyou">未読0件 / 既読0件 / 投稿数1件</div>
+                            </div>
+                        </div>
+                        <script>
+                            _QuillUtil.threadContents1.setJsonData("{\"ops\":[{\"insert\":\"ある方（Yes）: 具体例を書いてください。\\n\"}]}", 'reference');
+                        </script>
+                "#;
+
+                let result = parse_luna_discussion_thread(html);
+                assert_eq!(result.posts.len(), 1);
+                assert_eq!(result.posts[0].thread_id, "59001");
+                assert_eq!(result.posts[0].author, "田中 花子");
+                assert!(result.posts[0]
+                        .content
+                        .contains("具体例を書いてください。"));
+        }
+
+        #[test]
+        fn test_parse_discussion_thread_maps_one_based_quill_payloads_per_row() {
+                // Multiple threads whose Quill variables are numbered from 1.
+                // Each subtopic must render its own body, not the previous row's.
+                let html = r#"
+                        <div class="contents-title-txt">掲示板 テーマトップ</div>
+                        <div id="themeTopList">
+                            <div class="result-list sp-contents-hidden">
+                                <div class="theme-top-thread-title link-txt" onclick="viewthread(101);">スレッドＡ</div>
+                                <div class="theme-top-thread-author">榎本 可奈子</div>
+                            </div>
+                            <div class="result-list sp-contents-hidden">
+                                <div class="theme-top-thread-title link-txt" onclick="viewthread(102);">スレッドＢ</div>
+                                <div class="theme-top-thread-author">田中 花子</div>
+                            </div>
+                        </div>
+                        <script>
+                            _QuillUtil.threadContents1.setJsonData("{\"ops\":[{\"insert\":\"これはスレッドＡの本文です。\\n\"}]}", 'reference');
+                            _QuillUtil.threadContents2.setJsonData("{\"ops\":[{\"insert\":\"これはスレッドＢの本文です。\\n\"}]}", 'reference');
+                        </script>
+                "#;
+
+                let result = parse_luna_discussion_thread(html);
+                assert_eq!(result.posts.len(), 2);
+                assert_eq!(result.posts[0].title, "スレッドＡ");
+                assert!(result.posts[0].content.contains("スレッドＡの本文"));
+                assert_eq!(result.posts[1].title, "スレッドＢ");
+                assert!(result.posts[1].content.contains("スレッドＢの本文"));
+        }
+
+        #[test]
+        fn test_parse_discussion_thread_dedupes_responsive_list_copies() {
+                // LUNA emits the same threads twice for responsive layouts. The
+                // broadened row selector matches both copies, so each thread must
+                // still be emitted once, with its own (non-shifted) body.
+                let html = r#"
+                        <div class="contents-title-txt">掲示板 テーマトップ</div>
+                        <div id="themeTopList">
+                            <div class="result-list sp-contents-hidden">
+                                <div class="theme-top-thread-title link-txt" onclick="viewthread(201);">スレッド甲</div>
+                                <div class="theme-top-thread-author">榎本 可奈子</div>
+                            </div>
+                            <div class="result-list sp-contents-hidden">
+                                <div class="theme-top-thread-title link-txt" onclick="viewthread(202);">スレッド乙</div>
+                                <div class="theme-top-thread-author">田中 花子</div>
+                            </div>
+                            <div class="contents-result-list">
+                                <div class="theme-top-thread-title link-txt" onclick="viewthread(201);">スレッド甲</div>
+                                <div class="theme-top-thread-author">榎本 可奈子</div>
+                            </div>
+                            <div class="contents-result-list">
+                                <div class="theme-top-thread-title link-txt" onclick="viewthread(202);">スレッド乙</div>
+                                <div class="theme-top-thread-author">田中 花子</div>
+                            </div>
+                        </div>
+                        <script>
+                            _QuillUtil.threadContents1.setJsonData("{\"ops\":[{\"insert\":\"甲の本文\\n\"}]}", 'reference');
+                            _QuillUtil.threadContents2.setJsonData("{\"ops\":[{\"insert\":\"乙の本文\\n\"}]}", 'reference');
+                        </script>
+                "#;
+
+                let result = parse_luna_discussion_thread(html);
+                assert_eq!(result.posts.len(), 2);
+                assert_eq!(result.posts[0].thread_id, "201");
+                assert!(result.posts[0].content.contains("甲の本文"));
+                assert_eq!(result.posts[1].thread_id, "202");
+                assert!(result.posts[1].content.contains("乙の本文"));
+        }
 
     #[test]
     fn test_parse_announcement_detail_blacklists_system_notice_body() {
