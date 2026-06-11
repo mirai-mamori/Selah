@@ -329,7 +329,7 @@
   }
 
   .file-error {
-    color: #b42318;
+    color: var(--detail-danger, #b42318);
     font-size: 12px;
     font-weight: 650;
   }

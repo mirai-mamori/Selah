@@ -43,6 +43,24 @@
   --border: rgba(0, 0, 0, 0.06);
   --border-strong: rgba(0, 0, 0, 0.12);
   --shadow-sm: 0 1px 3px rgba(0, 0, 0, 0.04), 0 0 0.5px rgba(0, 0, 0, 0.06);
+
+  /* Detail-page (luna/kwic/kgc) tokens. These were never defined, so the detail
+     components fell back to light literals and broke dark mode. Light values
+     here match those old fallbacks (light mode unchanged); dark overrides live
+     in the dark blocks below. text/accent/shadow reference theme tokens so they
+     adapt automatically. */
+  --detail-text: var(--text-primary);
+  --detail-muted: #64748b;
+  --detail-faint: #64748b;
+  --detail-surface: #ffffff;
+  --detail-card: rgba(255, 255, 255, 0.92);
+  --detail-border: rgba(0, 0, 0, 0.1);
+  --detail-shadow: var(--shadow-sm);
+  --detail-accent: var(--accent);
+  --detail-accent-contrast: #ffffff;
+  --detail-warn: #9a3412;
+  --detail-danger: #b42318;
+
   --shadow-md: 0 2px 12px rgba(0, 0, 0, 0.06), 0 0 0.5px rgba(0, 0, 0, 0.08);
   --shadow-lg: 0 8px 40px rgba(0, 0, 0, 0.08), 0 0 1px rgba(0, 0, 0, 0.06);
   --shadow-card: 0 0.5px 0 rgba(0, 0, 0, 0.04);
@@ -93,6 +111,16 @@
     --border: rgba(255, 255, 255, 0.06);
     --border-strong: rgba(255, 255, 255, 0.12);
     --shadow-sm: 0 1px 3px rgba(0, 0, 0, 0.3);
+
+    --detail-muted: #9aa4b2;
+    --detail-faint: #6b7280;
+    --detail-surface: #2c2c2e;
+    --detail-card: rgba(58, 58, 60, 0.6);
+    --detail-border: rgba(255, 255, 255, 0.1);
+    --detail-accent-contrast: #1b2d5b;
+    --detail-warn: #fdba74;
+    --detail-danger: #ff6b6b;
+
     --shadow-md: 0 2px 12px rgba(0, 0, 0, 0.3), 0 0 0.5px rgba(0, 0, 0, 0.4);
     --shadow-lg: 0 8px 40px rgba(0, 0, 0, 0.4), 0 0 1px rgba(0, 0, 0, 0.3);
     --shadow-card: 0 0.5px 0 rgba(0, 0, 0, 0.25);
@@ -140,6 +168,16 @@
   --border: rgba(255, 255, 255, 0.06);
   --border-strong: rgba(255, 255, 255, 0.12);
   --shadow-sm: 0 1px 3px rgba(0, 0, 0, 0.3);
+
+  --detail-muted: #9aa4b2;
+  --detail-faint: #6b7280;
+  --detail-surface: #2c2c2e;
+  --detail-card: rgba(58, 58, 60, 0.6);
+  --detail-border: rgba(255, 255, 255, 0.1);
+  --detail-accent-contrast: #1b2d5b;
+  --detail-warn: #fdba74;
+  --detail-danger: #ff6b6b;
+
   --shadow-md: 0 2px 12px rgba(0, 0, 0, 0.3), 0 0 0.5px rgba(0, 0, 0, 0.4);
   --shadow-lg: 0 8px 40px rgba(0, 0, 0, 0.4), 0 0 1px rgba(0, 0, 0, 0.3);
   --shadow-card: 0 0.5px 0 rgba(0, 0, 0, 0.25);

@@ -6,6 +6,7 @@
   import selahLogoUrl from "../assets/logo.png";
   import Icon, { type IconName } from "./Icon.svelte";
   import { listBookmarks, toggleBookmark } from "./bookmarks";
+  import { tabFaviconUrl } from "./documentTabs";
 
   interface DocumentTabControl {
     id: string;
@@ -68,6 +69,7 @@
   let appThemeUnlisten: (() => void) | null = null;
   let bookmarksUnlisten: (() => void) | null = null;
   let refreshTimer: number | null = null;
+  let visibilityHandler: (() => void) | null = null;
   let copyTimer: number | null = null;
   let dragStart: { x: number; y: number } | null = null;
   let draggingWindow = false;
@@ -109,16 +111,6 @@
 
   // ── Favicons ──
   let faviconFailed = $state<Set<string>>(new Set());
-
-  function faviconFor(url: string): string {
-    try {
-      const host = new URL(url).hostname;
-      if (!host) return "";
-      return `https://www.google.com/s2/favicons?sz=64&domain=${encodeURIComponent(host)}`;
-    } catch {
-      return "";
-    }
-  }
 
   function onFaviconError(src: string): void {
     if (!src || faviconFailed.has(src)) return;
@@ -565,9 +557,17 @@
     bookmarksUnlisten = await listen("bookmarks-changed", () => refreshBookmarkIds());
     await refreshTabs();
     agentOpen = await invoke<boolean>("document_tabs_agent_is_open").catch(() => false);
+    // document-tabs-changed drives real-time updates (new/close/activate/reorder/
+    // loading all emit it); this slow poll is only a safety net for any dropped
+    // event, so it can run infrequently instead of hammering IPC every ~1s.
+    // Skip the IPC entirely while the window is hidden/minimized to save power —
+    // live events keep `tabs` current, and refreshTabs runs again once visible.
     refreshTimer = window.setInterval(() => {
+      if (document.hidden) return;
       void refreshTabs();
-    }, 1200);
+    }, 3000);
+    visibilityHandler = () => { if (!document.hidden) void refreshTabs(); };
+    document.addEventListener("visibilitychange", visibilityHandler);
   });
 
   onDestroy(() => {
@@ -579,6 +579,7 @@
     bookmarksUnlisten?.();
     if (refreshTimer !== null) window.clearInterval(refreshTimer);
     if (copyTimer !== null) window.clearTimeout(copyTimer);
+    if (visibilityHandler) document.removeEventListener("visibilitychange", visibilityHandler);
   });
 </script>
 
@@ -605,6 +606,7 @@
         <Icon name="house" size={15} />
       </button>
       {#each tabs as tab, i (tab.id)}
+        {@const fav = tab.type === "browser" ? tabFaviconUrl(tab.url) : ""}
         <div
           class="tab"
           class:active={tab.active}
@@ -630,8 +632,8 @@
             <span class="tab-spinner" aria-hidden="true"></span>
           {:else if tab.type === "detective"}
             <img class="favicon det-favicon" src="/naruhodo.png" alt="" aria-hidden="true" draggable="false" />
-          {:else if tab.type === "browser" && faviconFor(tab.url) && !faviconFailed.has(faviconFor(tab.url))}
-            <img class="favicon" src={faviconFor(tab.url)} alt="" aria-hidden="true" draggable="false" onerror={() => onFaviconError(faviconFor(tab.url))} />
+          {:else if fav && !faviconFailed.has(fav)}
+            <img class="favicon" src={fav} alt="" aria-hidden="true" draggable="false" onerror={() => onFaviconError(fav)} />
           {:else}
             <span class="kind-dot" data-kind={tab.type} aria-hidden="true"></span>
           {/if}

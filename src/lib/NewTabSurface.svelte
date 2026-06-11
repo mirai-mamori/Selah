@@ -6,6 +6,7 @@
   // Copilot window brand — copilot.png lives in static/ (served from web root).
   const copilotLogoUrl = "/copilot.png";
   import { listBookmarks, removeBookmark as removeStoredBookmark, type Bookmark } from "./bookmarks";
+  import { tabFaviconUrl } from "./documentTabs";
 
   interface QuickNav {
     label: string;
@@ -157,19 +158,9 @@
   // no icon. Keyed by URL so a broken icon isn't retried every render.
   let faviconFailed = $state<Set<string>>(new Set());
 
-  function faviconFor(url: string): string {
-    try {
-      const host = new URL(url).hostname;
-      if (!host) return "";
-      return `https://www.google.com/s2/favicons?sz=64&domain=${encodeURIComponent(host)}`;
-    } catch {
-      return "";
-    }
-  }
-
   function bookmarkFavicon(bm: Bookmark): string {
     const spec = (bm.spec || {}) as Record<string, unknown>;
-    if (String(spec.type || "") === "browser") return faviconFor(String(spec.url || ""));
+    if (String(spec.type || "") === "browser") return tabFaviconUrl(String(spec.url || ""));
     return "";
   }
 

@@ -326,7 +326,7 @@
   }
 
   .actions > span.error {
-    color: #b42318;
+    color: var(--detail-danger, #b42318);
   }
 
   .actions button {
@@ -375,7 +375,7 @@
   .unavailable {
     border-radius: 8px;
     background: rgba(249,115,22,0.1);
-    color: #9a3412;
+    color: var(--detail-warn, #9a3412);
     padding: 10px 12px;
     font-size: 13px;
     font-weight: 700;

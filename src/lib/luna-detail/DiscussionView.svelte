@@ -287,7 +287,7 @@
 
 <style>
   .thread-preview {
-    color: #64748b;
+    color: var(--detail-muted, #64748b);
     font-size: 13px;
     line-height: 1.55;
     display: -webkit-box;

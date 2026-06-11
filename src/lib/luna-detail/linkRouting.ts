@@ -84,6 +84,14 @@ export async function openUniversityRichLink(
       });
       return true;
     }
+    // Material file/resource links (e.g. /lms/course/display/material/resource
+    // ?objectName=…&fileName=…) are direct files served by Luna, not detail
+    // pages. Open the (already host-completed) URL in a browser tab — the in-app
+    // webview carries the Luna session, same as exam links above.
+    if (url.pathname.startsWith("/lms/course/display/material/")) {
+      await invoke("open_external_url", { url: url.toString(), title: label });
+      return true;
+    }
     const cachedTarget = await resolveLunaCachedTarget(url, title, context);
     if (cachedTarget?.kind === "announcement") {
       await openLunaDetail(url, cachedTarget.title || "お知らせ", {

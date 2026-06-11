@@ -3,15 +3,7 @@
   import { invoke } from "@tauri-apps/api/core";
   import { listen } from "@tauri-apps/api/event";
   import Icon from "./Icon.svelte";
-
-  interface DocumentTab {
-    id: string;
-    title: string;
-    url: string;
-    type: string;
-    active: boolean;
-    loading?: boolean;
-  }
+  import { tabFaviconUrl, type DocumentTabSummary as DocumentTab } from "./documentTabs";
 
   const OWNER = "document-tabs";
 
@@ -22,15 +14,14 @@
   const MAX_VISIBLE = 4;
   const visibleTabs = $derived(tabs.slice(0, MAX_VISIBLE));
   let unlisten: (() => void) | null = null;
+  let destroyed = false;
   let faviconFailed = $state<Set<string>>(new Set());
 
-  function faviconFor(url: string): string {
-    try {
-      const host = new URL(url).hostname;
-      return host ? `https://www.google.com/s2/favicons?sz=64&domain=${encodeURIComponent(host)}` : "";
-    } catch {
-      return "";
-    }
+  // Pause the continuously-repainting flowing border while the window is hidden
+  // (minimized / app in background) to avoid burning CPU/battery off-screen.
+  let docHidden = $state(typeof document !== "undefined" && document.hidden);
+  function onVisibility(): void {
+    docHidden = document.hidden;
   }
 
   function onFaviconError(src: string): void {
@@ -55,6 +46,8 @@
     busy = true;
     try {
       await action();
+    } catch (e) {
+      console.warn("[Copilot dock]", e);
     } finally {
       busy = false;
     }
@@ -74,16 +67,24 @@
   }
 
   onMount(async () => {
+    document.addEventListener("visibilitychange", onVisibility);
     await refresh();
-    unlisten = await listen<{ owner: string; tabs: DocumentTab[] }>("document-tabs-changed", (event) => {
+    const un = await listen<{ owner: string; tabs: DocumentTab[] }>("document-tabs-changed", (event) => {
       if (event.payload?.owner === OWNER) tabs = event.payload.tabs || [];
     });
+    // Guard the async gap: if we unmounted while listen() was resolving, detach now.
+    if (destroyed) un();
+    else unlisten = un;
   });
 
-  onDestroy(() => unlisten?.());
+  onDestroy(() => {
+    destroyed = true;
+    unlisten?.();
+    document.removeEventListener("visibilitychange", onVisibility);
+  });
 </script>
 
-<div class="copilot-dock">
+<div class="copilot-dock" class:paused={docHidden}>
   <div class="cd-header">
     <span class="cd-logo" aria-hidden="true"><Icon name="copilot" size={19} /></span>
     <span class="cd-title">Copilot</span>
@@ -95,6 +96,7 @@
   {#if tabs.length}
     <div class="cd-tabs">
       {#each visibleTabs as tab (tab.id)}
+        {@const fav = tab.type === "browser" ? tabFaviconUrl(tab.url) : ""}
         <button
           class="cd-tab"
           class:active={tab.active}
@@ -107,8 +109,8 @@
             <span class="cd-ico cd-spinner" aria-hidden="true"></span>
           {:else if tab.type === "detective"}
             <img class="cd-ico cd-img" src="/naruhodo.png" alt="" aria-hidden="true" draggable="false" />
-          {:else if tab.type === "browser" && faviconFor(tab.url) && !faviconFailed.has(faviconFor(tab.url))}
-            <img class="cd-ico cd-img" src={faviconFor(tab.url)} alt="" aria-hidden="true" draggable="false" onerror={() => onFaviconError(faviconFor(tab.url))} />
+          {:else if fav && !faviconFailed.has(fav)}
+            <img class="cd-ico cd-img" src={fav} alt="" aria-hidden="true" draggable="false" onerror={() => onFaviconError(fav)} />
           {:else}
             <span class="cd-ico cd-dot" data-kind={tab.type} aria-hidden="true"></span>
           {/if}
@@ -250,6 +252,11 @@
     animation: cd-rotate 6s linear infinite;
   }
 
+  /* Off-screen: stop the per-frame gradient repaint. */
+  .copilot-dock.paused .cd-new::before {
+    animation-play-state: paused;
+  }
+
   .cd-new :global(.icon) {
     display: block;
     position: relative;
@@ -293,13 +300,12 @@
     color: var(--text-secondary);
     cursor: pointer;
     text-align: left;
-    transition: background 0.15s ease, color 0.15s ease, transform 0.14s cubic-bezier(0.2, 0.8, 0.2, 1);
+    transition: background 0.15s ease, color 0.15s ease;
   }
 
   .cd-tab:hover:not(:disabled) {
     background: color-mix(in srgb, var(--text-primary) 6%, transparent);
     color: var(--text-primary);
-    transform: translateX(2px);
   }
 
   .cd-tab.active {
@@ -370,6 +376,5 @@
 
   @media (prefers-reduced-motion: reduce) {
     .cd-new::before { animation: none; }
-    .cd-tab:hover:not(:disabled) { transform: none; }
   }
 </style>

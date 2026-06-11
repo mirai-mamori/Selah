@@ -348,7 +348,6 @@ fn split_weights_for_second(weights: &[f64]) -> Vec<f64> {
     }
 }
 
-
 fn logical_window_size(window: &tauri::Window) -> Result<(f64, f64), String> {
     let size = window.inner_size().map_err(|e| e.to_string())?;
     let scale = window.scale_factor().unwrap_or(1.0);
@@ -410,9 +409,7 @@ fn emit_tabs_changed(app: &tauri::AppHandle, owner: &str) {
     }
     for label in labels {
         let _ = app.emit_to(
-            tauri::EventTarget::AnyLabel {
-                label,
-            },
+            tauri::EventTarget::AnyLabel { label },
             "document-tabs-changed",
             payload.clone(),
         );
@@ -512,7 +509,10 @@ fn ensure_window(app: &tauri::AppHandle, owner: &str) -> Result<tauri::Window, S
     // spawns exactly stacked on top of it. Falls back to screen-center.
     if let Some(main) = app.get_webview_window("main") {
         if let Ok(pos) = main.outer_position() {
-            let _ = window.set_position(tauri::PhysicalPosition::new(pos.x + 48, pos.y + 48));
+            // 48 logical px cascade, kept constant across DPI.
+            let offset = (48.0 * main.scale_factor().unwrap_or(1.0)).round() as i32;
+            let _ =
+                window.set_position(tauri::PhysicalPosition::new(pos.x + offset, pos.y + offset));
         } else {
             let _ = window.center();
         }
@@ -756,6 +756,8 @@ fn notify_tab_activated(app: &tauri::AppHandle, owner: &str, tab: &DocumentTab) 
     }
 }
 
+/// Cheap read of just the active tab's kind (no full-state clone), so the strip
+/// can be resized on every drag tick without waiting on a heavy clone.
 fn active_kind_for_owner(owner: &str) -> Option<String> {
     DOCUMENT_WINDOWS
         .lock()
@@ -772,7 +774,11 @@ fn active_kind_for_owner(owner: &str) -> Option<String> {
 }
 
 fn resize_document_window(app: &tauri::AppHandle, owner: &str, width: f64, height: f64) {
-    // Detective collapses the toolbar row away, so its content starts higher.
+    // Resize the strip FIRST, with the least possible work, so its responsive
+    // width @media (max-width: 760px) tracks the window edge closely during a
+    // drag. Detective collapses the toolbar row away (shorter strip); only a
+    // cheap active-kind read is needed — the heavier full-state clone for the
+    // content layout happens afterwards.
     let strip_h = if active_kind_for_owner(owner).as_deref() == Some("detective") {
         COMPACT_STRIP_HEIGHT
     } else {
@@ -785,20 +791,19 @@ fn resize_document_window(app: &tauri::AppHandle, owner: &str, width: f64, heigh
             0.0, 0.0,
         )));
         let _ = strip.set_size(tauri::Size::Logical(tauri::LogicalSize::new(
-            width,
-            strip_h,
+            width, strip_h,
         )));
     }
 
-    let panel_width = agent_panel_width(width);
-    let content_width = (width - panel_width).max(260.0);
-    let document_height = (height - strip_h).max(120.0);
     let state = DOCUMENT_WINDOWS
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .get(owner)
         .cloned()
         .unwrap_or_default();
+    let panel_width = agent_panel_width(width);
+    let content_width = (width - panel_width).max(260.0);
+    let document_height = (height - strip_h).max(120.0);
     let window = app.get_window(owner);
     let active = state.active.as_deref();
     let content_height = document_height.max(120.0);
@@ -828,7 +833,9 @@ fn resize_document_window(app: &tauri::AppHandle, owner: &str, width: f64, heigh
             }
             if let Some(window) = window.as_ref() {
                 for index in 0..live_panes.len() {
-                    if let Err(err) = ensure_split_divider_webview(app, window, owner, &tab.target, index) {
+                    if let Err(err) =
+                        ensure_split_divider_webview(app, window, owner, &tab.target, index)
+                    {
                         log::warn!(
                             "split divider ensure failed owner={} parent={} index={} err={}",
                             owner,
@@ -851,7 +858,11 @@ fn resize_document_window(app: &tauri::AppHandle, owner: &str, width: f64, heigh
                     } else {
                         SPLIT_DIVIDER_WIDTH
                     };
-                    let divider_pos_x = if dragging_this_divider { 0.0 } else { divider_x };
+                    let divider_pos_x = if dragging_this_divider {
+                        0.0
+                    } else {
+                        divider_x
+                    };
                     let _ = divider.set_position(tauri::Position::Logical(
                         tauri::LogicalPosition::new(divider_pos_x, TAB_STRIP_HEIGHT),
                     ));
@@ -1119,9 +1130,8 @@ pub fn open_markdown_reader_tab(
         urlencoding::encode(OWNER_LABEL)
     );
     // Only bookmarkable when we know the file path to reopen it from.
-    let reopen = source_path.map(|path| {
-        serde_json::json!({ "type": "reader", "path": path, "title": title })
-    });
+    let reopen = source_path
+        .map(|path| serde_json::json!({ "type": "reader", "path": path, "title": title }));
     open_tab(
         app,
         Some(label.clone()),
@@ -1136,27 +1146,43 @@ pub fn open_markdown_reader_tab(
     )
 }
 
-pub fn open_new_tab(app: &tauri::AppHandle) -> Result<DocumentTabInfo, String> {
+/// Open (or focus) a tab that loads one of the app's own `#surface=…` pages in
+/// the Copilot window. `key` makes it a singleton (re-open focuses the existing
+/// tab); `extra_query` appends to the URL hash (e.g. "&course=…").
+fn open_app_surface_tab(
+    app: &tauri::AppHandle,
+    surface: &str,
+    kind: &str,
+    title: String,
+    key: Option<&str>,
+    extra_query: &str,
+) -> Result<DocumentTabInfo, String> {
     let idx = TAB_COUNTER.fetch_add(1, Ordering::Relaxed);
-    let label = format!("document-tab-home-{}", idx);
+    let label = format!("document-tab-{}-{}", kind, idx);
     let target = format!("{}-ct", label);
     let url = format!(
-        "index.html#surface=home&tabLabel={}&ownerLabel={}",
+        "index.html#surface={}&tabLabel={}&ownerLabel={}{}",
+        surface,
         urlencoding::encode(&target),
-        urlencoding::encode(OWNER_LABEL)
+        urlencoding::encode(OWNER_LABEL),
+        extra_query
     );
     open_tab(
         app,
-        None,
+        key.map(str::to_string),
         Some(label),
         Some(target),
         tauri::WebviewUrl::App(url.clone().into()),
         url,
-        "新しいタブ".to_string(),
-        "home".to_string(),
+        title,
+        kind.to_string(),
         &[],
         None,
     )
+}
+
+pub fn open_new_tab(app: &tauri::AppHandle) -> Result<DocumentTabInfo, String> {
+    open_app_surface_tab(app, "home", "home", "新しいタブ".to_string(), None, "")
 }
 
 fn detail_kind(params: &str) -> &'static str {
@@ -1173,7 +1199,10 @@ fn detail_webview_url(target: &str, params: &str) -> String {
     let suffix = if params.trim().is_empty() {
         String::new()
     } else {
-        format!("&{}", params.trim_start_matches('?').trim_start_matches('&'))
+        format!(
+            "&{}",
+            params.trim_start_matches('?').trim_start_matches('&')
+        )
     };
     format!(
         "index.html#surface=university-detail&tabLabel={}&ownerLabel={}{}",
@@ -1206,12 +1235,16 @@ fn ensure_split_divider_webview(
     let target = split_divider_target(parent_target, index);
     if app.get_webview(&target).is_none() {
         let url = split_divider_url(owner, parent_target, index);
-        let builder = tauri::webview::WebviewBuilder::new(&target, tauri::WebviewUrl::App(url.into()))
-            .background_throttling(tauri::utils::config::BackgroundThrottlingPolicy::Disabled);
+        let builder =
+            tauri::webview::WebviewBuilder::new(&target, tauri::WebviewUrl::App(url.into()))
+                .background_throttling(tauri::utils::config::BackgroundThrottlingPolicy::Disabled);
         window
             .add_child(
                 builder,
-                tauri::Position::Logical(tauri::LogicalPosition::new(OFFSCREEN_X, TAB_STRIP_HEIGHT)),
+                tauri::Position::Logical(tauri::LogicalPosition::new(
+                    OFFSCREEN_X,
+                    TAB_STRIP_HEIGHT,
+                )),
                 tauri::Size::Logical(tauri::LogicalSize::new(SPLIT_DIVIDER_WIDTH, 120.0)),
             )
             .map_err(|e| format!("分割バー作成失敗: {}", e))?;
@@ -1230,9 +1263,10 @@ fn close_split_dividers(app: &tauri::AppHandle, parent_target: &str, keep: usize
 fn hide_split_dividers(app: &tauri::AppHandle, parent_target: &str) {
     for index in 0..MAX_SPLIT_DIVIDERS {
         if let Some(webview) = app.get_webview(&split_divider_target(parent_target, index)) {
-            let _ = webview.set_position(tauri::Position::Logical(
-                tauri::LogicalPosition::new(OFFSCREEN_X, TAB_STRIP_HEIGHT),
-            ));
+            let _ = webview.set_position(tauri::Position::Logical(tauri::LogicalPosition::new(
+                OFFSCREEN_X,
+                TAB_STRIP_HEIGHT,
+            )));
             let _ = webview.set_size(tauri::Size::Logical(tauri::LogicalSize::new(0.0, 0.0)));
         }
     }
@@ -1255,9 +1289,8 @@ fn create_pane_webview(
     }
     crate::webview_toolbar::unregister_readable_label(label);
     let url = detail_webview_url(target, params);
-    let builder =
-        tauri::webview::WebviewBuilder::new(target, tauri::WebviewUrl::App(url.into()))
-            .background_throttling(tauri::utils::config::BackgroundThrottlingPolicy::Disabled);
+    let builder = tauri::webview::WebviewBuilder::new(target, tauri::WebviewUrl::App(url.into()))
+        .background_throttling(tauri::utils::config::BackgroundThrottlingPolicy::Disabled);
     window
         .add_child(
             builder,
@@ -1287,8 +1320,7 @@ pub fn open_child_detail(
 ) -> Result<(), String> {
     let owner = OWNER_LABEL;
     let window = ensure_window(app, owner)?;
-    let parent =
-        active_tab_for_owner(owner).ok_or_else(|| "親詳細タブがありません".to_string())?;
+    let parent = active_tab_for_owner(owner).ok_or_else(|| "親詳細タブがありません".to_string())?;
     if parent.kind == "home" || parent.kind == "files" {
         return open_university_detail_tab(app, params, title).map(|_| ());
     }
@@ -1452,61 +1484,25 @@ pub fn open_files_tab(
     course: Option<String>,
     title: String,
 ) -> Result<DocumentTabInfo, String> {
-    let idx = TAB_COUNTER.fetch_add(1, Ordering::Relaxed);
-    let label = format!("document-tab-files-{}", idx);
-    let target = format!("{}-ct", label);
-    let suffix = match course
-        .as_deref()
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-    {
+    let suffix = match course.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
         Some(c) => format!("&course={}", urlencoding::encode(c)),
         None => String::new(),
     };
-    let url = format!(
-        "index.html#surface=files&tabLabel={}&ownerLabel={}{}",
-        urlencoding::encode(&target),
-        urlencoding::encode(OWNER_LABEL),
-        suffix
-    );
     // Keyed so re-opening focuses the single existing files tab instead of
     // stacking duplicates; the caller re-emits focus-course on reuse.
-    open_tab(
-        app,
-        Some("files".to_string()),
-        Some(label),
-        Some(target),
-        tauri::WebviewUrl::App(url.clone().into()),
-        url,
-        title,
-        "files".to_string(),
-        &[],
-        None,
-    )
+    open_app_surface_tab(app, "files", "files", title, Some("files"), &suffix)
 }
 
 /// Open (or focus) the Detective ("なるほど") game as a singleton tab in the
 /// Copilot window. Keyed on "detective" so re-launching just re-focuses it.
 pub fn open_detective_tab(app: &tauri::AppHandle) -> Result<DocumentTabInfo, String> {
-    let idx = TAB_COUNTER.fetch_add(1, Ordering::Relaxed);
-    let label = format!("document-tab-detective-{}", idx);
-    let target = format!("{}-ct", label);
-    let url = format!(
-        "index.html#surface=detective&tabLabel={}&ownerLabel={}",
-        urlencoding::encode(&target),
-        urlencoding::encode(OWNER_LABEL)
-    );
-    open_tab(
+    open_app_surface_tab(
         app,
-        Some("detective".to_string()),
-        Some(label),
-        Some(target),
-        tauri::WebviewUrl::App(url.clone().into()),
-        url,
+        "detective",
+        "detective",
         "なるほど".to_string(),
-        "detective".to_string(),
-        &[],
-        None,
+        Some("detective"),
+        "",
     )
 }
 
@@ -1732,6 +1728,11 @@ pub fn document_tabs_reveal(
     id: Option<String>,
 ) -> Result<(), String> {
     let owner = owner.as_deref().unwrap_or(OWNER_LABEL);
+    // Reveal only shows an existing (possibly hidden) window — it never conjures
+    // an empty one. Creating windows is document_tabs_new_tab's job.
+    if app.get_window(owner).is_none() {
+        return Ok(());
+    }
     ensure_window(&app, owner)?;
     if let Some(id) = id {
         activate_tab_inner(&app, owner, &id)?;

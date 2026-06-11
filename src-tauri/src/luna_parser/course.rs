@@ -698,6 +698,36 @@ fn parse_materials(doc: &Html) -> Vec<LunaContentItem> {
             });
         }
 
+        // Fallback: some materials expose their file purely as a Luna resource
+        // link (<a href="/lms/course/display/material/resource?objectName=…
+        // &fileName=…">…</a>) with no structured download row, which would leave
+        // an empty card. Capture those as web-link files so the frontend shows a
+        // button and opens them in the browser (host is completed there).
+        if files.is_empty() {
+            for a in folder.select(&SEL_A_HREF) {
+                let href = a.value().attr("href").unwrap_or("").trim().to_string();
+                if !href.contains("/lms/course/display/material/") {
+                    continue;
+                }
+                let display = a.text().collect::<String>().trim().to_string();
+                if display.is_empty() {
+                    continue;
+                }
+                files.push(LunaMaterialFile {
+                    display_name: display,
+                    file_name: String::new(),
+                    object_name: String::new(),
+                    resource_id: String::new(),
+                    material_id: String::new(),
+                    file_type: "1".to_string(),
+                    end_date: String::new(),
+                    scan_status: String::new(),
+                    link_type: "web".to_string(),
+                    external_url: href,
+                });
+            }
+        }
+
         let status = if files.is_empty() {
             String::new()
         } else {

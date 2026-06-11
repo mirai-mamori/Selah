@@ -612,10 +612,24 @@
   }
 
   .meta-table > div > span,
-  .meta-table > div > strong,
+  .meta-table > div > strong.rich.compact,
   .meta-table > div > .kgc-field-value {
+    display: grid;
+    align-content: center;
     padding: 10px 12px;
     font-size: 13px;
+  }
+
+  .meta-table > div > strong.rich.compact {
+    max-height: none;
+    overflow: visible;
+    color: var(--detail-text);
+    line-height: 1.5;
+    gap: 0.5em;
+  }
+
+  .meta-table > div > strong.rich.compact p {
+    margin: 0;
   }
 
   .meta-table .kgc-field-value {

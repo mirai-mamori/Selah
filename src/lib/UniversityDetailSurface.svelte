@@ -421,11 +421,22 @@
   }
 
   async function openOrDownloadMaterial(file: LunaMaterialFile, materialTitle: string): Promise<void> {
-    const linkType = file.link_type || (file.file_type === "0" ? "file" : "web");
+    // An external_url means this is a link to follow (e.g. a material/resource
+    // page), not a managed file download — open it in the browser even when the
+    // file_type would otherwise mark it as a downloadable file.
+    const linkType = file.external_url
+      ? "web"
+      : file.link_type || (file.file_type === "0" ? "file" : "web");
     if (linkType !== "file") {
       try {
+        // A relative Luna link (e.g. /lms/course/display/material/resource?…)
+        // just needs its host prefixed; only fall back to rebuilding the URL
+        // from object fields when there's no usable link at all.
+        const relativeLink = file.external_url?.startsWith("/") ? normalizeLunaUrl(file.external_url) : "";
         const url = file.external_url && /^https?:/i.test(file.external_url)
           ? file.external_url
+          : relativeLink
+          ? relativeLink
           : await invoke<string>("luna_resolve_material_link", {
               idnumber: idnumberParam,
               fileName: file.file_name,

@@ -40,6 +40,24 @@
       border-color: rgba(255,255,255,0.1);
     }
 
+    :root:not([data-theme="light"]) .file-list button,
+    :root:not([data-theme="light"]) .attachments button {
+      background: rgba(255,255,255,0.08);
+      border-color: rgba(255,255,255,0.12);
+      color: var(--detail-text);
+    }
+
+    :root:not([data-theme="light"]) .meta-table span {
+      background: rgba(255,255,255,0.04);
+      color: var(--detail-muted);
+    }
+
+    :root:not([data-theme="light"]) .meta-table .std-year-row > span,
+    :root:not([data-theme="light"]) .meta-table .std-year-row > strong,
+    :root:not([data-theme="light"]) .meta-table .std-year-row > .kgc-field-value {
+      background: rgba(251,191,36,0.08);
+    }
+
     :root:not([data-theme="light"]) .hero {
       background: var(--detail-surface);
       border-bottom-color: var(--detail-border-soft);
@@ -135,6 +153,24 @@
   [data-theme="dark"] .lead {
     background: rgba(255,255,255,0.06);
     border-color: rgba(255,255,255,0.1);
+  }
+
+  [data-theme="dark"] .file-list button,
+  [data-theme="dark"] .attachments button {
+    background: rgba(255,255,255,0.08);
+    border-color: rgba(255,255,255,0.12);
+    color: var(--detail-text);
+  }
+
+  [data-theme="dark"] .meta-table span {
+    background: rgba(255,255,255,0.04);
+    color: var(--detail-muted);
+  }
+
+  [data-theme="dark"] .meta-table .std-year-row > span,
+  [data-theme="dark"] .meta-table .std-year-row > strong,
+  [data-theme="dark"] .meta-table .std-year-row > .kgc-field-value {
+    background: rgba(251,191,36,0.08);
   }
 
   [data-theme="dark"] .hero {
