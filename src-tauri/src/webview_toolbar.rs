@@ -397,8 +397,11 @@ const BROWSER_BRIDGE_SCRIPT: &str = r#"
   }
 
   function clickableSelector() {
-    return 'a[href],button,[role="button"],[role="link"],[role="tab"],summary,' +
-      'input[type="button"],input[type="submit"],input[type="reset"],label,[onclick]';
+    return 'a[href],button,[role="button"],[role="link"],[role="tab"],' +
+      '[role="menuitem"],[role="menuitemcheckbox"],[role="menuitemradio"],' +
+      '[role="option"],[role="checkbox"],[role="radio"],[role="switch"],[role="treeitem"],' +
+      'summary,input[type="button"],input[type="submit"],input[type="reset"],' +
+      'input[type="checkbox"],input[type="radio"],label,[onclick],[tabindex]:not([tabindex="-1"])';
   }
 
   function isClickable(el) {
@@ -573,15 +576,24 @@ const BROWSER_BRIDGE_SCRIPT: &str = r#"
 
   function performClick(el) {
     if (!el) throw new Error('No clickable element found');
-    if (typeof el.focus === 'function') el.focus();
-    ['mouseover', 'mousedown', 'mouseup'].forEach(function (type) {
-      el.dispatchEvent(new MouseEvent(type, { bubbles: true, cancelable: true, view: window }));
-    });
-    if (typeof el.click === 'function') {
-      el.click();
-    } else {
-      el.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, view: window }));
+    try { if (typeof el.focus === 'function') el.focus(); } catch (e) {}
+    var rect = el.getBoundingClientRect();
+    var cx = Math.round(rect.left + rect.width / 2);
+    var cy = Math.round(rect.top + rect.height / 2);
+    var opts = { bubbles: true, cancelable: true, view: window, clientX: cx, clientY: cy, button: 0, buttons: 1 };
+    var PE = window.PointerEvent;
+    var pOpts = Object.assign({ pointerId: 1, pointerType: 'mouse', isPrimary: true }, opts);
+    function fireP(type) { if (PE) { try { el.dispatchEvent(new PE(type, pOpts)); } catch (e) {} } }
+    function fireM(type, extra) {
+      try { el.dispatchEvent(new MouseEvent(type, Object.assign({}, opts, extra || {}))); } catch (e) {}
     }
+    // Full pointer + mouse sequence so controls that only listen for pointer
+    // events (custom buttons, SPA widgets) also fire, not just legacy mouse ones.
+    fireP('pointerover'); fireM('mouseover');
+    fireP('pointerenter');
+    fireP('pointerdown'); fireM('mousedown');
+    fireP('pointerup'); fireM('mouseup', { buttons: 0 });
+    if (typeof el.click === 'function') { el.click(); } else { fireM('click', { buttons: 0 }); }
   }
 
   function viewportPoint(action, prefix) {
@@ -612,11 +624,28 @@ const BROWSER_BRIDGE_SCRIPT: &str = r#"
     return el;
   }
 
+  function dispatchPointer(type, point) {
+    if (!window.PointerEvent) return;
+    var el = document.elementFromPoint(point.x, point.y) || document.body || document.documentElement;
+    if (!el) return;
+    try {
+      el.dispatchEvent(new PointerEvent(type, {
+        bubbles: true, cancelable: true, view: window,
+        clientX: point.x, clientY: point.y, button: 0,
+        buttons: type === 'pointerup' ? 0 : 1,
+        pointerId: 1, pointerType: 'mouse', isPrimary: true
+      }));
+    } catch (e) {}
+  }
+
   function performMouseClick(action) {
     var point = viewportPoint(action, '');
+    dispatchPointer('pointerover', point);
     var downEl = dispatchMouse('mouseover', point, 0);
     dispatchMouse('mousemove', point, 0);
+    dispatchPointer('pointerdown', point);
     dispatchMouse('mousedown', point, 0);
+    dispatchPointer('pointerup', point);
     dispatchMouse('mouseup', point, 0);
     dispatchMouse('click', point, 0);
     return { point: point, element: elementSummary(downEl) };
@@ -626,17 +655,21 @@ const BROWSER_BRIDGE_SCRIPT: &str = r#"
     var from = viewportPoint(action, 'from');
     var to = viewportPoint(action, 'to');
     var steps = Math.max(2, Math.min(Number(action.steps || 8), 24));
+    dispatchPointer('pointerover', from);
     var startEl = dispatchMouse('mouseover', from, 0);
     dispatchMouse('mousemove', from, 0);
+    dispatchPointer('pointerdown', from);
     dispatchMouse('mousedown', from, 0);
     for (var i = 1; i <= steps; i++) {
       var point = {
         x: Math.round(from.x + (to.x - from.x) * i / steps),
         y: Math.round(from.y + (to.y - from.y) * i / steps)
       };
+      dispatchPointer('pointermove', point);
       dispatchMouse('mousemove', point, 0);
       await wait(16);
     }
+    dispatchPointer('pointerup', to);
     dispatchMouse('mouseup', to, 0);
     return { from: from, to: to, element: elementSummary(startEl) };
   }
@@ -961,6 +994,10 @@ static BROWSER_WINDOW_TITLES: LazyLock<Mutex<HashMap<String, String>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 static BROWSER_WINDOW_KINDS: LazyLock<Mutex<HashMap<String, String>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
+// WKWebView.URL can briefly be nil while navigating or closing, and Wry 0.54
+// unwraps it internally. Keep event-driven snapshots instead of calling url().
+static BROWSER_WINDOW_URLS: LazyLock<Mutex<HashMap<String, String>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
 #[derive(Debug, Clone, serde::Serialize, Deserialize)]
 pub struct BrowserWindowInfo {
     pub label: String,
@@ -1026,10 +1063,16 @@ pub fn unregister_readable_label(label: &str) {
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .remove(label);
-    BROWSER_WINDOW_TARGETS
+    let target = BROWSER_WINDOW_TARGETS
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .remove(label);
+    if let Some(target) = target {
+        BROWSER_WINDOW_URLS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&target);
+    }
     BROWSER_WINDOW_OWNERS
         .lock()
         .unwrap_or_else(|e| e.into_inner())
@@ -1042,6 +1085,22 @@ pub fn unregister_readable_label(label: &str) {
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .remove(label);
+}
+
+pub fn set_readable_url(target: &str, url: &str) {
+    BROWSER_WINDOW_URLS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(target.to_string(), url.to_string());
+}
+
+fn readable_url(target: &str) -> String {
+    BROWSER_WINDOW_URLS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(target)
+        .cloned()
+        .unwrap_or_default()
 }
 
 pub fn set_owner_active_target(owner_label: &str, target: &str, title: &str, kind: &str) {
@@ -1273,8 +1332,12 @@ pub fn create_browser_window(
         .unwrap_or_else(|e| e.into_inner())
         .insert(label.to_string(), label.to_string());
 
+    let target_for_load = content_label.clone();
     let mut content_builder = tauri::webview::WebviewBuilder::new(&content_label, url)
-        .initialization_script(BROWSER_BRIDGE_SCRIPT);
+        .initialization_script(BROWSER_BRIDGE_SCRIPT)
+        .on_page_load(move |_webview, payload| {
+            set_readable_url(&target_for_load, payload.url().as_str());
+        });
     for script in init_scripts {
         content_builder = content_builder.initialization_script(*script);
     }
@@ -1334,8 +1397,32 @@ pub async fn browser_reload(app: tauri::AppHandle, target: String) -> Result<(),
 
 #[tauri::command]
 pub async fn browser_get_url(app: tauri::AppHandle, target: String) -> Result<String, String> {
-    let wv = app.get_webview(&target).ok_or("Webview not found")?;
-    wv.url().map(|u| u.to_string()).map_err(|e| e.to_string())
+    if app.get_webview(&target).is_none() {
+        return Err("Webview not found".into());
+    }
+    Ok(readable_url(&target))
+}
+
+pub async fn wait_for_readable_url_change(
+    app: &tauri::AppHandle,
+    target: &str,
+    previous: &str,
+    timeout: std::time::Duration,
+) -> Result<String, String> {
+    if app.get_webview(target).is_none() {
+        return Err("Webview not found".into());
+    }
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        let current = readable_url(target);
+        if !current.is_empty() && current != previous {
+            return Ok(current);
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Ok(current);
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(40)).await;
+    }
 }
 
 #[tauri::command]
@@ -1350,7 +1437,9 @@ pub async fn browser_navigate(
         return Err(format!("Unsupported URL scheme: {}", scheme));
     }
     let wv = app.get_webview(&target).ok_or("Webview not found")?;
-    wv.navigate(parsed).map_err(|e| e.to_string())
+    wv.navigate(parsed.clone()).map_err(|e| e.to_string())?;
+    set_readable_url(&target, parsed.as_str());
+    Ok(())
 }
 
 #[tauri::command]
@@ -1408,18 +1497,7 @@ pub async fn browser_close(app: tauri::AppHandle, target: String) -> Result<Stri
     let window = app
         .get_window(&label)
         .ok_or_else(|| format!("ウィンドウが見つかりません: {}", label))?;
-    BROWSER_WINDOW_LABELS
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .remove(&label);
-    BROWSER_WINDOW_TARGETS
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .remove(&label);
-    BROWSER_WINDOW_OWNERS
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .remove(&label);
+    unregister_readable_label(&label);
     window
         .close()
         .map_err(|e| format!("ウィンドウを閉じられませんでした: {}", e))?;
@@ -1495,14 +1573,8 @@ pub fn list_browser_windows(app: &tauri::AppHandle) -> Vec<BrowserWindowInfo> {
                 .cloned()
                 .unwrap_or_else(|| label.clone());
             app.get_window(&owner)?;
-            if app.get_webview(&target).is_none() {
-                return None;
-            }
-            let url = app
-                .get_webview(&target)
-                .and_then(|wv| wv.url().ok())
-                .map(|u| u.to_string())
-                .unwrap_or_default();
+            app.get_webview(&target)?;
+            let url = readable_url(&target);
             let title = BROWSER_WINDOW_TITLES
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())

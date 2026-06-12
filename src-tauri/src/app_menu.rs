@@ -1,5 +1,6 @@
 use tauri::{
-    menu::{Menu, MenuBuilder, MenuItemBuilder, SubmenuBuilder},
+    image::Image,
+    menu::{AboutMetadataBuilder, Menu, MenuBuilder, MenuItemBuilder, SubmenuBuilder},
     AppHandle,
 };
 
@@ -34,16 +35,20 @@ fn item(
 }
 
 pub fn build(app: &AppHandle) -> tauri::Result<Menu<tauri::Wry>> {
+    let about = AboutMetadataBuilder::new()
+        .name(Some("Selah"))
+        .version(Some(app.package_info().version.to_string()))
+        .copyright(Some("Copyright © 2026 Selah-KGU"))
+        .credits(Some("新月の下で、知性を繋ぐ。すべての関学生に。"))
+        .icon(Some(Image::from_bytes(include_bytes!(
+            "../icons/icon.png"
+        ))?))
+        .build();
     let settings = item(app, SETTINGS, "設定…", Some("CmdOrCtrl+,"))?;
     let app_menu = SubmenuBuilder::new(app, "Selah")
-        .about_with_text("Selah について", None)
+        .about_with_text("Selah について", Some(about))
         .separator()
         .item(&settings)
-        .separator()
-        .services()
-        .separator()
-        .hide_with_text("Selah を隠す")
-        .hide_others_with_text("ほかを隠す")
         .separator()
         .quit_with_text("Selah を終了")
         .build()?;

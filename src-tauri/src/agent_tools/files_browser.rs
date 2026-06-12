@@ -1450,6 +1450,8 @@ pub(super) async fn list_browser_windows(app: &tauri::AppHandle) -> Result<Value
             "label": w.label,
             "target": w.target,
             "url": w.url,
+            "title": w.title,
+            "type": w.kind,
         })).collect::<Vec<_>>()
     }))
 }
@@ -1615,6 +1617,8 @@ fn insert_browser_window_snapshot(
                 "label": w.label,
                 "target": w.target,
                 "url": w.url,
+                "title": w.title,
+                "type": w.kind,
             })
         })
         .collect::<Vec<_>>();
@@ -1739,19 +1743,35 @@ pub(super) async fn read_browser_page(
 
 pub(super) async fn browser_back(app: &tauri::AppHandle, args: &Value) -> Result<Value, String> {
     let target = resolve_browser_target_from_args(app, args)?;
-    crate::webview_toolbar::browser_go_back(app.clone(), target.clone()).await?;
-    let url = crate::webview_toolbar::browser_get_url(app.clone(), target.clone())
+    let previous = crate::webview_toolbar::browser_get_url(app.clone(), target.clone())
         .await
         .unwrap_or_default();
+    crate::webview_toolbar::browser_go_back(app.clone(), target.clone()).await?;
+    let url = crate::webview_toolbar::wait_for_readable_url_change(
+        app,
+        &target,
+        &previous,
+        std::time::Duration::from_millis(800),
+    )
+    .await
+    .unwrap_or(previous);
     Ok(json!({ "target": target, "status": "ok", "url": url }))
 }
 
 pub(super) async fn browser_forward(app: &tauri::AppHandle, args: &Value) -> Result<Value, String> {
     let target = resolve_browser_target_from_args(app, args)?;
-    crate::webview_toolbar::browser_go_forward(app.clone(), target.clone()).await?;
-    let url = crate::webview_toolbar::browser_get_url(app.clone(), target.clone())
+    let previous = crate::webview_toolbar::browser_get_url(app.clone(), target.clone())
         .await
         .unwrap_or_default();
+    crate::webview_toolbar::browser_go_forward(app.clone(), target.clone()).await?;
+    let url = crate::webview_toolbar::wait_for_readable_url_change(
+        app,
+        &target,
+        &previous,
+        std::time::Duration::from_millis(800),
+    )
+    .await
+    .unwrap_or(previous);
     Ok(json!({ "target": target, "status": "ok", "url": url }))
 }
 

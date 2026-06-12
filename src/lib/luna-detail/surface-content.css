@@ -674,6 +674,13 @@
     background: rgba(23,59,104,0.06);
   }
 
+  .meta-table .std-year-row > .kgc-field-value {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    white-space: nowrap;
+  }
+
   .year-range-badge,
   .new-inline {
     display: inline-flex;
@@ -688,6 +695,11 @@
     font-style: normal;
     font-weight: 800;
     white-space: nowrap;
+  }
+
+  .year-range-badge {
+    width: fit-content;
+    margin: 0;
   }
 
   .new-inline {

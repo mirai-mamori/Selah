@@ -5,7 +5,7 @@ description = "Selah - 新月の下で、知性を繋ぐ。すべての関学生
 authors = ["Selah-KGU"]
 license = "PolyForm-Noncommercial-1.0.0"
 edition = "2021"
-rust-version = "1.80.0"
+rust-version = "1.93.0"
 
 [lib]
 name = "app_lib"

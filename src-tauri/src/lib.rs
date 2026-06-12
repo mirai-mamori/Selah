@@ -642,6 +642,8 @@ pub fn run() {
             webview_toolbar::debug_browser_mouse_selftest_report,
             agent_commands::agent_list_conversations,
             agent_commands::agent_create_conversation,
+            agent_commands::agent_active_conversation,
+            agent_commands::agent_set_active_conversation,
             agent_commands::agent_load_messages,
             agent_commands::agent_send,
             agent_commands::agent_send_with_context,

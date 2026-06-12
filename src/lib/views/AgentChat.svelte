@@ -42,9 +42,10 @@
   let sttCommittedText = $state("");
   let sttPartialText = $state("");
   let sttStopRequested = $state(false);
-  let toolChips = $state<{ id: number; name: string; state: "running" | "ok" | "err"; preview?: string }[]>([]);
+  let toolChips = $state<{ id: number; name: string; detail?: string | null; state: "pending" | "running" | "ok" | "err"; preview?: string }[]>([]);
   let chipCounter = 0;
   let unlisten: UnlistenFn | null = null;
+  let unlistenActiveConv: UnlistenFn | null = null;
   let unlistenSttPartial: UnlistenFn | null = null;
   let unlistenSttFinal: UnlistenFn | null = null;
   let unlistenSttState: UnlistenFn | null = null;
@@ -212,6 +213,9 @@
     clearStreamBuffer();
     activeConvId = id;
     agentActiveConvId.set(id);
+    // Share this as the global active conversation so the sidebar agent (and any
+    // backend / scheduled turn) stays on the same continuous chat.
+    void invoke("agent_set_active_conversation", { convId: id }).catch(() => {});
     toolChips = [];
     thinkBuffer = "";
     currentPhase = "idle";
@@ -338,13 +342,30 @@
         currentPhase = ev.stage;
         scheduleScroll();
         break;
+      case "plan":
+        toolChips = [
+          ...toolChips,
+          ...ev.steps.map((step) => ({ id: ++chipCounter, ...step, state: "pending" as const })),
+        ];
+        scheduleScroll();
+        break;
       case "tool_call":
-        chipCounter++;
-        toolChips = [...toolChips, { id: chipCounter, name: ev.name, state: "running" }];
+        {
+          const pending = toolChips.find((chip) => chip.name === ev.name && chip.state === "pending");
+          if (pending) {
+            toolChips = toolChips.map((chip) =>
+              chip.id === pending.id ? { ...chip, state: "running" } : chip,
+            );
+          } else {
+            chipCounter++;
+            toolChips = [...toolChips, { id: chipCounter, name: ev.name, state: "running" }];
+          }
+        }
         scheduleScroll();
         break;
       case "tool_result": {
-        const last = [...toolChips].reverse().find((c) => c.name === ev.name && c.state === "running");
+        const last = toolChips.find((c) => c.name === ev.name && c.state === "running")
+          ?? toolChips.find((c) => c.name === ev.name && c.state === "pending");
         if (last) {
           toolChips = toolChips.map((c) =>
             c.id === last.id ? { ...c, state: ev.ok ? "ok" : "err", preview: ev.preview } : c,
@@ -697,7 +718,19 @@
       sttStopRequested = false;
       alert(`音声入力エラー\n\n${ev.payload.message}`);
     });
-    if (!activeConvId && conversations.length > 0) {
+    // Follow the globally-shared active conversation so the main agent and the
+    // sidebar agent stay on one continuous chat. Adopt it if present; otherwise
+    // promote our default selection to be the shared one.
+    unlistenActiveConv = await listen<string>("agent-active-conversation-changed", async (ev) => {
+      const id = ev.payload;
+      if (!id || id === activeConvId) return;
+      if (!conversations.some((c) => c.id === id)) await refreshConversations();
+      await selectConversation(id);
+    });
+    const sharedConv = (await invoke<string | null>("agent_active_conversation").catch(() => null)) || "";
+    if (sharedConv && conversations.some((c) => c.id === sharedConv)) {
+      if (activeConvId !== sharedConv) await selectConversation(sharedConv);
+    } else if (!activeConvId && conversations.length > 0) {
       await selectConversation(conversations[0].id);
     }
   });
@@ -706,6 +739,7 @@
     document.removeEventListener("mousedown", onDocClick);
     clearStreamBuffer();
     if (unlisten) unlisten();
+    unlistenActiveConv?.();
     unlistenSttPartial?.();
     unlistenSttFinal?.();
     unlistenSttState?.();
@@ -765,6 +799,7 @@
       download_course_material: "資料保存",
       list_browser_windows: "ブラウザ一覧",
       open_browser_url: "ページを開く",
+      open_copilot_page: "Copilotで開く",
       read_browser_page: "ページ読取",
       browser_back: "戻る",
       browser_forward: "進む",
@@ -1016,19 +1051,24 @@
                     class:err={chip.state === "err"}
                     title={chip.preview ? `${toolLabel(chip.name)} ${chip.preview}` : toolLabel(chip.name)}
                   >
-                    {#if chip.state === "running"}
+                    {#if chip.state === "pending"}
+                      <span class="step-pending"></span>
+                    {:else if chip.state === "running"}
                       <span class="spin"></span>
                     {:else if chip.state === "ok"}
                       <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg>
                     {:else}
                       <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
                     {/if}
-                    <span class="tool-step-label">{toolLabel(chip.name)}</span>
+                    <span class="tool-step-label">{toolLabel(chip.name)}{chip.detail ? `: ${chip.detail}` : ""}</span>
                   </div>
                 {/each}
               </div>
             {:else}
-              <div class="wait-dots" aria-label="考え中"><span></span><span></span><span></span></div>
+              <div class="phase-wait">
+                <span>{currentPhase === "planning" ? "計画を整理中" : "結果をまとめ中"}</span>
+                <div class="wait-dots" aria-hidden="true"><span></span><span></span><span></span></div>
+              </div>
             {/if}
             {#if thinkBuffer}
               <p class="think-trace" bind:this={thinkTraceEl}>{thinkBuffer}</p>
@@ -1462,6 +1502,14 @@
     border-radius: 50%;
     animation: spin 0.8s linear infinite;
   }
+  .step-pending {
+    width: 8px;
+    height: 8px;
+    box-sizing: border-box;
+    border: 1px solid currentColor;
+    border-radius: 50%;
+    opacity: 0.45;
+  }
 
   /* ── Status Area ── */
   .status-row .status-area {
@@ -1528,6 +1576,15 @@
     align-items: center;
     gap: 5px;
     padding: 4px 0;
+  }
+  .phase-wait {
+    display: inline-flex;
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 6px;
+    color: var(--text-secondary);
+    font-size: 11px;
+    text-align: left;
   }
   .wait-dots span {
     width: 5px;

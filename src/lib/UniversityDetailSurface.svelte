@@ -62,6 +62,7 @@
   const kgcPathParam = readDetailParam("kgcPath");
   const courseNameParam = readDetailParam("courseName");
   const nameParam = readDetailParam("name") || titleParam;
+  const isLunaDetail = !["kwic", "kwiccabinet", "kgc", "syllabus"].includes(mode);
 
   // When ON, drilling into a sub-detail opens it in a split child pane beside
   // this one instead of as a new tab. Enabled by default; the right pane drills
@@ -188,6 +189,15 @@
         icon: "folder.open",
       });
     }
+    if (isLunaDetail) {
+      controls.push({
+        id: "refresh",
+        label: "再読み込み",
+        action: "detail.refresh",
+        icon: "arrow.clockwise",
+        disabled: loading,
+      });
+    }
     const sourceUrl = currentSourceUrl();
     if (sourceUrl) {
       // Unified across LUNA/KWIC/KGC: opens the original page in the in-app browser.
@@ -312,6 +322,7 @@
       const payload = control.payload as { url?: string; name?: string } | undefined;
       if (payload?.url) void openExternal(payload.url, payload.name);
     }
+    else if (action === "detail.refresh") void load();
     else if (action === "detail.toggleSplit") toggleSplit();
   }
 
@@ -578,6 +589,7 @@
     loadRunning = true;
     loading = true;
     error = "";
+    updateControls();
     try {
       if (mode === "course" || mode === "attendance") {
         if (!idnumberParam) throw new Error("idnumber がありません");

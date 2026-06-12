@@ -2736,6 +2736,7 @@ export interface AgentMessage {
 
 export type AgentStreamEvent =
   | { type: "phase"; stage: "planning" | "answering" }
+  | { type: "plan"; steps: { name: string; detail?: string | null }[] }
   | { type: "tool_call"; name: string }
   | { type: "tool_result"; name: string; preview: string; ok: boolean }
   | { type: "think"; text: string }

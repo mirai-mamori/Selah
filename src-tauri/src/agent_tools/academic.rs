@@ -468,6 +468,7 @@ pub(super) async fn list_luna_todos(app: &tauri::AppHandle) -> Result<Value, Str
         items.push(json!({
             "type": a.activity_type,
             "course": course_name,
+            "luna_id": a.luna_id,
             "title": a.title,
             "deadline": a.period,
             "status": a.status,
@@ -713,6 +714,7 @@ fn collect_notifications(db: &Database, keyword: Option<&str>, limit: usize) -> 
                         sortkey,
                         json!({
                             "source": "KGC",
+                            "identifier": e.get("id").and_then(|x| x.as_str()).unwrap_or(""),
                             "title": title,
                             "date": date_str,
                             "category": e.get("category").and_then(|x| x.as_str()).unwrap_or(""),
@@ -764,6 +766,7 @@ fn collect_notifications(db: &Database, keyword: Option<&str>, limit: usize) -> 
                                 sortkey,
                                 json!({
                                     "source": "KWIC",
+                                    "identifier": it.get("id").and_then(|x| x.as_str()).unwrap_or(""),
                                     "title": title,
                                     "date": date_str,
                                     "category": sec_title,

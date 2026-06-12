@@ -83,6 +83,33 @@ pub fn agent_create_conversation(
     Ok(id)
 }
 
+const ACTIVE_CONV_KEY: &str = "agent_active_conversation";
+
+/// The globally-shared "current" agent conversation, used by both the sidebar
+/// agent (across all tabs/pages) and the main-window agent so the chat stays
+/// continuous across pages. Persisted so it survives restarts and is readable
+/// from any webview as well as from backend (silent / scheduled) turns.
+#[tauri::command]
+pub fn agent_active_conversation(db: State<'_, Database>) -> Option<String> {
+    db.get_data_cache(ACTIVE_CONV_KEY)
+        .ok()
+        .flatten()
+        .map(|(value, _)| value)
+        .filter(|v| !v.is_empty())
+}
+
+#[tauri::command]
+pub fn agent_set_active_conversation(
+    app: AppHandle,
+    db: State<'_, Database>,
+    conv_id: String,
+) -> Result<(), String> {
+    db.save_data_cache(ACTIVE_CONV_KEY, &conv_id)?;
+    use tauri::Emitter;
+    let _ = app.emit("agent-active-conversation-changed", conv_id);
+    Ok(())
+}
+
 #[tauri::command]
 pub fn agent_load_messages(
     db: State<'_, Database>,
@@ -147,6 +174,8 @@ pub async fn agent_send_with_context(
             page_kind: page_kind
                 .map(|s| s.trim().to_string())
                 .filter(|s| !s.is_empty()),
+            // Filled in agent_send_with_context from the live split-view panes.
+            view_pane_targets: Vec::new(),
         },
     )
     .await

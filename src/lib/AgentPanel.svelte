@@ -24,13 +24,7 @@
     tabs: DocumentTab[];
   }
 
-  interface BrowserAgentStatus {
-    target?: string;
-    active: boolean;
-    action?: string;
-  }
-
-  type ToolChip = { id: number; name: string; state: "running" | "ok" | "err" };
+  type ToolChip = { id: number; name: string; detail?: string | null; state: "pending" | "running" | "ok" | "err" };
   type ActionMode = "send" | "mic" | "stop";
 
   function readParam(name: string): string {
@@ -54,10 +48,10 @@
   let messages = $state<AgentMessage[]>([]);
   let draft = $state("");
   let sending = $state(false);
-  let phase = $state("");
   let error = $state("");
   let streamText = $state("");
   let toolChips = $state<ToolChip[]>([]);
+  let currentPhase = $state<"planning" | "answering">("planning");
   let sttListening = $state(false);
   let sttBaseText = $state("");
   let sttCommittedText = $state("");
@@ -72,8 +66,8 @@
   let chipCounter = 0;
   let contextTimer: number | null = null;
   let unlistenStream: UnlistenFn | null = null;
+  let unlistenActiveConv: UnlistenFn | null = null;
   let unlistenTabs: UnlistenFn | null = null;
-  let unlistenBrowserStatus: UnlistenFn | null = null;
   let unlistenTheme: UnlistenFn | null = null;
   let unlistenAppTheme: UnlistenFn | null = null;
   let unlistenSttPartial: UnlistenFn | null = null;
@@ -97,14 +91,6 @@
     return DOMPurify.sanitize(marked.parse(content || "") as string);
   }
 
-  function conversationKey(target: string, contextual: boolean): string {
-    return contextual ? `selah-agent-popup-conv-id:${target}` : "selah-agent-popup-conv-id";
-  }
-
-  function conversationStorage(contextual: boolean): Storage {
-    return contextual ? sessionStorage : localStorage;
-  }
-
   function toolLabel(name: string): string {
     const labels: Record<string, string> = {
       read_browser_page: "ページ読取",
@@ -118,6 +104,19 @@
       search_courses: "科目検索",
       list_downloaded_files: "ファイル検索",
       read_downloaded_file: "ファイル読込",
+      open_downloaded_file: "ファイルを開く",
+      get_luna_activity_detail: "Luna詳細",
+      list_luna_todos: "提出物",
+      list_luna_announcements: "Luna掲示",
+      open_luna_attachment: "添付を開く",
+      download_luna_attachment: "添付を保存",
+      list_google_calendar_events: "予定一覧",
+      create_google_calendar_event: "予定作成",
+      update_google_calendar_event: "予定更新",
+      delete_google_calendar_event: "予定削除",
+      computer_screenshot: "画面確認",
+      computer_mouse_click: "画面クリック",
+      open_copilot_page: "Copilotで開く",
     };
     return labels[name] || name;
   }
@@ -148,17 +147,18 @@
     });
   }
 
-  async function loadConversation(target: string): Promise<void> {
+  // One globally-shared continuous conversation drives BOTH the sidebar agent
+  // (across every tab/page) and the main-window agent, so the chat never resets
+  // when you switch pages. The current page is still injected per turn (browser
+  // context), so "this page" keeps working. Use 新規 to start a fresh chat.
+  async function loadActiveConversation(): Promise<void> {
     const sequence = ++contextSequence;
     error = "";
     sending = false;
-    phase = "";
     streamText = "";
     toolChips = [];
-    const contextual = pageKind !== "agent" && target !== owner;
-    const storage = conversationStorage(contextual);
-    const key = conversationKey(target, contextual);
-    let id = storage.getItem(key) || "";
+    currentPhase = "planning";
+    let id = (await invoke<string | null>("agent_active_conversation").catch(() => null)) || "";
     if (id) {
       try {
         await invoke<AgentMessage[]>("agent_load_messages", { convId: id });
@@ -167,10 +167,8 @@
       }
     }
     if (!id) {
-      id = await invoke<string>("agent_create_conversation", {
-        title: contextual ? "ページエージェント" : "ミニエージェント",
-      });
-      storage.setItem(key, id);
+      id = await invoke<string>("agent_create_conversation", { title: "エージェント" });
+      await invoke("agent_set_active_conversation", { convId: id }).catch(() => {});
     }
     const rows = await invoke<AgentMessage[]>("agent_load_messages", { convId: id });
     if (sequence !== contextSequence) return;
@@ -180,21 +178,28 @@
     scrollBottom();
   }
 
-  async function applyContext(target: string, title: string, kind: string): Promise<void> {
+  async function newChat(): Promise<void> {
+    if (sending) return;
+    try {
+      const id = await invoke<string>("agent_create_conversation", { title: "エージェント" });
+      await invoke("agent_set_active_conversation", { convId: id }).catch(() => {});
+      await loadActiveConversation();
+      composerEl?.focus();
+    } catch (cause) {
+      error = `新しい会話を作成できませんでした: ${String(cause)}`;
+    }
+  }
+
+  // Only updates the per-turn page context (which page the next message is about).
+  // The conversation itself is the shared active one and does NOT change with the
+  // page — that's what keeps cross-page chats continuous.
+  function applyContext(target: string, title: string, kind: string): void {
     const normalizedTarget = target.trim();
     if (!normalizedTarget) return;
-    const changed = normalizedTarget !== pageTarget;
     pageTarget = normalizedTarget;
     pageTitle = title.trim() || pageTitle || "エージェント";
     pageKind = kind.trim() || pageKind || "detail";
     document.title = pageTitle;
-    if (changed || !convId) {
-      try {
-        await loadConversation(normalizedTarget);
-      } catch (cause) {
-        error = `エージェントを起動できませんでした: ${String(cause)}`;
-      }
-    }
   }
 
   async function refreshActiveContext(): Promise<void> {
@@ -202,20 +207,30 @@
     try {
       const tabs = await invoke<DocumentTab[]>("document_tabs_list", { owner });
       const active = tabs.find((tab) => tab.active);
-      if (active) await applyContext(active.target, active.title, active.type);
-      else await applyContext(owner, "エージェント", "agent");
+      if (active) applyContext(active.target, active.title, active.type);
+      else applyContext(owner, "エージェント", "agent");
     } catch {}
   }
 
   function handleStream(event: AgentStreamEvent): void {
     if (!sending) return;
     if (event.type === "phase") {
-      phase = event.stage === "planning" ? "考え中…" : "返答中…";
+      currentPhase = event.stage;
+    } else if (event.type === "plan") {
+      toolChips = [
+        ...toolChips,
+        ...event.steps.map((step) => ({ id: ++chipCounter, ...step, state: "pending" as const })),
+      ];
     } else if (event.type === "tool_call") {
-      toolChips = [...toolChips, { id: ++chipCounter, name: event.name, state: "running" }];
-      phase = "操作中…";
+      const pending = toolChips.find((chip) => chip.name === event.name && chip.state === "pending");
+      if (pending) {
+        toolChips = toolChips.map((chip) => chip.id === pending.id ? { ...chip, state: "running" } : chip);
+      } else {
+        toolChips = [...toolChips, { id: ++chipCounter, name: event.name, state: "running" }];
+      }
     } else if (event.type === "tool_result") {
-      const match = [...toolChips].reverse().find((chip) => chip.name === event.name && chip.state === "running");
+      const match = toolChips.find((chip) => chip.name === event.name && chip.state === "running")
+        ?? toolChips.find((chip) => chip.name === event.name && chip.state === "pending");
       if (match) toolChips = toolChips.map((chip) => chip.id === match.id ? { ...chip, state: event.ok ? "ok" : "err" } : chip);
     } else if (event.type === "token") {
       streamText += event.text;
@@ -230,9 +245,9 @@
 
   async function finishTurn(reload: boolean): Promise<void> {
     sending = false;
-    phase = "";
     toolChips = [];
     streamText = "";
+    currentPhase = "planning";
     if (reload && convId) {
       try {
         messages = (await invoke<AgentMessage[]>("agent_load_messages", { convId }))
@@ -245,7 +260,7 @@
   async function send(): Promise<void> {
     const content = draft.trim();
     if (!content || sending || !pageTarget) return;
-    if (!convId) await loadConversation(pageTarget);
+    if (!convId) await loadActiveConversation();
     const currentConv = convId;
     error = "";
     draft = "";
@@ -258,9 +273,9 @@
       created_at: Math.floor(Date.now() / 1000),
     }];
     sending = true;
-    phase = "考え中…";
     streamText = "";
     toolChips = [];
+    currentPhase = "planning";
     scrollBottom();
     try {
       if (hasPageContext) {
@@ -289,7 +304,6 @@
   async function stop(): Promise<void> {
     if (!sending || !convId) return;
     sending = false;
-    phase = "";
     await invoke("agent_cancel", { convId }).catch(() => {});
   }
 
@@ -350,13 +364,14 @@
     unlistenTabs = await listen<DocumentTabsChanged>("document-tabs-changed", (event) => {
       if (!event.payload || event.payload.owner !== owner) return;
       const active = event.payload.tabs.find((tab) => tab.active);
-      if (active) void applyContext(active.target, active.title, active.type);
-      else void applyContext(owner, "エージェント", "agent");
+      if (active) applyContext(active.target, active.title, active.type);
+      else applyContext(owner, "エージェント", "agent");
     }).catch(() => null);
-    unlistenBrowserStatus = await listen<BrowserAgentStatus>("browser-agent-status", (event) => {
-      if (event.payload.target && event.payload.target !== pageTarget) return;
-      if (event.payload.active) phase = event.payload.action?.trim() || "操作中";
-      else if (!sending) phase = "";
+    // Follow the shared active conversation: when it changes (main agent picks a
+    // conversation, or 新規 elsewhere), reload so the sidebar stays in sync.
+    unlistenActiveConv = await listen<string>("agent-active-conversation-changed", (event) => {
+      const id = event.payload;
+      if (id && id !== convId) void loadActiveConversation();
     }).catch(() => null);
     unlistenSttPartial = await listen<{ text: string; caller: string }>("stt-partial", (event) => {
       if (event.payload.caller !== "agent") return;
@@ -393,7 +408,8 @@
       error = event.payload.message || "音声入力エラー";
     }).catch(() => null);
     await refreshSttState();
-    await applyContext(initialTarget || owner, initialTitle, initialKind);
+    applyContext(initialTarget || owner, initialTitle, initialKind);
+    await loadActiveConversation();
     await refreshActiveContext();
     contextTimer = window.setInterval(() => void refreshActiveContext(), 900);
     composerEl?.focus();
@@ -402,8 +418,8 @@
   onDestroy(() => {
     contextSequence++;
     unlistenStream?.();
+    unlistenActiveConv?.();
     unlistenTabs?.();
-    unlistenBrowserStatus?.();
     unlistenTheme?.();
     unlistenAppTheme?.();
     unlistenSttPartial?.();
@@ -427,15 +443,14 @@
     <div class="agent-head-text">
       <div class="agent-title-row">
         <div class="agent-title" title={pageTitle}>{pageTitle}</div>
-        <div class="agent-live-pill" class:active={!!phase}>
-          <span class="agent-live-dot"></span>
-          <span>{phase || "操作中"}</span>
-        </div>
       </div>
       <div class="agent-meta-row">
         <span class="agent-kind-tag" class:reader={pageKind === "reader"}>{kindLabel}</span>
       </div>
     </div>
+    <button class="agent-icon-button agent-new" type="button" title="新しい会話" aria-label="新しい会話" disabled={sending} onclick={newChat}>
+      <Icon name="plus" size={16} />
+    </button>
     {#if !standalone}
       <button class="agent-icon-button agent-close" type="button" title="閉じる" aria-label="閉じる" onclick={closePanel}>
         <Icon name="xmark" size={16} />
@@ -467,8 +482,8 @@
       <div class="agent-tool-stack">
         {#each toolChips as tool (tool.id)}
           <span class="agent-tool-chip" class:ok={tool.state === "ok"} class:err={tool.state === "err"}>
-            <span class="agent-tool-icon"></span>
-            <span class="agent-tool-name">{toolLabel(tool.name)}</span>
+            <span class="agent-tool-icon" class:pending={tool.state === "pending"}></span>
+            <span class="agent-tool-name">{toolLabel(tool.name)}{tool.detail ? `: ${tool.detail}` : ""}</span>
           </span>
         {/each}
       </div>
@@ -478,7 +493,13 @@
       <article class="agent-row assistant">
         <img class="agent-avatar" class:pulse={!streamText} src={selahLogoUrl} alt="" aria-hidden="true" />
         <div class="agent-bubble assistant-copy streaming">
-          {#if streamText}{@html renderMessage(streamText)}{/if}
+          {#if streamText}
+            {@html renderMessage(streamText)}
+          {:else if currentPhase === "planning" && !toolChips.length}
+            <span class="agent-phase-label">計画を整理中…</span>
+          {:else if currentPhase === "answering"}
+            <span class="agent-phase-label">結果をまとめ中…</span>
+          {/if}
         </div>
       </article>
     {/if}

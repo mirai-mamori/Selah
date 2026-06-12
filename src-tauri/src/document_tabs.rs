@@ -470,6 +470,25 @@ fn active_tab_for_owner(owner: &str) -> Option<DocumentTab> {
     state.tabs.iter().find(|tab| tab.id == active).cloned()
 }
 
+/// Targets of every **live** pane that makes up the owner's current view: the
+/// active tab's main webview plus its split child panes (pane2, pane3, …), in
+/// left-to-right order. One element when there is no split. Used so the agent
+/// can read/operate on any pane of the current split view, not just the active
+/// one.
+pub fn active_view_panes(app: &tauri::AppHandle, owner: &str) -> Vec<String> {
+    let Some(tab) = active_tab_for_owner(owner) else {
+        return Vec::new();
+    };
+    std::iter::once(tab.target.clone())
+        .chain(
+            pane_chain(&tab.child)
+                .into_iter()
+                .map(|(target, _label)| target),
+        )
+        .filter(|target| app.get_webview(target).is_some())
+        .collect()
+}
+
 fn ensure_window(app: &tauri::AppHandle, owner: &str) -> Result<tauri::Window, String> {
     if let Some(window) = app.get_window(owner) {
         if AGENT_PANEL_OPEN.load(Ordering::Relaxed) && app.get_webview(AGENT_PANEL_LABEL).is_none()
@@ -1050,6 +1069,7 @@ fn open_tab(
             return;
         }
         let url = payload.url().to_string();
+        crate::webview_toolbar::set_readable_url(&target_for_load, &url);
         let mut should_emit = false;
         if let Ok(mut states) = DOCUMENT_WINDOWS.lock() {
             if let Some(state) = states.get_mut(&owner_for_load) {
@@ -1289,8 +1309,16 @@ fn create_pane_webview(
     }
     crate::webview_toolbar::unregister_readable_label(label);
     let url = detail_webview_url(target, params);
+    // Inject the browser bridge (__selahBrowserExtractText / __selahBrowserRunAction)
+    // just like open_tab does, so the agent's DOM tools (read_browser_page,
+    // browser_click, browser_fill, …) actually work inside split child panes.
+    let target_for_load = target.to_string();
     let builder = tauri::webview::WebviewBuilder::new(target, tauri::WebviewUrl::App(url.into()))
-        .background_throttling(tauri::utils::config::BackgroundThrottlingPolicy::Disabled);
+        .initialization_script(crate::webview_toolbar::browser_bridge_script())
+        .background_throttling(tauri::utils::config::BackgroundThrottlingPolicy::Disabled)
+        .on_page_load(move |_webview, payload| {
+            crate::webview_toolbar::set_readable_url(&target_for_load, payload.url().as_str());
+        });
     window
         .add_child(
             builder,
@@ -1630,20 +1658,28 @@ pub fn document_tabs_send_control(
     let owner = owner.unwrap_or_else(|| OWNER_LABEL.to_string());
     let tab =
         active_tab_for_owner(&owner).ok_or_else(|| "アクティブなタブがありません".to_string())?;
-    app.emit_to(
-        tauri::EventTarget::AnyLabel {
-            label: tab.target.clone(),
-        },
-        "document-tab-control",
-        serde_json::json!({
-            "owner": owner,
-            "target": tab.target,
-            "tabId": tab.id,
-            "action": action,
-            "payload": payload.unwrap_or(serde_json::Value::Null),
-        }),
-    )
-    .map_err(|e| e.to_string())
+    let mut targets = vec![tab.target.clone()];
+    if action == "detail.refresh" {
+        targets.extend(pane_chain(&tab.child).into_iter().map(|(target, _)| target));
+    }
+    let payload = payload.unwrap_or(serde_json::Value::Null);
+    for target in targets {
+        app.emit_to(
+            tauri::EventTarget::AnyLabel {
+                label: target.clone(),
+            },
+            "document-tab-control",
+            serde_json::json!({
+                "owner": owner,
+                "target": target,
+                "tabId": tab.id,
+                "action": action,
+                "payload": payload,
+            }),
+        )
+        .map_err(|e| e.to_string())?;
+    }
+    Ok(())
 }
 
 #[tauri::command]

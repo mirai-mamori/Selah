@@ -24,7 +24,6 @@ use crate::agent_pseudo_call::{
 use crate::agent_text;
 use crate::agent_tools;
 use crate::ai::{ChatMessage, ImagePart};
-use crate::config;
 use crate::db::Database;
 
 // ─────────────────────── Date/Time Context ───────────────────────
@@ -58,6 +57,7 @@ fn datetime_context() -> String {
 /// Returns the week offset for 明日/tomorrow.
 /// If today is Sunday → tomorrow is Monday (next academic week) → offset 1.
 /// Otherwise → tomorrow is still within this week → offset 0.
+#[cfg(test)]
 fn tomorrow_week_offset() -> i32 {
     use chrono::{Datelike, Local};
     let dow = Local::now().weekday().number_from_monday(); // 1=Mon..7=Sun
@@ -86,6 +86,8 @@ struct AgentConfig {
     plan_think_budget_pct: u32,
     /// Number of recent history turns fed into Phase 1.
     plan_history_turns: usize,
+    /// Max chars for a persisted tool result summary in the planning prompt.
+    plan_tool_result_chars: usize,
     /// Prefill injected into the assistant turn for Phase 1.
     plan_prefill: &'static str,
     /// Think budget percentage for Phase 2.
@@ -128,13 +130,14 @@ fn timeout_for(tool: &str) -> std::time::Duration {
 }
 
 const CFG: AgentConfig = AgentConfig {
-    history_window: 6,
-    max_tools: 4,
+    history_window: 10,
+    max_tools: 6,
     plan_temperature: 0.1,
     // Give reasoning models full headroom — thinking produces better tool choices.
     plan_max_tokens: 8192,
     plan_think_budget_pct: 60,
-    plan_history_turns: 4,
+    plan_history_turns: 8,
+    plan_tool_result_chars: 900,
     plan_prefill: "{\"tools\":[",
     answer_think_budget_pct: 75,
     prompt_token_budget: 120_000,
@@ -169,10 +172,19 @@ fn mark_turn_inactive(conv_id: &str) {
 // ─────────────────────── Stream Events ───────────────────────
 
 #[derive(Debug, Serialize)]
+struct StreamPlanStep<'a> {
+    name: &'a str,
+    detail: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 enum StreamEvent<'a> {
     Phase {
         stage: &'a str,
+    },
+    Plan {
+        steps: Vec<StreamPlanStep<'a>>,
     },
     ToolCall {
         name: &'a str,
@@ -199,6 +211,51 @@ fn emit(app: &AppHandle, conv_id: &str, ev: &StreamEvent) {
     let _ = app.emit(&topic, ev);
 }
 
+fn plan_step_detail(call: &ToolCall) -> Option<String> {
+    let key = match call.name.as_str() {
+        "browser_click" => "text",
+        "browser_fill" | "browser_select_option" => "label",
+        "browser_wait_for" => "text",
+        "open_browser_url" | "download_url" => "url",
+        "open_copilot_page" => {
+            return call
+                .args
+                .get("context")
+                .or_else(|| call.args.get("page"))
+                .and_then(|v| v.as_str())
+                .map(|value| trim_to(value.trim(), 80));
+        }
+        "read_downloaded_file"
+        | "open_downloaded_file"
+        | "delete_downloaded_file"
+        | "write_downloaded_text_file" => "path",
+        "get_course_context" | "search_courses" => "query",
+        "list_downloaded_files"
+        | "search_notifications"
+        | "search_mail"
+        | "list_luna_announcements" => "keyword",
+        "get_luna_activity_detail"
+        | "open_luna_attachment"
+        | "download_luna_attachment"
+        | "create_google_calendar_event" => "title",
+        "download_course_material" => "filename",
+        "update_google_calendar_event" | "delete_google_calendar_event" => "event_id",
+        _ => return None,
+    };
+    let raw = call.args.get(key).and_then(|v| v.as_str())?.trim();
+    if raw.is_empty() {
+        return None;
+    }
+    let safe = if key == "path" {
+        raw.rsplit(['/', '\\']).next().unwrap_or(raw)
+    } else if key == "url" {
+        raw.split(['?', '#']).next().unwrap_or(raw)
+    } else {
+        raw
+    };
+    Some(trim_to(safe, 80))
+}
+
 // ─────────────────────── Public Entry Point ───────────────────────
 
 #[derive(Debug, Clone, Default)]
@@ -207,6 +264,11 @@ pub struct AgentTurnContext {
     pub browser_click_labels: Vec<String>,
     pub page_title: Option<String>,
     pub page_kind: Option<String>,
+    /// Targets of every live pane in the current split view (active tab's main
+    /// webview + split child panes). Empty = no relaxation (behaves as before).
+    /// The browser target lock allows any target in this set, so the agent can
+    /// read/operate on any pane of the current view, not only the active one.
+    pub view_pane_targets: Vec<String>,
 }
 
 /// Called from the Tauri command layer.
@@ -236,6 +298,14 @@ pub async fn agent_send_with_context(
 ) -> Result<(), String> {
     AgentProvider::clear_cancel(&conv_id);
     mark_turn_active(&conv_id);
+    let mut turn_context = turn_context;
+    // Widen the browser target lock to the whole current split view: collect the
+    // live pane targets of the Copilot window's active tab so the agent may read
+    // and operate on any pane, not just the attached/active one.
+    if turn_context.browser_target.is_some() && turn_context.view_pane_targets.is_empty() {
+        turn_context.view_pane_targets =
+            crate::document_tabs::active_view_panes(&app, "document-tabs");
+    }
     let result = run_turn(&app, &conv_id, user_text, user_images, turn_context).await;
     mark_turn_inactive(&conv_id);
     AgentProvider::clear_cancel(&conv_id);
@@ -315,6 +385,52 @@ async fn run_turn(
         execute_tools(app, conv_id, &db, &plan, &user_text, &turn_context).await?;
     if AgentProvider::is_cancelled(conv_id) {
         return Err(AgentError::Cancelled);
+    }
+
+    if should_continue_after_browser_observation(&plan, &tool_results, &user_text, &turn_context) {
+        let follow_history = db.agent_load_messages(conv_id).unwrap_or_default();
+        match plan_after_browser_observation(
+            app,
+            &provider,
+            &follow_history,
+            &user_text,
+            conv_id,
+            &turn_context,
+        )
+        .await
+        {
+            Ok(next_plan) => {
+                let follow_results =
+                    execute_tools(app, conv_id, &db, &next_plan, &user_text, &turn_context).await?;
+                tool_results.extend(follow_results);
+            }
+            Err(AgentError::Cancelled) => return Err(AgentError::Cancelled),
+            Err(error) => log::warn!("[agent plan] observation follow-up failed: {}", error),
+        }
+    }
+
+    if should_continue_after_actionable_lookup(&tool_results) {
+        let follow_history = db.agent_load_messages(conv_id).unwrap_or_default();
+        let allowed_actions = allowed_lookup_followup_actions(&tool_results);
+        match plan_after_actionable_lookup(
+            app,
+            &provider,
+            &follow_history,
+            &user_text,
+            conv_id,
+            &turn_context,
+            &allowed_actions,
+        )
+        .await
+        {
+            Ok(next_plan) => {
+                let follow_results =
+                    execute_tools(app, conv_id, &db, &next_plan, &user_text, &turn_context).await?;
+                tool_results.extend(follow_results);
+            }
+            Err(AgentError::Cancelled) => return Err(AgentError::Cancelled),
+            Err(error) => log::warn!("[agent plan] lookup follow-up failed: {}", error),
+        }
     }
 
     if let Some(answer) = local_browser_action_answer(&user_text, &tool_results, &turn_context) {
@@ -553,16 +669,14 @@ async fn choose_plan(
     conv_id: &str,
     turn_context: &AgentTurnContext,
 ) -> Result<Plan, AgentError> {
-    let norm = normalize_planner_text(user_text);
-    if let Some(plan) = attached_browser_control_plan(&norm, turn_context) {
+    if let Some(plan) = deterministic_preplan(history, user_text, turn_context) {
         return Ok(finalize_plan(plan, history, user_text, turn_context));
     }
 
-    // Fast path: heuristic covers unambiguous keywords.
-    if let Some(plan) = heuristic_plan(history, user_text) {
-        return Ok(finalize_plan(plan, history, user_text, turn_context));
-    }
-    // Slow path: ask model.
+    // Business intent belongs to the model planner. Keyword routing used to
+    // steal ambiguous requests here (for example, "open Luna details" jumping
+    // to the Luna root). Keep only attached-page controls above, where the
+    // target is concrete and the operation is local to the visible page.
     match run_plan_inference(app, provider, history, user_text, conv_id, turn_context).await {
         Ok(plan) => {
             let mut finalized =
@@ -601,14 +715,286 @@ async fn choose_plan(
                     }
                 }
             }
+            if finalized.plan.tools.is_empty()
+                && should_retry_empty_plan(history, user_text, turn_context)
+            {
+                for attempt in 1..=CFG.max_plan_repairs {
+                    let note = format!(
+                        "Empty plan attempt {attempt} is not sufficient for this request because it clearly needs current data or an available tool. Select the focused tools needed to make progress."
+                    );
+                    match run_plan_inference_with_note(
+                        app,
+                        provider,
+                        history,
+                        user_text,
+                        conv_id,
+                        Some(&note),
+                        turn_context,
+                    )
+                    .await
+                    {
+                        Ok(next_plan) => {
+                            let next = finalize_plan_with_diagnostics(
+                                next_plan,
+                                history,
+                                user_text,
+                                turn_context,
+                            );
+                            if !next.plan.tools.is_empty() {
+                                return Ok(next.plan);
+                            }
+                        }
+                        Err(AgentError::Cancelled) => return Err(AgentError::Cancelled),
+                        Err(error) => {
+                            log::warn!("[agent plan] empty-plan retry failed: {}", error)
+                        }
+                    }
+                }
+                return Ok(planner_failure_fallback(history, user_text, turn_context));
+            }
+            if finalized.plan.tools.is_empty() && finalized.has_rejections() {
+                return Ok(planner_failure_fallback(history, user_text, turn_context));
+            }
             Ok(finalized.plan)
         }
         Err(AgentError::Cancelled) => Err(AgentError::Cancelled),
         Err(e) => {
-            log::warn!("agent plan phase failed: {} — proceeding with no tools", e);
-            Ok(Plan::default())
+            let mut repair_note = format!(
+                "The previous planning attempt failed: {e}. Return one valid tools JSON object."
+            );
+            for attempt in 1..=CFG.max_plan_repairs {
+                log::warn!(
+                    "[agent plan] retrying invalid plan attempt {}/{}: {}",
+                    attempt,
+                    CFG.max_plan_repairs,
+                    repair_note
+                );
+                match run_plan_inference_with_note(
+                    app,
+                    provider,
+                    history,
+                    user_text,
+                    conv_id,
+                    Some(&repair_note),
+                    turn_context,
+                )
+                .await
+                {
+                    Ok(plan) => {
+                        let finalized =
+                            finalize_plan_with_diagnostics(plan, history, user_text, turn_context);
+                        if !finalized.plan.tools.is_empty() || !finalized.has_rejections() {
+                            return Ok(finalized.plan);
+                        }
+                        repair_note = plan_repair_note(&finalized);
+                    }
+                    Err(AgentError::Cancelled) => return Err(AgentError::Cancelled),
+                    Err(next_error) => {
+                        repair_note = format!(
+                            "The previous planning attempt failed: {next_error}. Return one valid tools JSON object."
+                        );
+                    }
+                }
+            }
+            log::warn!("agent plan repair exhausted — using safe fallback");
+            Ok(planner_failure_fallback(history, user_text, turn_context))
         }
     }
+}
+
+fn deterministic_preplan(
+    history: &[crate::db::AgentMessageRow],
+    user_text: &str,
+    turn_context: &AgentTurnContext,
+) -> Option<Plan> {
+    if should_skip_tools(history, user_text) {
+        return Some(Plan::default());
+    }
+    attached_browser_control_plan(&normalize_planner_text(user_text), turn_context)
+}
+
+fn planner_failure_fallback(
+    history: &[crate::db::AgentMessageRow],
+    user_text: &str,
+    turn_context: &AgentTurnContext,
+) -> Plan {
+    if should_skip_tools(history, user_text) {
+        return Plan::default();
+    }
+    if turn_context.browser_target.is_some() {
+        return finalize_plan(
+            single_tool_plan("read_browser_page", json!({})),
+            history,
+            user_text,
+            turn_context,
+        );
+    }
+    Plan::default()
+}
+
+fn should_retry_empty_plan(
+    history: &[crate::db::AgentMessageRow],
+    user_text: &str,
+    turn_context: &AgentTurnContext,
+) -> bool {
+    if should_skip_tools(history, user_text) {
+        return false;
+    }
+    if turn_context.browser_target.is_some() {
+        return true;
+    }
+    let norm = normalize_planner_text(user_text);
+    let has_recent_tool = history.iter().rev().take(6).any(|row| row.role == "tool");
+    if has_recent_tool
+        && contains_any(
+            &norm,
+            &[
+                "总结",
+                "總結",
+                "要約",
+                "まとめ",
+                "解释",
+                "説明",
+                "どういう意味",
+                "感想",
+            ],
+        )
+    {
+        return false;
+    }
+    contains_any(
+        &norm,
+        &[
+            "授業",
+            "课程",
+            "course",
+            "時間割",
+            "schedule",
+            "今日",
+            "今天",
+            "明日",
+            "明天",
+            "来週",
+            "下周",
+            "課題",
+            "レポート",
+            "todo",
+            "締切",
+            "deadline",
+            "メール",
+            "mail",
+            "通知",
+            "お知らせ",
+            "成績",
+            "grade",
+            "単位",
+            "ファイル",
+            "資料",
+            "添付",
+            "file",
+            "luna",
+            "kwic",
+            "kgc",
+            "ブラウザ",
+            "browser",
+            "ページ",
+            "page",
+            "http",
+            "カレンダー",
+            "calendar",
+            "日历",
+            "天気",
+            "weather",
+            "更新",
+            "refresh",
+        ],
+    )
+}
+
+async fn plan_after_browser_observation(
+    app: &AppHandle,
+    provider: &AgentProvider,
+    history: &[crate::db::AgentMessageRow],
+    user_text: &str,
+    conv_id: &str,
+    turn_context: &AgentTurnContext,
+) -> Result<Plan, AgentError> {
+    let mut note = "The page observation is complete. Continue the user's explicit browser operation now. Select concrete action tools that finish exactly the requested operation. Do not return an empty plan or repeat observation-only tools unless the target is still genuinely unclear. Do not submit, send, delete, purchase, or go beyond the requested action unless the user explicitly asked for it.".to_string();
+    for attempt in 0..=CFG.max_plan_repairs {
+        let plan = match run_plan_inference_with_note(
+            app,
+            provider,
+            history,
+            user_text,
+            conv_id,
+            Some(&note),
+            turn_context,
+        )
+        .await
+        {
+            Ok(plan) => plan,
+            Err(AgentError::Cancelled) => return Err(AgentError::Cancelled),
+            Err(error) => {
+                note = format!(
+                    "Continuation attempt {} failed: {error}. The page is already observed. Return valid tools JSON with the concrete browser action.",
+                    attempt + 1
+                );
+                continue;
+            }
+        };
+        let plan = finalize_plan(plan, history, user_text, turn_context);
+        if plan_contains_browser_action(&plan) {
+            return Ok(plan);
+        }
+        note = format!(
+            "Continuation attempt {} did not select a browser action. The page is already observed. Choose the concrete action tools needed for the user's explicit request.",
+            attempt + 1
+        );
+    }
+    Ok(Plan::default())
+}
+
+async fn plan_after_actionable_lookup(
+    app: &AppHandle,
+    provider: &AgentProvider,
+    history: &[crate::db::AgentMessageRow],
+    user_text: &str,
+    conv_id: &str,
+    turn_context: &AgentTurnContext,
+    allowed_actions: &[&str],
+) -> Result<Plan, AgentError> {
+    let mut note = "A lookup is complete and fresh results are available. Decide from the full meaning of the user's request whether a related action is still needed. If the user requested an action, perform exactly that action now. If they only requested information, return an empty plan. Do not infer action intent from one isolated keyword, and do not perform any destructive or external action unless the full request explicitly asks for it.".to_string();
+    for attempt in 0..=CFG.max_plan_repairs {
+        let plan = match run_plan_inference_with_note(
+            app,
+            provider,
+            history,
+            user_text,
+            conv_id,
+            Some(&note),
+            turn_context,
+        )
+        .await
+        {
+            Ok(plan) => plan,
+            Err(AgentError::Cancelled) => return Err(AgentError::Cancelled),
+            Err(error) => {
+                note = format!(
+                    "Action continuation attempt {} failed: {error}. Use the fresh lookup result and return valid tools JSON for exactly the requested action.",
+                    attempt + 1
+                );
+                continue;
+            }
+        };
+        let mut plan = finalize_plan(plan, history, user_text, turn_context);
+        plan.tools
+            .retain(|call| allowed_actions.contains(&call.name.as_str()));
+        if !plan.tools.is_empty() {
+            return Ok(plan);
+        }
+        return Ok(Plan::default());
+    }
+    Ok(Plan::default())
 }
 
 async fn run_plan_inference(
@@ -820,9 +1206,12 @@ fn summarize_plan_tool_result(name: &str, json: &str) -> String {
                 .take(3)
                 .map(|t| {
                     format!(
-                        "todo[title={}, course={}]",
+                        "todo[title={}, course={}, luna_id={}, type={}, deadline={}]",
                         t.get("title").and_then(|v| v.as_str()).unwrap_or(""),
-                        t.get("course").and_then(|v| v.as_str()).unwrap_or("")
+                        t.get("course").and_then(|v| v.as_str()).unwrap_or(""),
+                        t.get("luna_id").and_then(|v| v.as_str()).unwrap_or(""),
+                        t.get("type").and_then(|v| v.as_str()).unwrap_or(""),
+                        t.get("deadline").and_then(|v| v.as_str()).unwrap_or("")
                     )
                 })
                 .collect::<Vec<_>>()
@@ -963,6 +1352,12 @@ fn summarize_plan_tool_result(name: &str, json: &str) -> String {
             .get("url")
             .and_then(|v| v.as_str())
             .map(|url| format!("browser[url={}]", url)),
+        "open_copilot_page" => Some(format!(
+            "copilot[page={}, title={}, target={}]",
+            parsed.get("page").and_then(|v| v.as_str()).unwrap_or(""),
+            parsed.get("title").and_then(|v| v.as_str()).unwrap_or(""),
+            parsed.get("target").and_then(|v| v.as_str()).unwrap_or(""),
+        )),
         "search_notifications" | "list_recent_notifications" => parsed
             .get("notifications")
             .and_then(|v| v.as_array())
@@ -972,7 +1367,9 @@ fn summarize_plan_tool_result(name: &str, json: &str) -> String {
                     .take(3)
                     .map(|n| {
                         format!(
-                            "notification[title={}]",
+                            "notification[source={}, identifier={}, title={}]",
+                            n.get("source").and_then(|v| v.as_str()).unwrap_or(""),
+                            n.get("identifier").and_then(|v| v.as_str()).unwrap_or(""),
                             n.get("title").and_then(|v| v.as_str()).unwrap_or("")
                         )
                     })
@@ -1065,26 +1462,43 @@ fn summarize_plan_tool_result(name: &str, json: &str) -> String {
             ))
         }
         "get_luna_activity_detail" => {
-            let title = parsed.get("title").and_then(|v| v.as_str()).unwrap_or("");
+            let title = parsed
+                .get("matched_title")
+                .or_else(|| parsed.get("detail_title"))
+                .or_else(|| parsed.get("title"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let luna_id = parsed
+                .pointer("/source/luna_id")
+                .or_else(|| parsed.get("luna_id"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
             let deadline = parsed
                 .get("deadline")
                 .or_else(|| parsed.get("period"))
                 .and_then(|v| v.as_str())
                 .unwrap_or("");
+            let attachments = parsed
+                .get("attachments")
+                .and_then(|v| v.as_array())
+                .map(|items| {
+                    items
+                        .iter()
+                        .take(5)
+                        .filter_map(|a| a.get("name").and_then(|v| v.as_str()))
+                        .collect::<Vec<_>>()
+                        .join(" / ")
+                })
+                .unwrap_or_default();
             let body_preview = parsed
                 .get("body")
                 .or_else(|| parsed.get("description"))
                 .and_then(|v| v.as_str())
                 .map(|s| s.chars().take(80).collect::<String>())
                 .unwrap_or_default();
-            let attachment_count = parsed
-                .get("attachments")
-                .and_then(|v| v.as_array())
-                .map(|a| a.len())
-                .unwrap_or(0);
             Some(format!(
-                "activity[title={}, deadline={}, attachments={}, body_preview={}]",
-                title, deadline, attachment_count, body_preview
+                "activity[title={}, luna_id={}, attachments={}, deadline={}, body_preview={}]",
+                title, luna_id, attachments, deadline, body_preview
             ))
         }
         "list_luna_announcements" => {
@@ -1097,9 +1511,11 @@ fn summarize_plan_tool_result(name: &str, json: &str) -> String {
                         .take(5)
                         .map(|a| {
                             format!(
-                                "announce[course={}, title={}]",
-                                a.get("course").and_then(|v| v.as_str()).unwrap_or(""),
+                                "announce[title={}, luna_id={}, course={}, period={}]",
                                 a.get("title").and_then(|v| v.as_str()).unwrap_or(""),
+                                a.get("luna_id").and_then(|v| v.as_str()).unwrap_or(""),
+                                a.get("course").and_then(|v| v.as_str()).unwrap_or(""),
+                                a.get("period").and_then(|v| v.as_str()).unwrap_or(""),
                             )
                         })
                         .collect::<Vec<_>>()
@@ -1346,7 +1762,10 @@ fn summarize_plan_tool_result(name: &str, json: &str) -> String {
         }
         _ => None,
     };
-    trim_to(summary.as_deref().unwrap_or(json), 260)
+    trim_to(
+        summary.as_deref().unwrap_or(json),
+        CFG.plan_tool_result_chars,
+    )
 }
 
 fn append_browser_context(
@@ -1370,8 +1789,47 @@ fn append_browser_context(
              The current Agent panel is attached to this exact webview. For references like \
              \"this page\", \"current page\", \"这里\", \"这个页面\", \"このページ\", or \
              \"今見ている内容\", use target=\"{active}\" exactly. Do not use another window \
-             unless the user explicitly asks to operate a different named window.\n"
+             unless the user explicitly asks to operate a different named window.\n\
+             IMPORTANT: When the user asks about ANYTHING shown on this page — its content, \
+             course materials/教材/资料, lists, details, an item visible on screen — your FIRST \
+             step is to call read_browser_page(target=\"{active}\") and answer from what it \
+             returns. This attached page is the source of truth; its rendered content (e.g. a \
+             Luna course's material list) is already on screen. Do NOT say you lack the data or \
+             offer to fetch it from elsewhere before you have actually read this page. Prefer \
+             reading this page over data/list tools when the user is clearly referring to what \
+             they are currently looking at.\n"
         ));
+    }
+    let panes = &turn_context.view_pane_targets;
+    if panes.len() > 1 {
+        system.push_str(&format!(
+            "\n=== CURRENT SPLIT VIEW ({n} panes side by side) ===\n\
+             The user sees these {n} panes at once — they are ONE split view, not \
+             separate windows. For whole-view references (\"both\", \"两边\", \"全部\", \
+             \"比较\", \"この画面全体\", \"整个画面\") cover ALL of them. Read or operate \
+             each pane by passing its exact target to the browser tools \
+             (read_browser_page / browser_click / browser_fill / …); target is NOT \
+             restricted to the active pane inside this view.\n",
+            n = panes.len()
+        ));
+        for (idx, target) in panes.iter().enumerate() {
+            let is_active = active_target == Some(target.as_str());
+            let info = windows
+                .iter()
+                .find(|w| &w.target == target || &w.label == target);
+            let (title, url, kind) = info
+                .map(|w| (w.title.as_str(), w.url.as_str(), w.kind.as_str()))
+                .unwrap_or(("", "", ""));
+            system.push_str(&format!(
+                "- pane[{}]{} target={} type={} title={} url={}\n",
+                idx,
+                if is_active { " (active)" } else { "" },
+                target,
+                kind,
+                trim_to(title, 120),
+                trim_to(url, 240),
+            ));
+        }
     }
     if windows.is_empty() {
         system.push_str("No app browser window is currently registered.\n");
@@ -1435,6 +1893,26 @@ fn plan_repair_note(finalized: &FinalizedPlan) -> String {
     )
 }
 
+fn contains_unresolved_plan_placeholder(value: &Value) -> bool {
+    match value {
+        Value::String(text) => {
+            let trimmed = text.trim();
+            let Some(inner) = trimmed.strip_prefix('<').and_then(|s| s.strip_suffix('>')) else {
+                return false;
+            };
+            let ascii_letters: Vec<char> =
+                inner.chars().filter(|c| c.is_ascii_alphabetic()).collect();
+            !inner.is_empty()
+                && (inner.contains('_')
+                    || (!ascii_letters.is_empty()
+                        && ascii_letters.iter().all(|c| c.is_ascii_uppercase())))
+        }
+        Value::Array(items) => items.iter().any(contains_unresolved_plan_placeholder),
+        Value::Object(map) => map.values().any(contains_unresolved_plan_placeholder),
+        _ => false,
+    }
+}
+
 fn is_browser_target_scoped_tool(name: &str) -> bool {
     matches!(
         name,
@@ -1458,6 +1936,149 @@ fn is_browser_target_scoped_tool(name: &str) -> bool {
     )
 }
 
+fn is_browser_action_tool(name: &str) -> bool {
+    matches!(
+        name,
+        "browser_back"
+            | "browser_forward"
+            | "browser_reload_page"
+            | "browser_click"
+            | "browser_mouse_click"
+            | "browser_mouse_drag"
+            | "computer_mouse_click"
+            | "computer_mouse_drag"
+            | "computer_scroll"
+            | "browser_fill"
+            | "browser_select_option"
+            | "browser_press"
+            | "browser_scroll"
+            | "browser_close"
+    )
+}
+
+fn is_browser_mutation_tool(name: &str) -> bool {
+    matches!(
+        name,
+        "browser_back"
+            | "browser_forward"
+            | "browser_reload_page"
+            | "browser_click"
+            | "browser_mouse_click"
+            | "browser_mouse_drag"
+            | "computer_mouse_click"
+            | "computer_mouse_drag"
+            | "browser_fill"
+            | "browser_select_option"
+            | "browser_press"
+            | "browser_close"
+    )
+}
+
+fn plan_contains_browser_action(plan: &Plan) -> bool {
+    plan.tools
+        .iter()
+        .any(|call| is_browser_action_tool(&call.name))
+}
+
+fn is_agent_action_tool(name: &str) -> bool {
+    is_browser_action_tool(name)
+        || matches!(
+            name,
+            "write_downloaded_text_file"
+                | "open_downloaded_file"
+                | "delete_downloaded_file"
+                | "download_url"
+                | "open_luna_attachment"
+                | "download_luna_attachment"
+                | "download_course_material"
+                | "open_browser_url"
+                | "open_copilot_page"
+                | "create_google_calendar_event"
+                | "delete_google_calendar_event"
+                | "update_google_calendar_event"
+        )
+}
+
+fn should_continue_after_browser_observation(
+    _plan: &Plan,
+    results: &[(String, Value)],
+    user_text: &str,
+    turn_context: &AgentTurnContext,
+) -> bool {
+    turn_context.browser_target.is_some()
+        && is_browser_operation_intent(&normalize_planner_text(user_text))
+        && !results.iter().any(|(name, result)| {
+            is_browser_action_tool(name.as_str()) && result.get("error").is_none()
+        })
+        && results.iter().any(|(name, result)| {
+            matches!(name.as_str(), "read_browser_page" | "computer_screenshot")
+                && result.get("error").is_none()
+        })
+}
+
+fn should_continue_after_actionable_lookup(results: &[(String, Value)]) -> bool {
+    if results
+        .iter()
+        .any(|(name, _)| is_agent_action_tool(name.as_str()))
+    {
+        return false;
+    }
+    !allowed_lookup_followup_actions(results).is_empty()
+}
+
+fn allowed_lookup_followup_actions(results: &[(String, Value)]) -> Vec<&'static str> {
+    let successful = |name: &str| {
+        results
+            .iter()
+            .any(|(result_name, result)| result_name == name && result.get("error").is_none())
+    };
+    let mut allowed = Vec::new();
+    if successful("list_google_calendar_events") {
+        allowed.push("delete_google_calendar_event");
+        allowed.push("update_google_calendar_event");
+    }
+    if successful("list_downloaded_files") {
+        allowed.push("open_downloaded_file");
+        allowed.push("delete_downloaded_file");
+        if !successful("read_downloaded_file") {
+            allowed.push("read_downloaded_file");
+        }
+    }
+    let has_luna_list_lookup = results.iter().any(|(name, result)| {
+        matches!(name.as_str(), "list_luna_announcements" | "list_luna_todos")
+            && result.get("error").is_none()
+    });
+    let has_luna_lookup = results.iter().any(|(name, result)| {
+        matches!(
+            name.as_str(),
+            "get_luna_activity_detail" | "list_luna_announcements" | "list_luna_todos"
+        ) && result.get("error").is_none()
+    });
+    if has_luna_list_lookup && !successful("get_luna_activity_detail") {
+        allowed.push("get_luna_activity_detail");
+    }
+    if has_luna_lookup {
+        allowed.push("open_copilot_page");
+        allowed.push("open_luna_attachment");
+        allowed.push("download_luna_attachment");
+        allowed.push("download_course_material");
+    }
+    let has_notification_list = results.iter().any(|(name, result)| {
+        matches!(
+            name.as_str(),
+            "list_recent_notifications" | "search_notifications"
+        ) && result.get("error").is_none()
+    });
+    let has_notification_detail = successful("get_notification_detail");
+    if has_notification_list && !has_notification_detail {
+        allowed.push("get_notification_detail");
+    }
+    if has_notification_list || has_notification_detail {
+        allowed.push("open_copilot_page");
+    }
+    allowed
+}
+
 fn apply_browser_target_lock(
     tool_name: &str,
     mut args: Value,
@@ -1471,7 +2092,16 @@ fn apply_browser_target_lock(
     }
     if let Value::Object(map) = &mut args {
         let old_target = map.get("target").and_then(|v| v.as_str()).unwrap_or("");
-        if old_target != target {
+        // Allow any pane of the current split view (active tab's main webview +
+        // split children). Only force the attached/active target when the request
+        // has no target or points outside the current view (e.g. an unrelated
+        // window), preserving the "don't wander off" guard.
+        let in_current_view = !old_target.is_empty()
+            && turn_context
+                .view_pane_targets
+                .iter()
+                .any(|pane| pane == old_target);
+        if old_target != target && !in_current_view {
             if !old_target.is_empty() {
                 log::warn!(
                     "[agent plan] browser target locked: tool={} requested={} forced={}",
@@ -1511,6 +2141,15 @@ fn finalize_plan_with_diagnostics(
                 unknown_tools.push(call.name);
                 return None;
             };
+            if contains_unresolved_plan_placeholder(&call.args) {
+                log::warn!(
+                    "[agent plan] tool dropped because args contain unresolved placeholder: name={} args={}",
+                    name,
+                    call.args
+                );
+                invalid_args.push(name.to_string());
+                return None;
+            }
             let sanitized = agent_tools::sanitize_tool_args(name, &call.args);
             if sanitized.is_none() {
                 log::warn!(
@@ -1559,13 +2198,64 @@ async fn execute_tools(
     let mut results = Vec::new();
     let mut auto_read_done = false;
     let mut auto_mouse_done = false;
+    let mut browser_mutation_failed = false;
     let plan_already_reads_file = plan
         .tools
         .iter()
         .any(|call| call.name == "read_downloaded_file");
+    let plan_already_reads_browser_page = plan
+        .tools
+        .iter()
+        .any(|call| call.name == "read_browser_page");
+    if !plan.tools.is_empty() {
+        emit(
+            app,
+            conv_id,
+            &StreamEvent::Plan {
+                steps: plan
+                    .tools
+                    .iter()
+                    .map(|call| StreamPlanStep {
+                        name: call.name.as_str(),
+                        detail: plan_step_detail(call),
+                    })
+                    .collect(),
+            },
+        );
+    }
     for call in plan.tools.iter().take(CFG.max_tools) {
         if AgentProvider::is_cancelled(conv_id) {
             return Err(AgentError::Cancelled);
+        }
+        if browser_mutation_failed && is_browser_mutation_tool(&call.name) {
+            let result = json!({
+                "error": "skipped because an earlier browser interaction failed; re-observe the page before another interaction",
+            });
+            let preview = preview_of(&result);
+            log::warn!(
+                "[agent tool] skipped browser interaction after earlier failure name={}",
+                call.name
+            );
+            emit(
+                app,
+                conv_id,
+                &StreamEvent::ToolResult {
+                    name: &call.name,
+                    preview: &preview,
+                    ok: false,
+                },
+            );
+            let tool_json = serde_json::to_string(&result).unwrap_or_else(|_| "{}".into());
+            let _ = db.agent_append_message(
+                conv_id,
+                "tool",
+                "",
+                None,
+                Some(&call.name),
+                Some(&tool_json),
+            );
+            results.push((call.name.clone(), result));
+            continue;
         }
         emit(app, conv_id, &StreamEvent::ToolCall { name: &call.name });
         let started = std::time::Instant::now();
@@ -1596,6 +2286,9 @@ async fn execute_tools(
             }
         };
         let ok = result.get("error").is_none();
+        if !ok && is_browser_mutation_tool(&call.name) {
+            browser_mutation_failed = true;
+        }
         let preview = preview_of(&result);
         log::debug!(
             "[agent tool] finish name={} ok={} elapsed_ms={} preview={}",
@@ -1629,6 +2322,20 @@ async fn execute_tools(
 
         if AgentProvider::is_cancelled(conv_id) {
             return Err(AgentError::Cancelled);
+        }
+
+        if !ok
+            && is_browser_mutation_tool(&call.name)
+            && !plan_already_reads_browser_page
+            && turn_context.browser_target.is_some()
+        {
+            let read_args = apply_browser_target_lock("read_browser_page", json!({}), turn_context);
+            let read_result =
+                execute_auto_tool(app, conv_id, db, "read_browser_page", read_args).await?;
+            results.push(("read_browser_page".into(), read_result));
+            if AgentProvider::is_cancelled(conv_id) {
+                return Err(AgentError::Cancelled);
+            }
         }
 
         if !auto_mouse_done
@@ -3076,6 +3783,7 @@ fn neutralize_tool_call_syntax(s: &str) -> String {
 // model when no rule matches.  This avoids a model round-trip for the most
 // common queries and is cheaper than 20+ if-else branches.
 
+#[cfg(test)]
 struct HeuristicRule {
     keywords: &'static [&'static str],
     /// Extra keywords that must ALSO match (empty = no extra requirement).
@@ -3084,6 +3792,7 @@ struct HeuristicRule {
     args: fn() -> Value,
 }
 
+#[cfg(test)]
 const HEURISTIC_RULES: &[HeuristicRule] = &[
     HeuristicRule {
         keywords: &["天気", "weather", "天气"],
@@ -3316,6 +4025,7 @@ const HEURISTIC_RULES: &[HeuristicRule] = &[
     },
 ];
 
+#[cfg(test)]
 fn heuristic_plan(history: &[crate::db::AgentMessageRow], user_text: &str) -> Option<Plan> {
     if should_skip_tools(history, user_text) {
         return Some(Plan::default());
@@ -3324,6 +4034,10 @@ fn heuristic_plan(history: &[crate::db::AgentMessageRow], user_text: &str) -> Op
     let norm = normalize_planner_text(user_text);
 
     if is_browser_operation_intent(&norm) {
+        return None;
+    }
+
+    if has_multiple_tool_domains(&norm) {
         return None;
     }
 
@@ -3445,6 +4159,38 @@ fn heuristic_plan(history: &[crate::db::AgentMessageRow], user_text: &str) -> Op
     None // Fall through to model inference.
 }
 
+#[cfg(test)]
+fn has_multiple_tool_domains(norm: &str) -> bool {
+    const DOMAINS: &[&[&str]] = &[
+        &["メール", "mail", "邮件", "郵件"],
+        &[
+            "課題",
+            "レポート",
+            "todo",
+            "task",
+            "作业",
+            "作業",
+            "締切",
+            "deadline",
+        ],
+        &["授業", "時間割", "schedule", "class", "课程", "上课"],
+        &["成績", "grade", "成绩", "単位", "credit"],
+        &["お知らせ", "通知", "notification"],
+        &["ファイル", "資料", "添付", "file", "attachment", "文件"],
+        &["天気", "weather", "天气"],
+        &["カレンダー", "calendar", "日历", "日程"],
+        &["luna", "ルナ"],
+        &["kwic"],
+        &["kgcourse", "kgc"],
+    ];
+    DOMAINS
+        .iter()
+        .filter(|markers| contains_any(norm, markers))
+        .take(2)
+        .count()
+        >= 2
+}
+
 fn is_browser_operation_intent(norm: &str) -> bool {
     contains_any(
         norm,
@@ -3458,10 +4204,21 @@ fn is_browser_operation_intent(norm: &str) -> bool {
             "click",
             "填写",
             "填",
+            "fill",
+            "typeinto",
             "入力",
+            "入力して",
             "submit",
+            "送信",
+            "提出して",
             "选择",
             "選択",
+            "選んで",
+            "select",
+            "choose",
+            "保存",
+            "save",
+            "決定",
             "scroll",
             "スクロール",
             "拖拽",
@@ -3612,8 +4369,32 @@ fn extract_between_any(s: &str, pairs: &[(&str, &str)]) -> Option<String> {
     None
 }
 
+#[cfg(test)]
 fn campus_browser_plan(norm: &str) -> Option<Plan> {
     if is_browser_operation_intent(norm) {
+        return None;
+    }
+
+    // Distinguish "open Luna (the site root)" from "see the Luna *detail / content
+    // / materials*" — the latter is about the page the user is already looking at,
+    // not the portal root. When the request names specific content, fall through
+    // to the model so it reads the current page (read_browser_page) or uses a
+    // detail tool, instead of hard-jumping to the site root.
+    if contains_any(
+        norm,
+        &[
+            "详情",
+            "詳細",
+            "詳细",
+            "detail",
+            "内容",
+            "中身",
+            "なかみ",
+            "教材",
+            "资料",
+            "資料",
+        ],
+    ) {
         return None;
     }
 
@@ -3638,19 +4419,19 @@ fn campus_browser_plan(norm: &str) -> Option<Plan> {
     if contains_any(norm, &["luna", "ルナ"]) {
         return Some(single_tool_plan(
             "open_browser_url",
-            json!({ "url": config::LUNA_BASE }),
+            json!({ "url": crate::config::LUNA_BASE }),
         ));
     }
     if contains_any(norm, &["kwic"]) {
         return Some(single_tool_plan(
             "open_browser_url",
-            json!({ "url": config::KWIC_BASE }),
+            json!({ "url": crate::config::KWIC_BASE }),
         ));
     }
     if contains_any(norm, &["kgcourse", "kgc"]) {
         return Some(single_tool_plan(
             "open_browser_url",
-            json!({ "url": config::KG_COURSE_BASE }),
+            json!({ "url": crate::config::KG_COURSE_BASE }),
         ));
     }
 
@@ -3725,6 +4506,7 @@ fn is_smalltalk_or_identity(norm: &str) -> bool {
     false
 }
 
+#[cfg(test)]
 fn recent_downloaded_file_path(history: &[crate::db::AgentMessageRow]) -> Option<String> {
     history
         .iter()
@@ -3986,8 +4768,8 @@ fn parse_plan(raw: &str) -> Result<Plan, String> {
     let trimmed = cleaned.trim();
 
     // Fast path: try parsing the entire string as JSON first (works with prefill).
-    if let Ok(plan) = serde_json::from_str::<Plan>(trimmed) {
-        return Ok(plan);
+    if let Ok(value) = serde_json::from_str::<Value>(trimmed) {
+        return plan_from_value(value);
     }
 
     if let Some(call) = parse_visible_tool_call(trimmed) {
@@ -4003,8 +4785,8 @@ fn parse_plan(raw: &str) -> Result<Plan, String> {
 
     // Fallback: find the first JSON object in the string.
     if let Some(obj) = first_json_object(trimmed) {
-        match serde_json::from_str::<Plan>(obj) {
-            Ok(p) => return Ok(p),
+        match serde_json::from_str::<Value>(obj) {
+            Ok(value) => return plan_from_value(value),
             Err(e) => log::warn!("plan JSON parse error: {} (raw: {})", e, obj),
         }
     } else if trimmed.contains("\"tools\"") {
@@ -4014,7 +4796,17 @@ fn parse_plan(raw: &str) -> Result<Plan, String> {
             trimmed
         );
     }
-    Ok(Plan::default())
+    Err(format!(
+        "planner returned invalid output: {}",
+        truncate_for_log(trimmed, 240)
+    ))
+}
+
+fn plan_from_value(value: Value) -> Result<Plan, String> {
+    if !value.get("tools").is_some_and(Value::is_array) {
+        return Err("planner JSON is missing a tools array".to_string());
+    }
+    serde_json::from_value(value).map_err(|e| format!("invalid planner JSON: {e}"))
 }
 
 fn first_json_object(s: &str) -> Option<&str> {
@@ -4071,6 +4863,7 @@ fn contains_any(text: &str, needles: &[&str]) -> bool {
     needles.iter().any(|n| text.contains(n))
 }
 
+#[cfg(test)]
 fn extract_kgc_code(text: &str) -> Option<String> {
     let mut start = None;
     for (idx, ch) in text.char_indices() {
@@ -4096,6 +4889,7 @@ fn extract_kgc_code(text: &str) -> Option<String> {
 /// Adding the whitelist here prevents tokens like `PDF12345` or `MAC10000` —
 /// which fit the structural pattern of letters+digits — from being
 /// dispatched as syllabus lookups.
+#[cfg(test)]
 const KGC_PREFIX_WHITELIST: &[&str] = &[
     "AB", "AE", "AL", "AS", "BL", "BU", "CO", "CS", "DC", "EC", "ED", "EN", "FD", "GE", "GS", "HS",
     "HU", "IB", "IC", "IS", "JP", "LA", "LB", "LE", "LI", "LR", "LS", "MA", "MD", "ME", "MM", "MS",
@@ -4103,6 +4897,7 @@ const KGC_PREFIX_WHITELIST: &[&str] = &[
     "TH", "TM", "TS", "UC",
 ];
 
+#[cfg(test)]
 fn looks_like_kgc_code(token: &str) -> bool {
     let letters_n = token
         .chars()
@@ -4240,7 +5035,7 @@ mod tests {
         assert_eq!(plan.tools[0].name, "open_browser_url");
         assert_eq!(
             plan.tools[0].args.get("url").and_then(|v| v.as_str()),
-            Some(config::LUNA_BASE)
+            Some(crate::config::LUNA_BASE)
         );
     }
 
@@ -4277,6 +5072,224 @@ mod tests {
             .expect("attached browser click plan");
         assert_eq!(plan.tools.len(), 1);
         assert_eq!(plan.tools[0].name, "computer_screenshot");
+    }
+
+    #[test]
+    fn explicit_fill_continues_after_page_observation() {
+        let plan = single_tool_plan("read_browser_page", json!({}));
+        let results = vec![(
+            "read_browser_page".into(),
+            json!({"inputs":[{"label":"名前"}]}),
+        )];
+        let ctx = AgentTurnContext {
+            browser_target: Some("ext-a-ct".into()),
+            ..Default::default()
+        };
+        assert!(should_continue_after_browser_observation(
+            &plan,
+            &results,
+            "名前にSelahと入力して",
+            &ctx
+        ));
+        assert!(should_continue_after_browser_observation(
+            &plan,
+            &results,
+            "fill the name field",
+            &ctx
+        ));
+    }
+
+    #[test]
+    fn browser_observation_does_not_continue_after_action_or_for_read_only_request() {
+        let observation = single_tool_plan("read_browser_page", json!({}));
+        let clicked = vec![
+            ("read_browser_page".into(), json!({"buttons":["次へ"]})),
+            ("browser_click".into(), json!({"ok":true})),
+        ];
+        let ctx = AgentTurnContext {
+            browser_target: Some("ext-a-ct".into()),
+            ..Default::default()
+        };
+        assert!(!should_continue_after_browser_observation(
+            &observation,
+            &clicked,
+            "次へをクリック",
+            &ctx
+        ));
+        assert!(!should_continue_after_browser_observation(
+            &observation,
+            &[("read_browser_page".into(), json!({"text":"本文"}))],
+            "このページを要約して",
+            &ctx
+        ));
+    }
+
+    #[test]
+    fn failed_browser_action_can_reobserve_and_continue_safely() {
+        let attempted = single_tool_plan("browser_click", json!({"text":"次へ"}));
+        let results = vec![
+            ("browser_click".into(), json!({"error":"not found"})),
+            (
+                "read_browser_page".into(),
+                json!({"buttons":[{"text":"続ける"}]}),
+            ),
+        ];
+        let ctx = AgentTurnContext {
+            browser_target: Some("ext-a-ct".into()),
+            ..Default::default()
+        };
+        assert!(should_continue_after_browser_observation(
+            &attempted,
+            &results,
+            "次へをクリック",
+            &ctx
+        ));
+        assert!(is_browser_mutation_tool("browser_click"));
+        assert!(is_browser_mutation_tool("browser_fill"));
+        assert!(!is_browser_mutation_tool("read_browser_page"));
+        assert!(!is_browser_mutation_tool("browser_wait_for"));
+    }
+
+    #[test]
+    fn lookup_followup_candidates_are_scoped_by_fresh_result_type() {
+        let calendar = vec![(
+            "list_google_calendar_events".into(),
+            json!({"events":[{"event_id":"event-1","title":"試験"}]}),
+        )];
+        assert_eq!(
+            allowed_lookup_followup_actions(&calendar),
+            vec![
+                "delete_google_calendar_event",
+                "update_google_calendar_event"
+            ]
+        );
+        assert!(should_continue_after_actionable_lookup(&calendar));
+
+        let files = vec![(
+            "list_downloaded_files".into(),
+            json!({"files":[{"path":"/tmp/a.pdf"}]}),
+        )];
+        assert_eq!(
+            allowed_lookup_followup_actions(&files),
+            vec![
+                "open_downloaded_file",
+                "delete_downloaded_file",
+                "read_downloaded_file"
+            ]
+        );
+
+        let luna = vec![(
+            "list_luna_todos".into(),
+            json!({"todos":[{"title":"第7回課題","luna_id":"LUNA-42"}]}),
+        )];
+        assert_eq!(
+            allowed_lookup_followup_actions(&luna),
+            vec![
+                "get_luna_activity_detail",
+                "open_copilot_page",
+                "open_luna_attachment",
+                "download_luna_attachment",
+                "download_course_material"
+            ]
+        );
+
+        let notifications = vec![(
+            "search_notifications".into(),
+            json!({"notifications":[{"title":"履修登録のお知らせ"}]}),
+        )];
+        assert_eq!(
+            allowed_lookup_followup_actions(&notifications),
+            vec!["get_notification_detail", "open_copilot_page"]
+        );
+
+        let notification_detail = vec![(
+            "get_notification_detail".into(),
+            json!({"source":"KWIC","title":"履修登録のお知らせ"}),
+        )];
+        assert_eq!(
+            allowed_lookup_followup_actions(&notification_detail),
+            vec!["open_copilot_page"]
+        );
+
+        let luna_detail = vec![
+            (
+                "list_luna_todos".into(),
+                json!({"todos":[{"title":"第7回課題","luna_id":"LUNA-42"}]}),
+            ),
+            (
+                "get_luna_activity_detail".into(),
+                json!({"matched_title":"第7回課題","activity_type":"report"}),
+            ),
+        ];
+        assert!(
+            !allowed_lookup_followup_actions(&luna_detail).contains(&"get_luna_activity_detail")
+        );
+    }
+
+    #[test]
+    fn planner_summaries_keep_dynamic_action_identifiers() {
+        let calendar = summarize_plan_tool_result(
+            "list_google_calendar_events",
+            r#"{"events":[{"event_id":"event-123","title":"試験","date":"2026-06-15","start_time":"10:00","end_time":"11:00"}]}"#,
+        );
+        assert!(calendar.contains("event-123"));
+
+        let files = summarize_plan_tool_result(
+            "list_downloaded_files",
+            r#"{"files":[{"path":"/tmp/lecture.pdf","filename":"lecture.pdf"}]}"#,
+        );
+        assert!(files.contains("/tmp/lecture.pdf"));
+
+        let detail = summarize_plan_tool_result(
+            "get_luna_activity_detail",
+            r#"{"matched_title":"第7回課題","period":"2026-06-20","source":{"luna_id":"LUNA-42"},"attachments":[{"name":"instructions.pdf"},{"name":"answer.docx"}]}"#,
+        );
+        assert!(detail.contains("title=第7回課題"));
+        assert!(detail.contains("luna_id=LUNA-42"));
+        assert!(detail.contains("instructions.pdf / answer.docx"));
+
+        let announcements = summarize_plan_tool_result(
+            "list_luna_announcements",
+            r#"{"announcements":[{"title":"第7回資料","course":"政治学","period":"2026-06-12","luna_id":"LUNA-42"}]}"#,
+        );
+        assert!(announcements.contains("title=第7回資料"));
+        assert!(announcements.contains("luna_id=LUNA-42"));
+
+        let notifications = summarize_plan_tool_result(
+            "search_notifications",
+            r#"{"notifications":[{"source":"KWIC","identifier":"notice-7","title":"履修登録"}]}"#,
+        );
+        assert!(notifications.contains("source=KWIC"));
+        assert!(notifications.contains("identifier=notice-7"));
+
+        let browser = summarize_plan_tool_result(
+            "list_browser_windows",
+            r#"{"windows":[{"target":"tab-1","type":"detail","title":"第7回課題","url":"index.html#surface=university-detail"}]}"#,
+        );
+        assert!(browser.contains("type=detail"));
+        assert!(browser.contains("title=第7回課題"));
+    }
+
+    #[test]
+    fn visible_plan_steps_are_specific_without_exposing_field_values() {
+        let click = ToolCall {
+            name: "browser_click".into(),
+            args: json!({"text":"次へ"}),
+        };
+        assert_eq!(plan_step_detail(&click).as_deref(), Some("次へ"));
+
+        let file = ToolCall {
+            name: "read_downloaded_file".into(),
+            args: json!({"path":"/Users/haru/Downloads/lecture.pdf"}),
+        };
+        assert_eq!(plan_step_detail(&file).as_deref(), Some("lecture.pdf"));
+
+        let fill = ToolCall {
+            name: "browser_fill".into(),
+            args: json!({"label":"パスワード","value":"secret-value"}),
+        };
+        assert_eq!(plan_step_detail(&fill).as_deref(), Some("パスワード"));
+        assert_ne!(plan_step_detail(&fill).as_deref(), Some("secret-value"));
     }
 
     #[test]
@@ -4665,9 +5678,10 @@ mod tests {
     }
 
     #[test]
-    fn parse_plan_empty_on_garbage() {
-        let plan = parse_plan("not json at all").unwrap();
-        assert!(plan.tools.is_empty());
+    fn parse_plan_rejects_garbage_for_retry() {
+        assert!(parse_plan("not json at all").is_err());
+        assert!(parse_plan(r#"{"tools":[{"name":"get_weather""#).is_err());
+        assert!(parse_plan(r#"{"answer":"I will check"}"#).is_err());
     }
 
     #[test]
@@ -4712,6 +5726,79 @@ mod tests {
     fn multi_tool_query_falls_to_model() {
         // Queries requiring multiple tools or ambiguous intent should NOT match a single heuristic.
         assert!(heuristic_plan(&[], "来週の予定を全部まとめて教えて、準備するものも").is_none());
+        assert!(heuristic_plan(&[], "看看邮件和课题").is_none());
+        assert!(heuristic_plan(&[], "LunaとKWICを開いて").is_none());
+    }
+
+    #[test]
+    fn production_preplan_leaves_business_intent_to_model() {
+        let ctx = AgentTurnContext::default();
+        assert!(deterministic_preplan(&[], "打开Luna看看", &ctx).is_none());
+        assert!(deterministic_preplan(&[], "看看邮件", &ctx).is_none());
+        assert!(deterministic_preplan(&[], "打开相关Copilot页面", &ctx).is_none());
+        assert!(deterministic_preplan(&[], "明天有什么课", &ctx).is_none());
+    }
+
+    #[test]
+    fn planner_failure_reads_attached_page_instead_of_doing_nothing() {
+        let ctx = AgentTurnContext {
+            browser_target: Some("detail-a-ct".into()),
+            ..Default::default()
+        };
+        let plan = planner_failure_fallback(&[], "这个页面有什么", &ctx);
+        assert_eq!(plan.tools.len(), 1);
+        assert_eq!(plan.tools[0].name, "read_browser_page");
+        assert_eq!(
+            plan.tools[0]
+                .args
+                .get("target")
+                .and_then(|value| value.as_str()),
+            Some("detail-a-ct")
+        );
+    }
+
+    #[test]
+    fn empty_plan_retries_for_data_requests_but_not_recent_summaries() {
+        assert!(should_retry_empty_plan(
+            &[],
+            "下周的课程和课题怎么样",
+            &AgentTurnContext::default()
+        ));
+        assert!(!should_retry_empty_plan(
+            &[tool_row("list_luna_todos")],
+            "总结一下",
+            &AgentTurnContext::default()
+        ));
+        assert!(!should_retry_empty_plan(
+            &[],
+            "帮我解释一下这个概念",
+            &AgentTurnContext::default()
+        ));
+    }
+
+    #[test]
+    fn finalized_plan_allows_six_step_chain() {
+        let plan = Plan {
+            tools: [
+                "get_weather",
+                "list_recent_mail",
+                "list_luna_todos",
+                "list_today_classes",
+                "list_recent_notifications",
+                "get_grades",
+                "get_registration",
+            ]
+            .into_iter()
+            .map(|name| ToolCall {
+                name: name.into(),
+                args: json!({}),
+            })
+            .collect(),
+            image_only: false,
+        };
+        let finalized =
+            finalize_plan_with_diagnostics(plan, &[], "全部まとめて", &AgentTurnContext::default());
+        assert_eq!(finalized.plan.tools.len(), 6);
     }
 
     #[test]
@@ -5206,6 +6293,10 @@ mod tests {
                     name: "open_browser_url".into(),
                     args: serde_json::json!({ "url": "https://example.com" }),
                 },
+                ToolCall {
+                    name: "read_downloaded_file".into(),
+                    args: serde_json::json!({ "path": "<PATH_FROM_LIST>" }),
+                },
             ],
             image_only: false,
         };
@@ -5216,10 +6307,29 @@ mod tests {
             &AgentTurnContext::default(),
         );
         assert_eq!(finalized.unknown_tools, vec!["launch_browser"]);
-        assert_eq!(finalized.invalid_args, vec!["browser_click"]);
+        assert_eq!(
+            finalized.invalid_args,
+            vec!["browser_click", "read_downloaded_file"]
+        );
         assert_eq!(finalized.plan.tools.len(), 1);
         assert_eq!(finalized.plan.tools[0].name, "open_browser_url");
         assert!(plan_repair_note(&finalized).contains("launch_browser"));
+    }
+
+    #[test]
+    fn placeholder_detection_does_not_reject_literal_markup() {
+        assert!(contains_unresolved_plan_placeholder(
+            &json!({"path":"<PATH_FROM_LIST>"})
+        ));
+        assert!(contains_unresolved_plan_placeholder(
+            &json!({"event_id":"<event_id_from_list>"})
+        ));
+        assert!(!contains_unresolved_plan_placeholder(
+            &json!({"value":"<div>"})
+        ));
+        assert!(!contains_unresolved_plan_placeholder(
+            &json!({"value":"<日本語>"})
+        ));
     }
 
     #[test]
