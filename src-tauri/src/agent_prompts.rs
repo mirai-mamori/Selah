@@ -325,8 +325,9 @@ No tools:
 - weather -> get_weather
 - weekly overview -> get_weekly_summary
 - today brief / overview / 今日まとめ -> get_today_brief
-- search mail by keyword -> search_mail
-- notification body / detail / 内容 / 本文 -> get_notification_detail (after list_recent_notifications or search_notifications)
+- search mail by keyword -> list_recent_mail (keyword=...)
+- search notifications by keyword -> list_recent_notifications (keyword=...)
+- notification body / detail / 内容 / 本文 -> get_notification_detail (after list_recent_notifications)
 - luna course announcements -> list_luna_announcements
 - delete a downloaded file -> delete_downloaded_file
 - save a URL to downloads -> download_url

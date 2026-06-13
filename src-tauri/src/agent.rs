@@ -112,6 +112,9 @@ struct AgentConfig {
     max_answer_repairs: usize,
     /// How many times Phase 1 may retry after selecting unknown/invalid tools.
     max_plan_repairs: usize,
+    /// Max adaptive plan→execute→observe steps per turn (incl. the first plan).
+    /// Enables "act, observe, re-plan" instead of failing on the first problem.
+    max_agent_steps: usize,
 }
 
 /// Tools that are known to take much longer than `tool_timeout_secs` because
@@ -150,6 +153,7 @@ const CFG: AgentConfig = AgentConfig {
     answer_timeout_secs: 90,
     max_answer_repairs: 2,
     max_plan_repairs: 2,
+    max_agent_steps: 8,
 };
 
 static ACTIVE_AGENT_TURNS: LazyLock<Mutex<HashSet<String>>> =
@@ -358,7 +362,7 @@ async fn run_turn(
     let db = app.state::<Database>();
 
     // 1. Persist user message.
-    persist_user_message(&db, conv_id, &user_text, &user_images)?;
+    persist_user_message(app, &db, conv_id, &user_text, &user_images)?;
 
     // 2. Load conversation history.
     let history = db.agent_load_messages(conv_id).unwrap_or_default();
@@ -387,49 +391,49 @@ async fn run_turn(
         return Err(AgentError::Cancelled);
     }
 
-    if should_continue_after_browser_observation(&plan, &tool_results, &user_text, &turn_context) {
-        let follow_history = db.agent_load_messages(conv_id).unwrap_or_default();
-        match plan_after_browser_observation(
-            app,
-            &provider,
-            &follow_history,
-            &user_text,
-            conv_id,
-            &turn_context,
-        )
-        .await
-        {
-            Ok(next_plan) => {
-                let follow_results =
-                    execute_tools(app, conv_id, &db, &next_plan, &user_text, &turn_context).await?;
-                tool_results.extend(follow_results);
-            }
-            Err(AgentError::Cancelled) => return Err(AgentError::Cancelled),
-            Err(error) => log::warn!("[agent plan] observation follow-up failed: {}", error),
+    // Adaptive agent loop: after each batch of tools, feed the results (including
+    // any errors and screenshots) back to the model and let it decide the NEXT
+    // step — observe, retry differently, or stop. This replaces the old fixed
+    // two-phase continuation so the agent can work step by step and recover from
+    // problems instead of failing on the first one.
+    let mut last_batch_len = tool_results.len();
+    for _step in 1..CFG.max_agent_steps {
+        if AgentProvider::is_cancelled(conv_id) {
+            return Err(AgentError::Cancelled);
         }
-    }
-
-    if should_continue_after_actionable_lookup(&tool_results) {
+        let batch_start = tool_results.len().saturating_sub(last_batch_len);
+        let last_batch = &tool_results[batch_start..];
+        if !agent_loop_should_continue(last_batch, &tool_results, &user_text, &turn_context) {
+            break;
+        }
         let follow_history = db.agent_load_messages(conv_id).unwrap_or_default();
-        let allowed_actions = allowed_lookup_followup_actions(&tool_results);
-        match plan_after_actionable_lookup(
+        let next_plan = match plan_next_step(
             app,
             &provider,
             &follow_history,
             &user_text,
             conv_id,
             &turn_context,
-            &allowed_actions,
         )
         .await
         {
-            Ok(next_plan) => {
-                let follow_results =
-                    execute_tools(app, conv_id, &db, &next_plan, &user_text, &turn_context).await?;
-                tool_results.extend(follow_results);
-            }
+            Ok(next_plan) => next_plan,
             Err(AgentError::Cancelled) => return Err(AgentError::Cancelled),
-            Err(error) => log::warn!("[agent plan] lookup follow-up failed: {}", error),
+            Err(error) => {
+                log::warn!("[agent loop] next-step planning failed: {}", error);
+                break;
+            }
+        };
+        // An empty plan is the model signalling it has everything it needs.
+        if next_plan.tools.is_empty() {
+            break;
+        }
+        let follow_results =
+            execute_tools(app, conv_id, &db, &next_plan, &user_text, &turn_context).await?;
+        last_batch_len = follow_results.len();
+        tool_results.extend(follow_results);
+        if last_batch_len == 0 {
+            break;
         }
     }
 
@@ -608,6 +612,7 @@ async fn run_turn(
 }
 
 fn persist_user_message(
+    app: &AppHandle,
     db: &Database,
     conv_id: &str,
     user_text: &str,
@@ -627,7 +632,7 @@ fn persist_user_message(
         None,
     )
     .map_err(AgentError::db)?;
-    maybe_autotitle(db, conv_id, user_text);
+    maybe_autotitle(app, db, conv_id, user_text);
     Ok(())
 }
 
@@ -911,7 +916,10 @@ fn should_retry_empty_plan(
     )
 }
 
-async fn plan_after_browser_observation(
+/// Plan the next step of the adaptive agent loop. Unlike the old fixed
+/// continuations, this may return an empty plan (the model is done) and is told
+/// to observe-and-adapt on failure rather than give up.
+async fn plan_next_step(
     app: &AppHandle,
     provider: &AgentProvider,
     history: &[crate::db::AgentMessageRow],
@@ -919,82 +927,56 @@ async fn plan_after_browser_observation(
     conv_id: &str,
     turn_context: &AgentTurnContext,
 ) -> Result<Plan, AgentError> {
-    let mut note = "The page observation is complete. Continue the user's explicit browser operation now. Select concrete action tools that finish exactly the requested operation. Do not return an empty plan or repeat observation-only tools unless the target is still genuinely unclear. Do not submit, send, delete, purchase, or go beyond the requested action unless the user explicitly asked for it.".to_string();
-    for attempt in 0..=CFG.max_plan_repairs {
-        let plan = match run_plan_inference_with_note(
-            app,
-            provider,
-            history,
-            user_text,
-            conv_id,
-            Some(&note),
-            turn_context,
-        )
-        .await
-        {
-            Ok(plan) => plan,
-            Err(AgentError::Cancelled) => return Err(AgentError::Cancelled),
-            Err(error) => {
-                note = format!(
-                    "Continuation attempt {} failed: {error}. The page is already observed. Return valid tools JSON with the concrete browser action.",
-                    attempt + 1
-                );
-                continue;
-            }
-        };
-        let plan = finalize_plan(plan, history, user_text, turn_context);
-        if plan_contains_browser_action(&plan) {
-            return Ok(plan);
-        }
-        note = format!(
-            "Continuation attempt {} did not select a browser action. The page is already observed. Choose the concrete action tools needed for the user's explicit request.",
-            attempt + 1
-        );
-    }
-    Ok(Plan::default())
+    let note = "You have already executed one or more tools; their results — including any errors and screenshots — are in the context above. Decide the NEXT step:\n\
+        - If the request still needs work, return the focused next tool(s) for it.\n\
+        - If a previous step FAILED, do NOT give up: first observe (read_browser_page, or computer_screenshot to actually see the page), then try a different approach (different selector/text, coordinates, scroll, or wait_for).\n\
+        - After an action, verify it worked by re-reading or screenshotting before moving on.\n\
+        - When you already have everything needed to answer, return an empty tools array to finish.\n\
+        Never submit, send, delete, purchase, or take any other irreversible action unless the user explicitly asked for it.";
+    let plan = run_plan_inference_with_note(
+        app,
+        provider,
+        history,
+        user_text,
+        conv_id,
+        Some(note),
+        turn_context,
+    )
+    .await?;
+    Ok(finalize_plan(plan, history, user_text, turn_context))
 }
 
-async fn plan_after_actionable_lookup(
-    app: &AppHandle,
-    provider: &AgentProvider,
-    history: &[crate::db::AgentMessageRow],
+/// Whether the adaptive loop should ask the model for another step after the
+/// just-executed batch. Keeps pure information lookups single-shot, but keeps
+/// going for browser/computer operations, lookup→action follow-ups, and — the
+/// key fix — recoverable failures, so the agent adapts instead of failing.
+fn agent_loop_should_continue(
+    last_batch: &[(String, Value)],
+    all_results: &[(String, Value)],
     user_text: &str,
-    conv_id: &str,
     turn_context: &AgentTurnContext,
-    allowed_actions: &[&str],
-) -> Result<Plan, AgentError> {
-    let mut note = "A lookup is complete and fresh results are available. Decide from the full meaning of the user's request whether a related action is still needed. If the user requested an action, perform exactly that action now. If they only requested information, return an empty plan. Do not infer action intent from one isolated keyword, and do not perform any destructive or external action unless the full request explicitly asks for it.".to_string();
-    for attempt in 0..=CFG.max_plan_repairs {
-        let plan = match run_plan_inference_with_note(
-            app,
-            provider,
-            history,
-            user_text,
-            conv_id,
-            Some(&note),
-            turn_context,
-        )
-        .await
-        {
-            Ok(plan) => plan,
-            Err(AgentError::Cancelled) => return Err(AgentError::Cancelled),
-            Err(error) => {
-                note = format!(
-                    "Action continuation attempt {} failed: {error}. Use the fresh lookup result and return valid tools JSON for exactly the requested action.",
-                    attempt + 1
-                );
-                continue;
-            }
-        };
-        let mut plan = finalize_plan(plan, history, user_text, turn_context);
-        plan.tools
-            .retain(|call| allowed_actions.contains(&call.name.as_str()));
-        if !plan.tools.is_empty() {
-            return Ok(plan);
-        }
-        return Ok(Plan::default());
+) -> bool {
+    let norm = normalize_planner_text(user_text);
+    if turn_context.browser_target.is_some() && is_browser_operation_intent(&norm) {
+        return true;
     }
-    Ok(Plan::default())
+    if should_continue_after_browser_observation(
+        &Plan::default(),
+        all_results,
+        user_text,
+        turn_context,
+    ) || should_continue_after_actionable_lookup(all_results)
+    {
+        return true;
+    }
+    // A failed browser/computer/page-scoped tool is recoverable: let the model
+    // observe and try a different approach rather than stopping here.
+    last_batch.iter().any(|(name, result)| {
+        result.get("error").is_some()
+            && (is_browser_action_tool(name)
+                || is_browser_target_scoped_tool(name)
+                || name.starts_with("computer_"))
+    })
 }
 
 async fn run_plan_inference(
@@ -1039,6 +1021,7 @@ async fn run_plan_inference_with_note(
         supports_prefill,
         repair_note,
         turn_context,
+        provider.supports_vision(),
     );
     let prefill = if supports_prefill {
         CFG.plan_prefill
@@ -1098,7 +1081,44 @@ fn build_plan_messages(
         supports_prefill,
         None,
         &AgentTurnContext::default(),
+        false,
     )
+}
+
+/// Pull the most recent screenshot image(s) out of the persisted tool history
+/// (newest first) so a vision-capable model can actually see what it just
+/// captured. Returns at most `limit` images.
+fn recent_screenshot_images(
+    history: &[crate::db::AgentMessageRow],
+    limit: usize,
+) -> Vec<ImagePart> {
+    let mut out = Vec::new();
+    for row in history.iter().rev() {
+        if row.role != "tool" {
+            continue;
+        }
+        let Some(json) = row.tool_result_json.as_deref() else {
+            continue;
+        };
+        let Ok(value) = serde_json::from_str::<Value>(json) else {
+            continue;
+        };
+        if let Some(img) = value.get("image") {
+            if let (Some(mime), Some(data)) = (
+                img.get("mime").and_then(|x| x.as_str()),
+                img.get("data_base64").and_then(|x| x.as_str()),
+            ) {
+                out.push(ImagePart {
+                    mime: mime.to_string(),
+                    data_base64: data.to_string(),
+                });
+                if out.len() >= limit {
+                    break;
+                }
+            }
+        }
+    }
+    out
 }
 
 fn build_plan_messages_with_note(
@@ -1108,6 +1128,7 @@ fn build_plan_messages_with_note(
     supports_prefill: bool,
     repair_note: Option<&str>,
     turn_context: &AgentTurnContext,
+    vision: bool,
 ) -> Vec<ChatMessage> {
     let mut system = agent_prompts::plan_system_prompt(&datetime_context(), supports_prefill);
     append_browser_context(&mut system, app, turn_context);
@@ -1158,7 +1179,13 @@ fn build_plan_messages_with_note(
     msgs.push(ChatMessage {
         role: "user".into(),
         content: user_text.to_string(),
-        images: Vec::new(),
+        // Attach the latest screenshot so a vision model can see the page it is
+        // operating on when deciding the next step.
+        images: if vision {
+            recent_screenshot_images(history, 1)
+        } else {
+            Vec::new()
+        },
     });
 
     // Merge consecutive same-role messages so the list is always strictly
@@ -1172,6 +1199,7 @@ fn build_plan_messages_with_note(
             if last.role == msg.role && last.role != "system" {
                 last.content.push('\n');
                 last.content.push_str(&msg.content);
+                last.images.extend(msg.images);
                 continue;
             }
         }
@@ -1972,12 +2000,6 @@ fn is_browser_mutation_tool(name: &str) -> bool {
             | "browser_press"
             | "browser_close"
     )
-}
-
-fn plan_contains_browser_action(plan: &Plan) -> bool {
-    plan.tools
-        .iter()
-        .any(|call| is_browser_action_tool(&call.name))
 }
 
 fn is_agent_action_tool(name: &str) -> bool {
@@ -3369,6 +3391,7 @@ async fn answer_phase_with_note(
         tool_results,
         repair_note,
         turn_context,
+        provider.supports_vision(),
     );
     log::debug!(
         "[agent answer] start conv_id={} messages={} tool_results={}",
@@ -3610,6 +3633,7 @@ fn build_answer_messages(
     tool_results: &[(String, Value)],
     repair_note: Option<&str>,
     turn_context: &AgentTurnContext,
+    vision: bool,
 ) -> Vec<ChatMessage> {
     let mut budget = CFG.prompt_token_budget;
 
@@ -3663,7 +3687,7 @@ fn build_answer_messages(
         system.push_str("</recent_tool_results>\n");
     }
 
-    if !user_images.is_empty() {
+    if !user_images.is_empty() && !vision {
         system.push_str(
             "\n[IMAGE NOTICE] The user sent an image, but the current model cannot see images.\n\
              Briefly say you cannot view images yet and ask for a text description.\n\
@@ -3707,10 +3731,15 @@ fn build_answer_messages(
     history_msgs.reverse();
     msgs.extend(history_msgs);
 
+    let mut images = user_images.to_vec();
+    if vision {
+        // Let a vision model see the latest screenshot when forming the answer.
+        images.extend(recent_screenshot_images(history, 1));
+    }
     msgs.push(ChatMessage {
         role: "user".into(),
         content: user_text.to_string(),
-        images: user_images.to_vec(),
+        images,
     });
 
     msgs
@@ -4958,7 +4987,7 @@ fn slice_history(
     rows[start..end].to_vec()
 }
 
-fn maybe_autotitle(db: &Database, conv_id: &str, user_text: &str) {
+fn maybe_autotitle(app: &AppHandle, db: &Database, conv_id: &str, user_text: &str) {
     let list = match db.agent_list_conversations() {
         Ok(l) => l,
         Err(_) => return,
@@ -4966,7 +4995,7 @@ fn maybe_autotitle(db: &Database, conv_id: &str, user_text: &str) {
     let Some(row) = list.iter().find(|c| c.id == conv_id) else {
         return;
     };
-    if row.title != "新しい会話" && !row.title.is_empty() {
+    if !matches!(row.title.as_str(), "" | "新しい会話" | "エージェント") {
         return;
     }
     let title: String = user_text
@@ -4979,7 +5008,9 @@ fn maybe_autotitle(db: &Database, conv_id: &str, user_text: &str) {
     } else {
         title
     };
-    let _ = db.agent_rename_conversation(conv_id, &title);
+    if db.agent_rename_conversation(conv_id, &title).is_ok() {
+        let _ = app.emit("agent-conversations-changed", conv_id);
+    }
 }
 
 // ─────────────────────── Tests ───────────────────────
@@ -6412,6 +6443,7 @@ mod tests {
             &tool_results,
             None,
             &AgentTurnContext::default(),
+            false,
         );
         assert_eq!(msgs.len(), 2); // system + user
         assert!(msgs[0].content.contains("tool_results"));
@@ -6450,6 +6482,7 @@ mod tests {
             &[],
             None,
             &AgentTurnContext::default(),
+            false,
         );
         // Budget should prevent ALL 200 history messages from being included.
         assert!(

@@ -4,61 +4,43 @@ pub(super) async fn list_recent_mail(
     app: &tauri::AppHandle,
     args: &Value,
 ) -> Result<Value, String> {
-    let limit = args
-        .get("limit")
-        .and_then(|v| v.as_u64())
-        .unwrap_or(10)
-        .min(LIST_CAP as u64) as u32;
-    let msgs = crate::mail_commands::fetch_inbox_internal(app, limit, 0).await?;
-    let items: Vec<Value> = msgs
-        .iter()
-        .map(|m| {
-            json!({
-                "id": m.id,
-                "subject": m.subject.clone().unwrap_or_default(),
-                "from": m.from.as_ref().map(|a| json!({
-                    "name": a.email_address.name.clone().unwrap_or_default(),
-                    "address": a.email_address.address.clone().unwrap_or_default(),
-                })),
-                "received": m.received_date_time.clone().unwrap_or_default(),
-                "is_read": m.is_read.unwrap_or(false),
-                "preview": m.body_preview.clone().unwrap_or_default(),
-            })
-        })
-        .collect();
-    Ok(json!({ "mails": items }))
-}
-
-pub(super) async fn search_mail(app: &tauri::AppHandle, args: &Value) -> Result<Value, String> {
-    let keyword =
-        sanitize_text_arg(args, "keyword", 80).ok_or_else(|| "keyword が空です".to_string())?;
+    let keyword = sanitize_text_arg(args, "keyword", 80);
     let limit = args
         .get("limit")
         .and_then(|v| v.as_u64())
         .unwrap_or(10)
         .clamp(1, LIST_CAP as u64) as u32;
-    // Fetch a larger window so substring filtering still has enough candidates.
-    let scan_top = (limit * 5).clamp(20, 100);
+
+    // With a keyword this behaves as a search: pull a larger window so the
+    // substring filter still has enough candidates, then narrow it down.
+    let scan_top = match &keyword {
+        Some(_) => (limit * 5).clamp(20, 100),
+        None => limit,
+    };
     let msgs = crate::mail_commands::fetch_inbox_internal(app, scan_top, 0).await?;
-    let needle = keyword.to_lowercase();
+
+    let needle = keyword.as_ref().map(|k| k.to_lowercase());
     let items: Vec<Value> = msgs
         .iter()
-        .filter(|m| {
-            let subject = m.subject.clone().unwrap_or_default().to_lowercase();
-            let preview = m.body_preview.clone().unwrap_or_default().to_lowercase();
-            let from = m
-                .from
-                .as_ref()
-                .map(|a| {
-                    format!(
-                        "{} {}",
-                        a.email_address.name.clone().unwrap_or_default(),
-                        a.email_address.address.clone().unwrap_or_default(),
-                    )
-                    .to_lowercase()
-                })
-                .unwrap_or_default();
-            subject.contains(&needle) || preview.contains(&needle) || from.contains(&needle)
+        .filter(|m| match needle.as_deref() {
+            None => true,
+            Some(needle) => {
+                let subject = m.subject.clone().unwrap_or_default().to_lowercase();
+                let preview = m.body_preview.clone().unwrap_or_default().to_lowercase();
+                let from = m
+                    .from
+                    .as_ref()
+                    .map(|a| {
+                        format!(
+                            "{} {}",
+                            a.email_address.name.clone().unwrap_or_default(),
+                            a.email_address.address.clone().unwrap_or_default(),
+                        )
+                        .to_lowercase()
+                    })
+                    .unwrap_or_default();
+                subject.contains(needle) || preview.contains(needle) || from.contains(needle)
+            }
         })
         .take(limit as usize)
         .map(|m| {
@@ -75,11 +57,12 @@ pub(super) async fn search_mail(app: &tauri::AppHandle, args: &Value) -> Result<
             })
         })
         .collect();
-    Ok(json!({
-        "keyword": keyword,
-        "scanned": msgs.len(),
-        "mails": items,
-    }))
+    let mut out = json!({ "mails": items });
+    if let Some(kw) = keyword {
+        out["keyword"] = json!(kw);
+        out["scanned"] = json!(msgs.len());
+    }
+    Ok(out)
 }
 
 pub(super) async fn read_mail(app: &tauri::AppHandle, args: &Value) -> Result<Value, String> {

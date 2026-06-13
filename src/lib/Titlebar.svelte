@@ -213,7 +213,7 @@
         <span class="titlebar-status-text">認証中</span>
       </span>
     {:else if $sessionExpired}
-      <button class="reauth-badge" onclick={handleRelogin} disabled={reloginLoading} title="セッションが期限切れです。クリックして再認証してください。">
+      <button class="reauth-badge" onclick={handleRelogin} disabled={reloginLoading} title="Luna または KWIC の再認証が必要です。">
         {#if reloginLoading}
           <span class="reauth-spinner"></span>
         {:else}

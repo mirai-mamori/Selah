@@ -24,10 +24,10 @@ export const authState = writable<AuthState>({
   error: "",
 });
 
-/** True while an automatic re-login flow is in progress (session expired mid-use) */
+/** True while a user-visible university login flow is in progress. */
 export const reloginInProgress = writable(false);
 
-/** True when session has expired but user hasn't re-authenticated yet (soft expired state) */
+/** True when Luna or KWIC is unavailable and user action may be required. */
 export const sessionExpired = writable(false);
 
 /** Luna LMS authentication state */

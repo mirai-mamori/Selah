@@ -97,14 +97,59 @@ html,
     border-bottom: 0.5px solid var(--detail-border-soft);
   }
 
-  .attendance-title {
+  .attendance-heading {
     margin: 0 0 14px;
     padding: 12px calc(clamp(24px, 3.2vw, 44px) + 2px);
-    font-size: 14px;
-    font-weight: 700;
-    line-height: 1.3;
     color: var(--detail-text);
     border-bottom: 0.5px solid var(--detail-border-soft);
+  }
+
+  .attendance-heading h1 {
+    margin: 0;
+    font-size: 14px;
+    font-weight: 750;
+    line-height: 1.3;
+  }
+
+  .course-subtitle {
+    min-width: 0;
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 3px 0;
+    margin: -3px 0 11px;
+    color: var(--detail-muted);
+    font-size: 12px;
+    font-weight: 650;
+    line-height: 1.4;
+  }
+
+  .course-subtitle > span {
+    min-width: 0;
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+  }
+
+  .course-subtitle > span + span::before {
+    content: "·";
+    margin: 0 8px;
+    color: var(--detail-faint);
+  }
+
+  .course-subtitle .course-teacher {
+    overflow-wrap: anywhere;
+  }
+
+  .course-subtitle .course-teacher svg {
+    flex: 0 0 auto;
+    color: var(--detail-faint);
+  }
+
+  .attendance-heading .course-subtitle {
+    margin: 3px 0 0;
+    color: var(--detail-faint);
+    font-size: 11px;
   }
 
   .eyebrow,

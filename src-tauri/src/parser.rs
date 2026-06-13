@@ -2071,9 +2071,9 @@ mod session_plan_tests {
         assert_eq!(detail.attachments[0].name, "notice.pdf");
     }
 
-        #[test]
-        fn test_parse_course_detail_preserves_detail_link_html() {
-                let html = r#"
+    #[test]
+    fn test_parse_course_detail_preserves_detail_link_html() {
+        let html = r#"
                 <table class="output">
                     <tr>
                         <th>関連資料</th>
@@ -2081,12 +2081,14 @@ mod session_plan_tests {
                     </tr>
                 </table>
                 "#;
-                let detail = parse_course_detail(html);
-                assert_eq!(detail.fields.len(), 1);
-                assert_eq!(detail.fields[0].0, "関連資料");
-                assert!(detail.fields[0].1.contains("href=\"/uniasv2/ARF020PVI01Action.do?LSN_CD=28550600\""));
-                assert!(detail.fields[0].1.contains("授業詳細を見る"));
-        }
+        let detail = parse_course_detail(html);
+        assert_eq!(detail.fields.len(), 1);
+        assert_eq!(detail.fields[0].0, "関連資料");
+        assert!(detail.fields[0]
+            .1
+            .contains("href=\"/uniasv2/ARF020PVI01Action.do?LSN_CD=28550600\""));
+        assert!(detail.fields[0].1.contains("授業詳細を見る"));
+    }
 
     #[test]
     fn test_expand_fullwidth_digits() {

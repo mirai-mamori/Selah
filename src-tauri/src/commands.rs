@@ -86,14 +86,26 @@ async fn kgc_try_fetch(state: &KgcState, path: &str) -> Result<String, String> {
         return Err(config::KGC_AUTH_REQUIRED_MSG.into());
     }
     let url = format!("{}{}", config::KG_COURSE_BASE, path);
-    client::fetch_with_redirect(
+    let result = client::fetch_with_redirect(
         &http,
         &url,
         config::KG_COURSE_BASE,
         client::SESSION_EXPIRED_MSG,
         client::is_session_expired_body,
     )
-    .await
+    .await;
+    if matches!(&result, Err(error) if error == client::SESSION_EXPIRED_MSG) {
+        // KGC is intentionally short-lived. Once the server confirms expiry,
+        // clear the stored session so background cache/notification loops stop
+        // repeatedly hitting it. Cached data remains available to the UI.
+        state.client.lock().await.clear_session();
+        log::info!("KGC session expired; stopped background KGC requests");
+    } else if result.is_ok() {
+        // Persist any Set-Cookie values/timestamps returned by this successful
+        // request. No expiry is fabricated or extended locally.
+        state.client.lock().await.save_session();
+    }
+    result
 }
 
 /// Fetch from KGC with DB cache fallback.

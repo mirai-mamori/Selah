@@ -343,6 +343,13 @@ pub fn run() {
             app.manage(tray_status.clone());
             tray::setup_tray(app.handle())?;
             if !browser_mouse_selftest {
+                // Restore backed-up SSO cookies into the webview store before any
+                // headless re-auth runs, so a wiped webview store can still
+                // present a valid SSO session / device token.
+                let restore_handle = app.handle().clone();
+                tauri::async_runtime::spawn(async move {
+                    cookie_bridge::restore_sso_cookies(&restore_handle).await;
+                });
                 tray::start_tray_cycle(app.handle(), tray_status);
                 background_refresh::start_background_refresh_loop(app.handle());
                 ai_refresh::start_ai_refresh_loop(app.handle());
@@ -426,9 +433,10 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             commands::open_login_window,
             commands::logout,
+            commands::reset_university_login,
             commands::delete_all_local_data,
+            commands::get_kgc_session_snapshot,
             commands::check_session,
-            commands::validate_session,
             commands::fetch_grades,
             commands::fetch_cancellations,
             commands::fetch_makeup_classes,
@@ -465,7 +473,6 @@ pub fn run() {
             commands::get_kgc_syllabus_fields,
             commands::sync_session,
             commands::get_session_states,
-            commands::get_session_expiry,
             luna_commands::university_open_detail_window,
             luna_commands::luna_open_detail_window,
             luna_commands::luna_fetch_page,
@@ -580,6 +587,7 @@ pub fn run() {
             document_tabs::document_tabs_open_agent,
             document_tabs::document_tabs_close_agent,
             document_tabs::document_tabs_agent_is_open,
+            document_tabs::document_tabs_resize_agent_panel,
             commands::get_download_config,
             commands::save_download_config,
             commands::select_download_dir,

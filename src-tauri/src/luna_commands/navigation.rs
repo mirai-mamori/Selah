@@ -140,10 +140,7 @@ pub async fn university_open_detail_window(
 
     let url_str = match mode.as_deref() {
         Some("material") => {
-            let mut parts = format!(
-                "mode=material&title={}",
-                urlencoding::encode(&title)
-            );
+            let mut parts = format!("mode=material&title={}", urlencoding::encode(&title));
             if let Some(p) = &period {
                 parts.push_str(&format!("&period={}", urlencoding::encode(p)));
             }

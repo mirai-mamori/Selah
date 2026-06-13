@@ -46,7 +46,9 @@ const TAB_STRIP_HEIGHT: f64 = 88.0;
 /// Detective is a full-screen game with no per-tab controls, so its strip
 /// collapses to just the tab row (no second toolbar row).
 const COMPACT_STRIP_HEIGHT: f64 = 46.0;
-const AGENT_PANEL_WIDTH: f64 = 360.0;
+const DEFAULT_AGENT_PANEL_RATIO_BPS: u32 = 3_333;
+const MIN_AGENT_PANEL_RATIO: f64 = 0.2;
+const MAX_AGENT_PANEL_RATIO: f64 = 0.4;
 const SPLIT_DIVIDER_WIDTH: f64 = 12.0;
 const MAX_SPLIT_DIVIDERS: usize = 2;
 const MIN_SPLIT_RATIO: f64 = 0.2;
@@ -57,6 +59,7 @@ const MAX_TABS: usize = 32;
 
 static TAB_COUNTER: AtomicU32 = AtomicU32::new(0);
 static AGENT_PANEL_OPEN: AtomicBool = AtomicBool::new(false);
+static AGENT_PANEL_RATIO_BPS: AtomicU32 = AtomicU32::new(DEFAULT_AGENT_PANEL_RATIO_BPS);
 // Set right before a programmatic window.close() (e.g. last tab closed) so the
 // CloseRequested guard lets it through; otherwise the red close button only hides
 // the window, preserving open tabs for the next time it is shown.
@@ -585,10 +588,21 @@ fn force_close_window(window: &tauri::Window) {
 
 fn agent_panel_width(width: f64) -> f64 {
     if AGENT_PANEL_OPEN.load(Ordering::Relaxed) {
-        AGENT_PANEL_WIDTH.min((width * 0.42).max(300.0))
+        width * agent_panel_ratio()
     } else {
         0.0
     }
+}
+
+fn agent_panel_ratio() -> f64 {
+    (AGENT_PANEL_RATIO_BPS.load(Ordering::Relaxed) as f64 / 10_000.0)
+        .clamp(MIN_AGENT_PANEL_RATIO, MAX_AGENT_PANEL_RATIO)
+}
+
+fn set_agent_panel_ratio(ratio: f64) -> f64 {
+    let clamped = ratio.clamp(MIN_AGENT_PANEL_RATIO, MAX_AGENT_PANEL_RATIO);
+    AGENT_PANEL_RATIO_BPS.store((clamped * 10_000.0).round() as u32, Ordering::Relaxed);
+    clamped
 }
 
 fn agent_panel_url(tab: Option<&DocumentTab>) -> String {
@@ -618,7 +632,7 @@ fn open_agent_panel(app: &tauri::AppHandle) -> Result<(), String> {
         let scale = window.scale_factor().unwrap_or(1.0);
         let width = size.width as f64 / scale;
         let height = size.height as f64 / scale;
-        let panel_width = AGENT_PANEL_WIDTH.min((width * 0.42).max(300.0));
+        let panel_width = width * agent_panel_ratio();
         window
             .add_child(
                 panel,
@@ -2169,4 +2183,18 @@ pub fn document_tabs_close_agent(app: tauri::AppHandle) -> Result<(), String> {
 #[tauri::command]
 pub fn document_tabs_agent_is_open() -> bool {
     AGENT_PANEL_OPEN.load(Ordering::Relaxed)
+}
+
+#[tauri::command]
+pub fn document_tabs_resize_agent_panel(app: tauri::AppHandle, width: f64) -> Result<f64, String> {
+    if !AGENT_PANEL_OPEN.load(Ordering::Relaxed) {
+        return Err("Agent パネルが開いていません".to_string());
+    }
+    let window = app
+        .get_window(OWNER_LABEL)
+        .ok_or_else(|| "タブウィンドウが見つかりません".to_string())?;
+    let (window_width, _) = logical_window_size(&window)?;
+    let ratio = set_agent_panel_ratio(width / window_width.max(1.0));
+    resize_current_for_owner(&app, OWNER_LABEL)?;
+    Ok(ratio)
 }

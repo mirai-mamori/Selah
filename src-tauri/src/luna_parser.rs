@@ -811,9 +811,9 @@ mod tests {
             .any(|(k, v)| k == "scanStatus" && v == "1"));
     }
 
-        #[test]
-        fn test_parse_discussion_thread_falls_back_to_row_local_quill_payload() {
-                let html = r#"
+    #[test]
+    fn test_parse_discussion_thread_falls_back_to_row_local_quill_payload() {
+        let html = r#"
                         <div class="course-title-txt">日本語教育センター 51001004 日本語I 4</div>
                         <div class="contents-title-txt">掲示板 テーマトップ</div>
                         <div id="themeTopList">
@@ -829,18 +829,18 @@ mod tests {
                         </div>
                 "#;
 
-                let result = parse_luna_discussion_thread(html);
-                assert_eq!(result.posts.len(), 1);
-                assert_eq!(result.posts[0].thread_id, "56777");
-                assert_eq!(result.posts[0].title, "主題文（１）");
-                assert!(result.posts[0]
-                        .content
-                        .contains("ここには何も書かないでください。"));
-        }
+        let result = parse_luna_discussion_thread(html);
+        assert_eq!(result.posts.len(), 1);
+        assert_eq!(result.posts[0].thread_id, "56777");
+        assert_eq!(result.posts[0].title, "主題文（１）");
+        assert!(result.posts[0]
+            .content
+            .contains("ここには何も書かないでください。"));
+    }
 
-        #[test]
-        fn test_parse_discussion_thread_uses_global_one_based_quill_payloads() {
-                let html = r#"
+    #[test]
+    fn test_parse_discussion_thread_uses_global_one_based_quill_payloads() {
+        let html = r#"
                         <div class="course-title-txt">日本語教育センター 51001004 日本語I 4</div>
                         <div class="contents-title-txt">掲示板 テーマトップ</div>
                         <div id="themeTopList">
@@ -856,15 +856,15 @@ mod tests {
                         </script>
                 "#;
 
-                let result = parse_luna_discussion_thread(html);
-                assert_eq!(result.posts.len(), 1);
-                assert_eq!(result.posts[0].title, "主題文（１）");
-                assert!(result.posts[0].content.contains("テキストｐ60"));
-        }
+        let result = parse_luna_discussion_thread(html);
+        assert_eq!(result.posts.len(), 1);
+        assert_eq!(result.posts[0].title, "主題文（１）");
+        assert!(result.posts[0].content.contains("テキストｐ60"));
+    }
 
-        #[test]
-        fn test_parse_discussion_thread_falls_back_when_row_container_differs() {
-                let html = r#"
+    #[test]
+    fn test_parse_discussion_thread_falls_back_when_row_container_differs() {
+        let html = r#"
                         <div class="course-title-txt">国際学部 34134000 社会言語学基礎</div>
                         <div class="contents-title-txt">掲示板 テーマトップ</div>
                         <div id="themeTopList">
@@ -880,20 +880,18 @@ mod tests {
                         </script>
                 "#;
 
-                let result = parse_luna_discussion_thread(html);
-                assert_eq!(result.posts.len(), 1);
-                assert_eq!(result.posts[0].thread_id, "59001");
-                assert_eq!(result.posts[0].author, "田中 花子");
-                assert!(result.posts[0]
-                        .content
-                        .contains("具体例を書いてください。"));
-        }
+        let result = parse_luna_discussion_thread(html);
+        assert_eq!(result.posts.len(), 1);
+        assert_eq!(result.posts[0].thread_id, "59001");
+        assert_eq!(result.posts[0].author, "田中 花子");
+        assert!(result.posts[0].content.contains("具体例を書いてください。"));
+    }
 
-        #[test]
-        fn test_parse_discussion_thread_maps_one_based_quill_payloads_per_row() {
-                // Multiple threads whose Quill variables are numbered from 1.
-                // Each subtopic must render its own body, not the previous row's.
-                let html = r#"
+    #[test]
+    fn test_parse_discussion_thread_maps_one_based_quill_payloads_per_row() {
+        // Multiple threads whose Quill variables are numbered from 1.
+        // Each subtopic must render its own body, not the previous row's.
+        let html = r#"
                         <div class="contents-title-txt">掲示板 テーマトップ</div>
                         <div id="themeTopList">
                             <div class="result-list sp-contents-hidden">
@@ -911,20 +909,20 @@ mod tests {
                         </script>
                 "#;
 
-                let result = parse_luna_discussion_thread(html);
-                assert_eq!(result.posts.len(), 2);
-                assert_eq!(result.posts[0].title, "スレッドＡ");
-                assert!(result.posts[0].content.contains("スレッドＡの本文"));
-                assert_eq!(result.posts[1].title, "スレッドＢ");
-                assert!(result.posts[1].content.contains("スレッドＢの本文"));
-        }
+        let result = parse_luna_discussion_thread(html);
+        assert_eq!(result.posts.len(), 2);
+        assert_eq!(result.posts[0].title, "スレッドＡ");
+        assert!(result.posts[0].content.contains("スレッドＡの本文"));
+        assert_eq!(result.posts[1].title, "スレッドＢ");
+        assert!(result.posts[1].content.contains("スレッドＢの本文"));
+    }
 
-        #[test]
-        fn test_parse_discussion_thread_dedupes_responsive_list_copies() {
-                // LUNA emits the same threads twice for responsive layouts. The
-                // broadened row selector matches both copies, so each thread must
-                // still be emitted once, with its own (non-shifted) body.
-                let html = r#"
+    #[test]
+    fn test_parse_discussion_thread_dedupes_responsive_list_copies() {
+        // LUNA emits the same threads twice for responsive layouts. The
+        // broadened row selector matches both copies, so each thread must
+        // still be emitted once, with its own (non-shifted) body.
+        let html = r#"
                         <div class="contents-title-txt">掲示板 テーマトップ</div>
                         <div id="themeTopList">
                             <div class="result-list sp-contents-hidden">
@@ -950,13 +948,13 @@ mod tests {
                         </script>
                 "#;
 
-                let result = parse_luna_discussion_thread(html);
-                assert_eq!(result.posts.len(), 2);
-                assert_eq!(result.posts[0].thread_id, "201");
-                assert!(result.posts[0].content.contains("甲の本文"));
-                assert_eq!(result.posts[1].thread_id, "202");
-                assert!(result.posts[1].content.contains("乙の本文"));
-        }
+        let result = parse_luna_discussion_thread(html);
+        assert_eq!(result.posts.len(), 2);
+        assert_eq!(result.posts[0].thread_id, "201");
+        assert!(result.posts[0].content.contains("甲の本文"));
+        assert_eq!(result.posts[1].thread_id, "202");
+        assert!(result.posts[1].content.contains("乙の本文"));
+    }
 
     #[test]
     fn test_parse_announcement_detail_blacklists_system_notice_body() {

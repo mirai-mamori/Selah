@@ -119,7 +119,13 @@ pub async fn sync_schedule_data(
         "{}/uniasv2/ARF010.do?REQ_PRFR_MNU_ID=MNUIDSTD0102014",
         config::KG_COURSE_BASE
     );
-    let kgc_html = client::fetch_page_with(&kgc_http, &kgc_url).await?;
+    let kgc_html = match client::fetch_page_with(&kgc_http, &kgc_url).await {
+        Ok(html) => html,
+        Err(error) => {
+            clear_kgc_if_expired(&kgc, &error).await;
+            return Err(error);
+        }
+    };
     let kgc_data = parser::parse_timetable(&kgc_html);
 
     let current_week_label = kgc_data.week_label.clone();
@@ -156,7 +162,13 @@ pub async fn sync_schedule_data(
     }
 
     // ── Step 2: KGC next week (serial, reuses same HTTP client) ──
-    let next_week_label = fetch_next_week_kgc(&kgc_http, &kgc_data, &db).await?;
+    let next_week_label = match fetch_next_week_kgc(&kgc_http, &kgc_data, &db).await {
+        Ok(label) => label,
+        Err(error) => {
+            clear_kgc_if_expired(&kgc, &error).await;
+            return Err(error);
+        }
+    };
     log::info!("sync_schedule_data: next_week_label='{}'", next_week_label);
 
     // ── Step 3: Luna timetable (serial, after KGC) ──
@@ -242,6 +254,7 @@ pub async fn sync_schedule_data(
 
     // ── Step 5: Enrichment (serial — KGC syllabus details, then Luna counts) ──
     if let Err(e) = enrich_schedule_inner(&kgc, &luna_state, &db).await {
+        clear_kgc_if_expired(&kgc, &e).await;
         log::warn!("sync_schedule_data: enrichment failed: {}", e);
     }
 
@@ -268,6 +281,13 @@ pub async fn sync_schedule_data(
         luna_year: snap.luna_year,
         luna_term: snap.luna_term,
     })
+}
+
+async fn clear_kgc_if_expired(kgc: &KgcState, error: &str) {
+    if error == client::SESSION_EXPIRED_MSG {
+        kgc.client.lock().await.clear_session();
+        log::info!("KGC session expired during schedule sync; stopped background KGC requests");
+    }
 }
 
 /// Fetch next week's KGC data by navigating the Struts form.

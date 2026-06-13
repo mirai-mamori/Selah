@@ -243,11 +243,15 @@ pub fn agent_delete_conversation(db: State<'_, Database>, conv_id: String) -> Re
 
 #[tauri::command]
 pub fn agent_rename_conversation(
+    app: AppHandle,
     db: State<'_, Database>,
     conv_id: String,
     title: String,
 ) -> Result<(), String> {
-    db.agent_rename_conversation(&conv_id, &title)
+    db.agent_rename_conversation(&conv_id, &title)?;
+    use tauri::Emitter;
+    let _ = app.emit("agent-conversations-changed", conv_id);
+    Ok(())
 }
 
 /// Minimal UUIDv4 generator (no new dependency).  Uses `rand` (already a

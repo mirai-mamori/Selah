@@ -155,6 +155,8 @@ pub async fn open_login_window(app: tauri::AppHandle) -> Result<(), String> {
         }
 
         log::info!("=== Cookie Bridge Phase 2: Luna SAML ===");
+        let mut luna_authenticated = false;
+        let mut kwic_authenticated = false;
 
         if let Some(win) = app_clone.get_webview_window("login") {
             {
@@ -198,6 +200,7 @@ pub async fn open_login_window(app: tauri::AppHandle) -> Result<(), String> {
                                     luna.authenticated = true;
                                     luna.save_session();
                                     drop(luna);
+                                    luna_authenticated = true;
                                     log::info!("Cookie Bridge: Luna login successful (verified)");
                                     let _ = app_clone.emit("luna-login-success", ());
                                 }
@@ -269,6 +272,7 @@ pub async fn open_login_window(app: tauri::AppHandle) -> Result<(), String> {
                                     kwic.authenticated = true;
                                     kwic.save_session();
                                     drop(kwic);
+                                    kwic_authenticated = true;
                                     log::info!(
                                         "Cookie Bridge: KWIC Portal login successful (verified)"
                                     );
@@ -299,15 +303,28 @@ pub async fn open_login_window(app: tauri::AppHandle) -> Result<(), String> {
             }
         }
 
+        // All SAML phases done: back up the fresh SSO cookies (incl. device
+        // token) before the login window — and its webview store — go away.
+        cookie_bridge::persist_sso_cookies(&app_clone).await;
+        let _ = app_clone.emit(
+            "university-login-complete",
+            serde_json::json!({
+                "luna_authenticated": luna_authenticated,
+                "kwic_authenticated": kwic_authenticated,
+            }),
+        );
+
+        if let Some(win) = app_clone.get_webview_window("login") {
+            let _ = win.close();
+        }
+
+        // Authentication is complete. Refresh data afterward without keeping
+        // the login window open or blocking the user-facing completion state.
         if let Err(e) = crate::notifier::notification_sync_now(app_clone.clone()).await {
             log::warn!("notification sync after login failed: {}", e);
         }
         if let Err(e) = crate::background_refresh::refresh_backend_data_now(&app_clone).await {
             log::warn!("background refresh after login failed: {}", e);
-        }
-
-        if let Some(win) = app_clone.get_webview_window("login") {
-            let _ = win.close();
         }
     });
 
@@ -334,6 +351,41 @@ pub async fn logout(
     Ok(())
 }
 
+/// Clear only university authentication state, including native webview SSO
+/// cookies, so the next visible login starts from a genuinely signed-out state.
+#[tauri::command]
+pub async fn reset_university_login(
+    app: tauri::AppHandle,
+    state: State<'_, KgcState>,
+    luna_state: State<'_, LunaState>,
+    kwic_state: State<'_, KwicState>,
+) -> Result<usize, String> {
+    // Wait for any in-flight hidden SAML refresh before clearing state, so it
+    // cannot write fresh cookies back after this reset.
+    let _sync_gate = super::session::lock_session_sync().await;
+
+    for label in ["login", "kgc-headless", "luna-headless", "kwic-headless"] {
+        if let Some(window) = app.get_webview_window(label) {
+            let _ = window.close();
+        }
+    }
+
+    {
+        let mut client = state.client.lock().await;
+        client.clear_session();
+    }
+    {
+        let mut luna = luna_state.client.lock().await;
+        luna.clear();
+    }
+    {
+        let mut kwic = kwic_state.client.lock().await;
+        kwic.clear();
+    }
+
+    cookie_bridge::clear_university_cookies(&app).await
+}
+
 #[tauri::command]
 pub async fn delete_all_local_data(
     app: tauri::AppHandle,
@@ -341,6 +393,7 @@ pub async fn delete_all_local_data(
     luna_state: State<'_, LunaState>,
     kwic_state: State<'_, KwicState>,
 ) -> Result<(), String> {
+    let _sync_gate = super::session::lock_session_sync().await;
     {
         let mut c = state.client.lock().await;
         c.clear_session();
@@ -369,9 +422,33 @@ pub async fn delete_all_local_data(
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    let _ = cookie_bridge::clear_university_cookies(&app).await;
     let _ = app.emit("logout", ());
 
     Ok(())
+}
+
+#[tauri::command]
+pub async fn get_kgc_session_snapshot(state: State<'_, KgcState>) -> Result<SessionStatus, String> {
+    let client = state.client.lock().await;
+    Ok(match client.session.as_ref() {
+        Some(session) => SessionStatus {
+            valid: true,
+            username: session.username.clone(),
+            display_name: session.display_name.clone(),
+            student_id: session.student_id.clone(),
+            faculty: session.faculty.clone(),
+            department: session.department.clone(),
+        },
+        None => SessionStatus {
+            valid: false,
+            username: String::new(),
+            display_name: String::new(),
+            student_id: String::new(),
+            faculty: String::new(),
+            department: String::new(),
+        },
+    })
 }
 
 #[tauri::command]
@@ -504,76 +581,6 @@ pub async fn check_session(state: State<'_, KgcState>) -> Result<SessionStatus, 
                 student_id: session.student_id,
                 faculty: session.faculty,
                 department: session.department,
-            })
-        }
-    }
-}
-
-#[tauri::command]
-pub async fn validate_session(state: State<'_, KgcState>) -> Result<SessionStatus, String> {
-    let (http, is_auth, session_snapshot) = {
-        let client = state.client.lock().await;
-        (
-            client.http.clone(),
-            client.is_authenticated(),
-            client.session.clone(),
-        )
-    };
-
-    if !is_auth {
-        return Ok(SessionStatus {
-            valid: false,
-            username: String::new(),
-            display_name: String::new(),
-            student_id: String::new(),
-            faculty: String::new(),
-            department: String::new(),
-        });
-    }
-
-    let verify_url = format!(
-        "{}/uniasv2/ARF010.do?REQ_PRFR_MNU_ID=MNUIDSTD0102014",
-        config::KG_COURSE_BASE
-    );
-    match client::fetch_page_with(&http, &verify_url).await {
-        Ok(html) => {
-            let info = parser::parse_student_info(&html);
-            if info.student_id.is_empty() && info.name.is_empty() {
-                log::warn!("validate_session: server returned empty page (stale session)");
-                let snap = session_snapshot.as_ref();
-                return Ok(SessionStatus {
-                    valid: false,
-                    username: snap.map_or(String::new(), |s| s.username.clone()),
-                    display_name: snap.map_or(String::new(), |s| s.display_name.clone()),
-                    student_id: snap.map_or(String::new(), |s| s.student_id.clone()),
-                    faculty: snap.map_or(String::new(), |s| s.faculty.clone()),
-                    department: snap.map_or(String::new(), |s| s.department.clone()),
-                });
-            }
-            let client = state.client.lock().await;
-            client.save_session();
-            let session = session_snapshot
-                .as_ref()
-                .ok_or_else(|| "session lost after fetch".to_string())?;
-            Ok(SessionStatus {
-                valid: true,
-                username: session.username.clone(),
-                display_name: session.display_name.clone(),
-                student_id: session.student_id.clone(),
-                faculty: session.faculty.clone(),
-                department: session.department.clone(),
-            })
-        }
-        Err(e) => {
-            log::info!("Session validation failed: {}", e);
-            let snap = session_snapshot.as_ref();
-            Ok(SessionStatus {
-                valid: false,
-                username: snap.map_or(String::new(), |s| s.username.clone()),
-                display_name: snap.map_or(String::new(), |s| s.display_name.clone()),
-                student_id: snap.map_or(String::new(), |s| s.student_id.clone()),
-                faculty: snap.map_or(String::new(), |s| s.faculty.clone()),
-                department: snap.map_or(String::new(), |s| s.department.clone()),
             })
         }
     }

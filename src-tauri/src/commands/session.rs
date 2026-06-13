@@ -7,7 +7,34 @@ use crate::luna_client;
 use crate::parser;
 use crate::{KgcState, KwicState, LunaState};
 use serde::Serialize;
+use std::sync::LazyLock;
 use tauri::State;
+
+static SESSION_SYNC_GATE: LazyLock<tokio::sync::Mutex<()>> =
+    LazyLock::new(|| tokio::sync::Mutex::new(()));
+static SESSION_SYNC_LAST_START: LazyLock<std::sync::Mutex<Option<std::time::Instant>>> =
+    LazyLock::new(|| std::sync::Mutex::new(None));
+const SESSION_SYNC_MIN_GAP: std::time::Duration = std::time::Duration::from_secs(2);
+
+pub(super) async fn lock_session_sync() -> tokio::sync::MutexGuard<'static, ()> {
+    SESSION_SYNC_GATE.lock().await
+}
+
+async fn pace_session_sync() {
+    let wait = {
+        let last = SESSION_SYNC_LAST_START
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        last.and_then(|started| SESSION_SYNC_MIN_GAP.checked_sub(started.elapsed()))
+    };
+    if let Some(wait) = wait {
+        tokio::time::sleep(wait).await;
+    }
+    let mut last = SESSION_SYNC_LAST_START
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    *last = Some(std::time::Instant::now());
+}
 
 #[derive(Debug, Serialize)]
 pub struct SessionStates {
@@ -26,19 +53,6 @@ pub async fn get_session_states(
     let luna = luna_state.client.lock().await.authenticated;
     let kwic = kwic_state.client.lock().await.authenticated;
     Ok(SessionStates { kgc, luna, kwic })
-}
-
-#[tauri::command]
-pub async fn get_session_expiry(
-    state: State<'_, KgcState>,
-    luna_state: State<'_, LunaState>,
-    kwic_state: State<'_, KwicState>,
-) -> Result<Option<i64>, String> {
-    let kgc_exp = state.client.lock().await.soonest_cookie_expiry_secs();
-    let luna_exp = client::soonest_cookie_expiry(&luna_state.client.lock().await.cookie_store);
-    let kwic_exp = client::soonest_cookie_expiry(&kwic_state.client.lock().await.cookie_store);
-    let min = [kgc_exp, luna_exp, kwic_exp].into_iter().flatten().min();
-    Ok(min)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -223,28 +237,37 @@ pub async fn sync_session(
     kwic_state: State<'_, KwicState>,
     service: String,
 ) -> Result<bool, String> {
+    // Startup restoration and the first SAML sync can race. Ensure the
+    // identity-provider backup has been restored exactly once before opening
+    // any hidden authentication window.
+    cookie_bridge::restore_sso_cookies(&app).await;
+    let _sync_gate = lock_session_sync().await;
+    pace_session_sync().await;
     log::info!("sync_session: service={}", service);
-    match service.as_str() {
+    let result = match service.as_str() {
         "kgc" => headless_kgc_refresh(&app, kgc_state.inner()).await,
         "luna" => headless_luna_refresh(&app, luna_state.inner()).await,
         "kwic" => headless_kwic_refresh(&app, kwic_state.inner()).await,
         "all" => {
-            let (kgc_res, luna_res, kwic_res) = tokio::join!(
-                headless_kgc_refresh(&app, kgc_state.inner()),
-                headless_luna_refresh(&app, luna_state.inner()),
-                headless_kwic_refresh(&app, kwic_state.inner()),
-            );
-            let kgc_ok = kgc_res.unwrap_or(false);
-            let luna_ok = luna_res.unwrap_or(false);
-            let kwic_ok = kwic_res.unwrap_or(false);
-            log::info!(
-                "sync_session(all): kgc={}, luna={}, kwic={}",
-                kgc_ok,
-                luna_ok,
-                kwic_ok
-            );
-            Ok(kgc_ok || luna_ok || kwic_ok)
+            // "all" means all core services. KGC is excluded from proactive
+            // batch renewal because its cookies are sensitive to timing.
+            let luna_ok = headless_luna_refresh(&app, luna_state.inner())
+                .await
+                .unwrap_or(false);
+            tokio::time::sleep(SESSION_SYNC_MIN_GAP).await;
+            let kwic_ok = headless_kwic_refresh(&app, kwic_state.inner())
+                .await
+                .unwrap_or(false);
+            log::info!("sync_session(all core): luna={}, kwic={}", luna_ok, kwic_ok);
+            Ok(luna_ok || kwic_ok)
         }
         _ => Err(format!("Unknown service: {}", service)),
+    };
+    // A successful headless refresh means a valid SSO session is in the webview
+    // store — back it up (incl. the long-lived device token) so it survives a
+    // webview-store wipe and stays fresh.
+    if matches!(&result, Ok(true)) {
+        cookie_bridge::persist_sso_cookies(&app).await;
     }
+    result
 }

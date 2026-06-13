@@ -216,19 +216,9 @@ const TOOL_SPECS: &[ToolSpec] = &[
     ToolSpec {
         name: "list_recent_notifications",
         category: "お知らせ・メール",
-        signature: "list_recent_notifications(limit?: number)",
-        purpose: "最新のお知らせ",
+        signature: "list_recent_notifications(limit?: number, keyword?: string)",
+        purpose: "最新のお知らせ一覧。keywordを渡すと全お知らせをキーワード検索する",
         schema: ArgSchema::LimitKeyword,
-    },
-    ToolSpec {
-        name: "search_notifications",
-        category: "お知らせ・メール",
-        signature: "search_notifications(keyword: string)",
-        purpose: "お知らせをキーワード検索",
-        schema: ArgSchema::Text {
-            key: "keyword",
-            max_len: 80,
-        },
     },
     ToolSpec {
         name: "get_notification_detail",
@@ -243,8 +233,8 @@ const TOOL_SPECS: &[ToolSpec] = &[
     ToolSpec {
         name: "list_recent_mail",
         category: "お知らせ・メール",
-        signature: "list_recent_mail(limit?: number)",
-        purpose: "受信メール一覧",
+        signature: "list_recent_mail(limit?: number, keyword?: string)",
+        purpose: "受信メール一覧。keywordを渡すと件名・本文プレビュー・送信者をキーワード検索する",
         schema: ArgSchema::LimitKeyword,
     },
     ToolSpec {
@@ -253,13 +243,6 @@ const TOOL_SPECS: &[ToolSpec] = &[
         signature: "read_mail(message_id: string)",
         purpose: "メール本文",
         schema: ArgSchema::MailMessageId,
-    },
-    ToolSpec {
-        name: "search_mail",
-        category: "お知らせ・メール",
-        signature: "search_mail(keyword: string, limit?: number)",
-        purpose: "受信メールを件名・本文プレビュー・送信者でキーワード検索",
-        schema: ArgSchema::LimitKeyword,
     },
     ToolSpec {
         name: "list_luna_announcements",
@@ -339,13 +322,6 @@ const TOOL_SPECS: &[ToolSpec] = &[
         schema: ArgSchema::FilePath,
     },
     ToolSpec {
-        name: "inspect_file",
-        category: "ダウンロードファイル",
-        signature: "inspect_file(path: string)",
-        purpose: "read_downloaded_file の互換エイリアス",
-        schema: ArgSchema::FilePath,
-    },
-    ToolSpec {
         name: "write_downloaded_text_file",
         category: "ダウンロードファイル",
         signature: "write_downloaded_text_file(path: string, content: string)",
@@ -411,8 +387,8 @@ const TOOL_SPECS: &[ToolSpec] = &[
     ToolSpec {
         name: "open_copilot_page",
         category: "ブラウザ",
-        signature: "open_copilot_page(page: new_tab|files|luna|luna_activity|kwic|kwic_notification|kwic_cabinet|kgc|kgc_notification, context?: string, luna_id?: string, identifier?: string)",
-        purpose: "SelahのCopilotウィンドウで関連ページを開く。個別活動・通知ページでは検索結果のluna_id/identifierを渡して同名項目を区別する。既知の画面を開く場合はURLを推測せずこちらを使う",
+        signature: "open_copilot_page(page: new_tab|files|luna|luna_course|luna_activity|kwic|kwic_notification|kwic_cabinet|kgc|kgc_notification, context?: string, luna_id?: string, identifier?: string)",
+        purpose: "SelahのCopilotウィンドウで関連ページを開く。luna_courseはcontextに科目名を渡してその科目のLuna詳細(教材・お知らせ等)を開く。個別活動・通知ページでは検索結果のluna_id/identifierを渡して同名項目を区別する。既知の画面を開く場合はURLを推測せずこちらを使う",
         schema: ArgSchema::CopilotPage,
     },
     ToolSpec {
@@ -567,7 +543,7 @@ const TOOL_SPECS: &[ToolSpec] = &[
         name: "list_google_calendar_events",
         category: "Google Calendar",
         signature: "list_google_calendar_events()",
-        purpose: "Agentが登録したGoogle Calendarイベントの一覧（event_idを含む）を返す。編集・削除の前に呼び出す。",
+        purpose: "予定を返す。events=Agentが登録したイベント(event_id付き、編集・削除前に呼ぶ)、upcoming_events=Selah専用カレンダー上の今後の実際の予定(時間割同期分含む、読み取り専用)。",
         schema: ArgSchema::Empty,
     },
     ToolSpec {
@@ -587,6 +563,9 @@ const TOOL_SPECS: &[ToolSpec] = &[
 ];
 
 const TOOL_ALIASES: &[(&str, &str)] = &[
+    ("inspect_file", "read_downloaded_file"),
+    ("search_notifications", "list_recent_notifications"),
+    ("search_mail", "list_recent_mail"),
     ("read_file", "read_downloaded_file"),
     ("view_file", "read_downloaded_file"),
     ("view_downloaded_file", "read_downloaded_file"),
@@ -663,11 +642,9 @@ const DISPATCH_TOOL_NAMES: &[&str] = &[
     "get_registration",
     "list_syllabus_favorites",
     "list_recent_notifications",
-    "search_notifications",
     "get_notification_detail",
     "list_recent_mail",
     "read_mail",
-    "search_mail",
     "list_luna_announcements",
     "get_mail_profile",
     "get_student_profile",
@@ -679,7 +656,6 @@ const DISPATCH_TOOL_NAMES: &[&str] = &[
     "refresh_data",
     "list_downloaded_files",
     "read_downloaded_file",
-    "inspect_file",
     "write_downloaded_text_file",
     "open_downloaded_file",
     "delete_downloaded_file",
@@ -777,12 +753,10 @@ pub async fn dispatch(app: &tauri::AppHandle, name: &str, args: &Value) -> Value
         "get_course_context" => get_course_context(app, args).await,
         "list_luna_todos" => list_luna_todos(app).await,
         "list_recent_notifications" => list_recent_notifications(app, args).await,
-        "search_notifications" => search_notifications(app, args).await,
         "get_notification_detail" => get_notification_detail(app, args).await,
         "get_course_detail" => get_course_detail(app, args).await,
         "list_recent_mail" => list_recent_mail(app, args).await,
         "read_mail" => read_mail(app, args).await,
-        "search_mail" => search_mail(app, args).await,
         "list_luna_announcements" => list_luna_announcements(app, args).await,
         "get_student_profile" => get_student_profile(app).await,
         "get_mail_profile" => get_mail_profile(app).await,
@@ -800,7 +774,7 @@ pub async fn dispatch(app: &tauri::AppHandle, name: &str, args: &Value) -> Value
         "get_luna_activity_detail" => get_luna_activity_detail(app, args).await,
         "refresh_data" => refresh_data(app).await,
         "list_downloaded_files" => list_downloaded_files(args).await,
-        "read_downloaded_file" | "inspect_file" => read_downloaded_file(app, args).await,
+        "read_downloaded_file" => read_downloaded_file(app, args).await,
         "write_downloaded_text_file" => write_downloaded_text_file(args).await,
         "open_downloaded_file" => open_downloaded_file(app, args).await,
         "delete_downloaded_file" => delete_downloaded_file(args).await,
@@ -1092,6 +1066,7 @@ fn sanitize_copilot_page_args(args: &Value) -> Option<Value> {
         "new_tab"
             | "files"
             | "luna"
+            | "luna_course"
             | "luna_activity"
             | "kwic"
             | "kwic_notification"
@@ -1114,10 +1089,10 @@ fn sanitize_copilot_page_args(args: &Value) -> Option<Value> {
     {
         return None;
     }
-    if matches!(page.as_str(), "luna_activity") && context.is_none() {
+    if matches!(page.as_str(), "luna_activity" | "luna_course") && context.is_none() {
         return None;
     }
-    if page == "luna_activity" {
+    if matches!(page.as_str(), "luna_activity" | "luna_course") {
         if let Some(luna_id) = sanitize_text_arg(args, "luna_id", 80) {
             out.insert("luna_id".into(), Value::String(luna_id));
         }
@@ -1221,6 +1196,11 @@ async fn open_copilot_page(app: &tauri::AppHandle, args: &Value) -> Result<Value
         .map(str::trim)
         .filter(|s| !s.is_empty());
 
+    // Whether the Copilot window already existed before this call. If not, this
+    // call is what opens it (e.g. the main-window agent opening a Copilot page),
+    // so afterwards we also bring up the sidebar agent for a continuous chat.
+    let copilot_window_existed = app.get_window("document-tabs").is_some();
+
     let (title, target) = match page {
         "new_tab" => {
             let tab = crate::document_tabs::open_new_tab(app)?;
@@ -1240,6 +1220,37 @@ async fn open_copilot_page(app: &tauri::AppHandle, args: &Value) -> Result<Value
                 crate::config::LUNA_BASE.to_string(),
                 Some("Luna".to_string()),
             )?;
+            (tab.title, tab.target)
+        }
+        "luna_course" => {
+            let query = context.ok_or("luna_courseにはcontext(科目名)が必要です")?;
+            let needle = normalize_text(query);
+            let db = app.state::<Database>();
+            let courses = db.get_luna_courses().unwrap_or_default();
+            let candidates = courses
+                .iter()
+                .filter(|row| luna_id.is_none_or(|id| row.luna_id == id))
+                .collect::<Vec<_>>();
+            let row = candidates
+                .iter()
+                .find(|row| normalize_text(&row.name) == needle)
+                .or_else(|| {
+                    candidates.iter().find(|row| {
+                        let name = normalize_text(&row.name);
+                        name.contains(&needle) || needle.contains(&name)
+                    })
+                })
+                .copied()
+                .ok_or_else(|| format!("「{}」に一致する科目が見つかりません", query))?;
+            // Luna course-top detail page; the course detail surface uses the
+            // course's luna_id as its idnumber (see Timetable/HomePage).
+            let params = format!(
+                "mode=course&idnumber={}&title={}",
+                urlencoding::encode(&row.luna_id),
+                urlencoding::encode(&row.name),
+            );
+            let tab =
+                crate::document_tabs::open_university_detail_tab(app, params, row.name.clone())?;
             (tab.title, tab.target)
         }
         "luna_activity" => {
@@ -1402,6 +1413,12 @@ async fn open_copilot_page(app: &tauri::AppHandle, args: &Value) -> Result<Value
         }
         _ => return Err(format!("未対応のCopilotページです: {}", page)),
     };
+
+    // Newly opening the Copilot window (e.g. from the main-window agent): also
+    // reveal the sidebar agent so the conversation can continue there.
+    if !copilot_window_existed {
+        let _ = crate::document_tabs::open_agent_workspace(app);
+    }
 
     Ok(json!({
         "page": page,
@@ -1989,6 +2006,14 @@ mod tests {
         assert!(
             sanitize_tool_args("open_copilot_page", &json!({"page":"luna_activity"})).is_none()
         );
+        assert_eq!(
+            sanitize_tool_args(
+                "open_copilot_page",
+                &json!({"page":"luna_course","course":"政治学","luna_id":"LUNA-7"})
+            ),
+            Some(json!({"page":"luna_course","context":"政治学","luna_id":"LUNA-7"}))
+        );
+        assert!(sanitize_tool_args("open_copilot_page", &json!({"page":"luna_course"})).is_none());
         assert_eq!(
             sanitize_tool_args(
                 "open_copilot_page",

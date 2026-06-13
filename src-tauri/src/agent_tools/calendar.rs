@@ -50,10 +50,15 @@ pub(super) async fn create_google_calendar_event(
     Ok(json!({ "message": message }))
 }
 
-/// List all agent-created Google Calendar events (newest first).
+/// List the agent's own editable events plus the actual upcoming schedule on
+/// the dedicated "Selah 時間割" calendar.
+///
+/// `events`: events the agent created (carry `event_id`; editable/deletable).
+/// `upcoming_events`: the real Google state of the Selah calendar, read-only
+/// (includes timetable-synced entries the local map doesn't track).
 pub(super) async fn list_google_calendar_events(app: &tauri::AppHandle) -> Result<Value, String> {
     let gcal_state = app.state::<crate::GCalState>();
-    let gcal = gcal_state.client.lock().await;
+    let mut gcal = gcal_state.client.lock().await;
     let events: Vec<Value> = gcal
         .list_agent_events()
         .into_iter()
@@ -74,7 +79,15 @@ pub(super) async fn list_google_calendar_events(app: &tauri::AppHandle) -> Resul
             obj
         })
         .collect();
-    Ok(json!({ "events": events }))
+    let mut out = json!({ "events": events });
+    // Best-effort: include the Selah calendar's actual upcoming events from
+    // Google. A read failure must not break listing the agent's own events, so
+    // surface it as a field instead of erroring.
+    match gcal.list_upcoming_events(30, 25).await {
+        Ok(upcoming) => out["upcoming_events"] = json!(upcoming),
+        Err(e) => out["upcoming_events_error"] = json!(e),
+    }
+    Ok(out)
 }
 
 /// Delete an agent-created Google Calendar event by event_id.

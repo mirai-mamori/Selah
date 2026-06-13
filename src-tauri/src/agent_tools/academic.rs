@@ -646,7 +646,7 @@ pub(super) async fn get_notification_detail(
     }
 
     Err(format!(
-        "「{}」に一致するお知らせがキャッシュ内に見つかりません。先にlist_recent_notificationsかsearch_notificationsで一覧を取得してください",
+        "「{}」に一致するお知らせがキャッシュ内に見つかりません。先にlist_recent_notificationsで一覧を取得してください",
         title
     ))
 }
@@ -664,28 +664,23 @@ pub(super) async fn list_recent_notifications(
     args: &Value,
 ) -> Result<Value, String> {
     let db = app.state::<Database>();
-    let limit = args.get("limit").and_then(|v| v.as_u64()).unwrap_or(10) as usize;
-    let limit = limit.min(LIST_CAP);
-    let items = collect_notifications(&db, None, limit);
-    Ok(json!({ "notifications": items }))
-}
-
-pub(super) async fn search_notifications(
-    app: &tauri::AppHandle,
-    args: &Value,
-) -> Result<Value, String> {
     let keyword = args
         .get("keyword")
         .and_then(|v| v.as_str())
-        .unwrap_or("")
-        .trim()
-        .to_string();
-    if keyword.is_empty() {
-        return Err("keyword が空です".into());
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    // With a keyword this behaves as a search across all cached notifications;
+    // without one it lists the most recent few.
+    let limit = match keyword {
+        Some(_) => LIST_CAP,
+        None => (args.get("limit").and_then(|v| v.as_u64()).unwrap_or(10) as usize).min(LIST_CAP),
+    };
+    let items = collect_notifications(&db, keyword, limit);
+    let mut out = json!({ "notifications": items });
+    if let Some(kw) = keyword {
+        out["keyword"] = json!(kw);
     }
-    let db = app.state::<Database>();
-    let items = collect_notifications(&db, Some(&keyword), LIST_CAP);
-    Ok(json!({ "keyword": keyword, "notifications": items }))
+    Ok(out)
 }
 
 fn collect_notifications(db: &Database, keyword: Option<&str>, limit: usize) -> Vec<Value> {

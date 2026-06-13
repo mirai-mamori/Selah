@@ -110,3 +110,108 @@ pub(super) async fn extract_all_cookies(app: &tauri::AppHandle) -> Result<Vec<Co
         })
         .collect())
 }
+
+/// Delete every cookie under the Kwansei Gakuin domain family via CDP.
+pub(super) async fn delete_university_cookies(app: &tauri::AppHandle) -> Result<usize, String> {
+    let cookies: Vec<CookieData> = extract_all_cookies(app)
+        .await?
+        .into_iter()
+        .filter(|c| super::is_university_cookie(&c.domain))
+        .collect();
+    let count = cookies.len();
+
+    let win = app
+        .get_webview_window("login")
+        .or_else(|| app.get_webview_window("kgc-headless"))
+        .or_else(|| app.get_webview_window("luna-headless"))
+        .or_else(|| app.get_webview_window("kwic-headless"))
+        .or_else(|| app.get_webview_window("main"))
+        .ok_or("No webview window available for cookie deletion")?;
+
+    win.with_webview(move |webview| unsafe {
+        use webview2_com::CallDevToolsProtocolMethodCompletedHandler;
+
+        let core_webview = webview
+            .controller()
+            .CoreWebView2()
+            .expect("CoreWebView2 must be available");
+
+        for cookie in &cookies {
+            let params = serde_json::json!({
+                "name": cookie.name,
+                "domain": cookie.domain,
+                "path": cookie.path,
+            });
+            let params_str = format!("{}\0", params);
+            let method: Vec<u16> = "Network.deleteCookies\0".encode_utf16().collect();
+            let params_w: Vec<u16> = params_str.encode_utf16().collect();
+            let handler =
+                CallDevToolsProtocolMethodCompletedHandler::create(Box::new(|_code, _json| Ok(())));
+
+            let _ = core_webview.CallDevToolsProtocolMethod(
+                windows_core::PCWSTR(method.as_ptr()),
+                windows_core::PCWSTR(params_w.as_ptr()),
+                &handler,
+            );
+        }
+    })
+    .map_err(|e| format!("with_webview failed: {}", e))?;
+
+    Ok(count)
+}
+
+/// Write cookies into the WebView2 cookie store via CDP `Network.setCookie`.
+/// Best-effort, fire-and-forget per cookie. Returns the count attempted.
+pub(super) async fn set_all_cookies(
+    app: &tauri::AppHandle,
+    cookies: &[CookieData],
+) -> Result<usize, String> {
+    let win = app
+        .get_webview_window("login")
+        .or_else(|| app.get_webview_window("kgc-headless"))
+        .or_else(|| app.get_webview_window("luna-headless"))
+        .or_else(|| app.get_webview_window("kwic-headless"))
+        .or_else(|| app.get_webview_window("main"))
+        .ok_or("No webview window available for cookie injection")?;
+
+    let cookies = cookies.to_vec();
+    let count = cookies.len();
+
+    win.with_webview(move |webview| unsafe {
+        use webview2_com::CallDevToolsProtocolMethodCompletedHandler;
+
+        let core_webview = webview
+            .controller()
+            .CoreWebView2()
+            .expect("CoreWebView2 must be available");
+
+        for c in &cookies {
+            let mut params = serde_json::json!({
+                "name": c.name,
+                "value": c.value,
+                "domain": c.domain.trim_start_matches('.'),
+                "path": c.path,
+                "secure": c.secure,
+                "httpOnly": c.http_only,
+            });
+            if let Some(exp) = c.expires_unix {
+                params["expires"] = serde_json::json!(exp);
+            }
+            let params_str = format!("{}\0", params);
+            let method: Vec<u16> = "Network.setCookie\0".encode_utf16().collect();
+            let params_w: Vec<u16> = params_str.encode_utf16().collect();
+
+            let handler =
+                CallDevToolsProtocolMethodCompletedHandler::create(Box::new(|_code, _json| Ok(())));
+
+            let _ = core_webview.CallDevToolsProtocolMethod(
+                windows_core::PCWSTR(method.as_ptr()),
+                windows_core::PCWSTR(params_w.as_ptr()),
+                &handler,
+            );
+        }
+    })
+    .map_err(|e| format!("with_webview failed: {}", e))?;
+
+    Ok(count)
+}

@@ -1403,28 +1403,6 @@ pub async fn browser_get_url(app: tauri::AppHandle, target: String) -> Result<St
     Ok(readable_url(&target))
 }
 
-pub async fn wait_for_readable_url_change(
-    app: &tauri::AppHandle,
-    target: &str,
-    previous: &str,
-    timeout: std::time::Duration,
-) -> Result<String, String> {
-    if app.get_webview(target).is_none() {
-        return Err("Webview not found".into());
-    }
-    let deadline = tokio::time::Instant::now() + timeout;
-    loop {
-        let current = readable_url(target);
-        if !current.is_empty() && current != previous {
-            return Ok(current);
-        }
-        if tokio::time::Instant::now() >= deadline {
-            return Ok(current);
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(40)).await;
-    }
-}
-
 #[tauri::command]
 pub async fn browser_navigate(
     app: tauri::AppHandle,

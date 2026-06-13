@@ -888,8 +888,12 @@ pub async fn open_markdown_file_window(app: tauri::AppHandle, path: String) -> R
     let label = markdown_window_label(&canonical);
 
     let source_path = canonical.to_string_lossy().to_string();
-    let tab =
-        crate::document_tabs::open_markdown_reader_tab(&app, label, filename.clone(), Some(source_path))?;
+    let tab = crate::document_tabs::open_markdown_reader_tab(
+        &app,
+        label,
+        filename.clone(),
+        Some(source_path),
+    )?;
 
     // Read and parse the file payload after the tab is created so opening a
     // large-but-supported note does not block the native window from appearing.

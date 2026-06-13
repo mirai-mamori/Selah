@@ -1,7 +1,8 @@
 use chrono::{Datelike, Local, TimeZone, Weekday};
 use serde::Serialize;
 use std::collections::BTreeSet;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
+use std::sync::Mutex;
 use std::time::Duration;
 use tauri::{AppHandle, Emitter, Manager};
 
@@ -17,6 +18,13 @@ const STABLE_CACHE_MAX_AGE_SECS: i64 = 12 * 60 * 60;
 const ACADEMIC_RECORD_CACHE_MAX_AGE_SECS: i64 = 72 * 60 * 60;
 const SCHEDULE_CACHE_MAX_AGE_SECS: i64 = 6 * 60 * 60;
 const SESSION_RENEW_THRESHOLD_SECS: i64 = 5 * 60;
+// Time-based "keep-alive" for the core Luna/KWIC sessions. KGC is deliberately
+// excluded because its cookies are sensitive to proactive renewal timing.
+const SESSION_KEEPALIVE_INTERVAL_SECS: i64 = 6 * 60 * 60;
+const SESSION_RENEW_MIN_INTERVAL_SECS: i64 = 30 * 60;
+const SESSION_RECOVERY_SUCCESS_COOLDOWN_SECS: i64 = 30 * 60;
+const SESSION_RECOVERY_BASE_DELAY_SECS: i64 = 10 * 60;
+const SESSION_RECOVERY_MAX_DELAY_SECS: i64 = 2 * 60 * 60;
 const GCAL_AUTO_SYNC_LAST_RUN_KEY: &str = "gcal_auto_sync_last_run";
 const GCAL_SYNC_MIN_HOURS: u32 = 6;
 const GCAL_SYNC_MAX_HOURS: u32 = 72;
@@ -25,6 +33,15 @@ const GCAL_SYNC_DEFAULT_HOURS: u32 = 12;
 pub struct BackendRefreshState {
     running: AtomicBool,
     session_sync_running: AtomicBool,
+    // Epoch seconds of the last headless keep-alive attempt.
+    last_session_keepalive: AtomicI64,
+    recovery: Mutex<[SessionRecoveryState; 2]>,
+}
+
+#[derive(Clone, Copy, Default)]
+struct SessionRecoveryState {
+    last_attempt: i64,
+    failures: u32,
 }
 
 impl BackendRefreshState {
@@ -32,8 +49,64 @@ impl BackendRefreshState {
         Self {
             running: AtomicBool::new(false),
             session_sync_running: AtomicBool::new(false),
+            // Allow a genuinely near-expiry cookie to renew at startup, but do
+            // not make the fixed-cadence keep-alive immediately due.
+            last_session_keepalive: AtomicI64::new(
+                epoch_secs().saturating_sub(SESSION_RENEW_MIN_INTERVAL_SECS),
+            ),
+            recovery: Mutex::new([SessionRecoveryState::default(); 2]),
         }
     }
+
+    fn recovery_due(&self, service: SessionService, now: i64) -> bool {
+        let recovery = self.recovery.lock().unwrap_or_else(|e| e.into_inner());
+        let entry = recovery[service.index()];
+        if entry.last_attempt == 0 {
+            return true;
+        }
+        now.saturating_sub(entry.last_attempt) >= recovery_delay_secs(entry.failures)
+    }
+
+    fn record_recovery(&self, service: SessionService, now: i64, succeeded: bool) {
+        let mut recovery = self.recovery.lock().unwrap_or_else(|e| e.into_inner());
+        let entry = &mut recovery[service.index()];
+        entry.last_attempt = now;
+        entry.failures = if succeeded {
+            0
+        } else {
+            entry.failures.saturating_add(1)
+        };
+    }
+}
+
+#[derive(Clone, Copy)]
+enum SessionService {
+    Luna,
+    Kwic,
+}
+
+impl SessionService {
+    fn index(self) -> usize {
+        match self {
+            Self::Luna => 0,
+            Self::Kwic => 1,
+        }
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            Self::Luna => "luna",
+            Self::Kwic => "kwic",
+        }
+    }
+}
+
+fn recovery_delay_secs(failures: u32) -> i64 {
+    if failures == 0 {
+        return SESSION_RECOVERY_SUCCESS_COOLDOWN_SECS;
+    }
+    let multiplier = 1_i64 << failures.saturating_sub(1).min(3);
+    (SESSION_RECOVERY_BASE_DELAY_SECS * multiplier).min(SESSION_RECOVERY_MAX_DELAY_SECS)
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -43,7 +116,7 @@ pub struct BackendCacheUpdatePayload {
 
 #[derive(Debug, Clone, Serialize, Default)]
 pub struct BackendSessionStatusPayload {
-    pub kgc_valid: bool,
+    pub kgc_session_present: bool,
     pub session_expired: bool,
     pub username: String,
     pub display_name: String,
@@ -232,7 +305,7 @@ async fn refresh_backend_data_inner(
 
     let db = app.state::<Database>();
     let session_status = sync_backend_session_status(app, true).await?;
-    let kgc_authenticated = session_status.kgc_valid;
+    let kgc_authenticated = session_status.kgc_session_present;
     let luna_authenticated = session_status.luna_authenticated;
     let mut updated_keys = Vec::new();
     let mut schedule_changed = false;
@@ -409,7 +482,20 @@ pub async fn sync_backend_session_status(
     app: &AppHandle,
     attempt_recovery: bool,
 ) -> Result<BackendSessionStatusPayload, String> {
-    let payload = sync_backend_session_status_inner(app, attempt_recovery).await?;
+    let state = app.state::<BackendRefreshState>();
+    let owns_recovery =
+        attempt_recovery && !state.session_sync_running.swap(true, Ordering::SeqCst);
+    struct RecoveryGuard<'a>(Option<&'a AtomicBool>);
+    impl Drop for RecoveryGuard<'_> {
+        fn drop(&mut self) {
+            if let Some(running) = self.0 {
+                running.store(false, Ordering::SeqCst);
+            }
+        }
+    }
+    let _guard = RecoveryGuard(owns_recovery.then_some(&state.session_sync_running));
+
+    let payload = sync_backend_session_status_inner(app, owns_recovery).await?;
     emit_session_status(app, &payload);
     Ok(payload)
 }
@@ -422,85 +508,57 @@ async fn sync_backend_session_status_inner(
     let luna_had_session = is_luna_authenticated(app).await;
     let kwic_had_session = is_kwic_authenticated(app).await;
 
-    let mut kgc_status = if kgc_had_session {
-        crate::commands::check_session(app.state::<KgcState>()).await?
-    } else {
-        crate::commands::SessionStatus {
-            valid: false,
-            username: String::new(),
-            display_name: String::new(),
-            student_id: String::new(),
-            faculty: String::new(),
-            department: String::new(),
+    // KGC is a short-lived, request-driven session. Background status sync must
+    // never touch its server; actual KGC requests and explicit user checks are
+    // responsible for confirming whether the stored session still works.
+    let kgc_status = kgc_status_from_memory(app, kgc_had_session).await;
+    let mut luna_valid = if luna_had_session && attempt_recovery {
+        match crate::luna_commands::luna_check_session(app.state::<LunaState>()).await {
+            Ok(valid) => valid,
+            Err(e) => {
+                log::warn!(
+                    "session status: Luna validation transient failure, retaining session: {}",
+                    e
+                );
+                true
+            }
         }
-    };
-    let mut luna_valid = if luna_had_session {
-        crate::luna_commands::luna_check_session(app.state::<LunaState>())
-            .await
-            .unwrap_or(false)
     } else {
-        false
+        luna_had_session
     };
-    let mut kwic_valid = if kwic_had_session {
-        crate::kwic_commands::kwic_check_session(app.state::<KwicState>())
-            .await
-            .unwrap_or(false)
+    let mut kwic_valid = if kwic_had_session && attempt_recovery {
+        match crate::kwic_commands::kwic_check_session(app.state::<KwicState>()).await {
+            Ok(valid) => valid,
+            Err(e) => {
+                log::warn!(
+                    "session status: KWIC validation transient failure, retaining session: {}",
+                    e
+                );
+                true
+            }
+        }
     } else {
-        false
+        kwic_had_session
     };
-    let mut kgc_session_present = is_kgc_authenticated(app).await;
-
     if attempt_recovery {
-        if kgc_had_session && !kgc_status.valid && !kgc_session_present {
-            let _ = crate::commands::sync_session(
-                app.clone(),
-                app.state::<KgcState>(),
-                app.state::<LunaState>(),
-                app.state::<KwicState>(),
-                "all".to_string(),
-            )
-            .await;
-            kgc_status = crate::commands::check_session(app.state::<KgcState>())
+        // Proactive recovery is restricted to the core services. KGC is only
+        // recovered after an actual KGC request fails or a user asks for it.
+        let has_session_evidence = kgc_had_session || luna_had_session || kwic_had_session;
+        if has_session_evidence
+            && !luna_valid
+            && attempt_service_recovery(app, SessionService::Luna).await
+        {
+            luna_valid = crate::luna_commands::luna_check_session(app.state::<LunaState>())
                 .await
-                .unwrap_or(kgc_status);
-            kgc_session_present = is_kgc_authenticated(app).await;
-            if luna_had_session {
-                luna_valid = crate::luna_commands::luna_check_session(app.state::<LunaState>())
-                    .await
-                    .unwrap_or(false);
-            }
-            if kwic_had_session {
-                kwic_valid = crate::kwic_commands::kwic_check_session(app.state::<KwicState>())
-                    .await
-                    .unwrap_or(false);
-            }
-        } else {
-            if luna_had_session && !luna_valid {
-                let _ = crate::commands::sync_session(
-                    app.clone(),
-                    app.state::<KgcState>(),
-                    app.state::<LunaState>(),
-                    app.state::<KwicState>(),
-                    "luna".to_string(),
-                )
-                .await;
-                luna_valid = crate::luna_commands::luna_check_session(app.state::<LunaState>())
-                    .await
-                    .unwrap_or(false);
-            }
-            if kwic_had_session && !kwic_valid {
-                let _ = crate::commands::sync_session(
-                    app.clone(),
-                    app.state::<KgcState>(),
-                    app.state::<LunaState>(),
-                    app.state::<KwicState>(),
-                    "kwic".to_string(),
-                )
-                .await;
-                kwic_valid = crate::kwic_commands::kwic_check_session(app.state::<KwicState>())
-                    .await
-                    .unwrap_or(false);
-            }
+                .unwrap_or(true);
+        }
+        if has_session_evidence
+            && !kwic_valid
+            && attempt_service_recovery(app, SessionService::Kwic).await
+        {
+            kwic_valid = crate::kwic_commands::kwic_check_session(app.state::<KwicState>())
+                .await
+                .unwrap_or(true);
         }
     }
 
@@ -512,9 +570,14 @@ async fn sync_backend_session_status_inner(
             display_name: String::new(),
         });
 
+    // Luna and KWIC are the core app sessions. KGC enriches timetable and
+    // academic-record features, but its isolated failure must not put the
+    // whole app into the user-facing re-authentication state.
+    let core_session_expired = !(luna_valid && kwic_valid);
+
     Ok(BackendSessionStatusPayload {
-        kgc_valid: kgc_status.valid,
-        session_expired: kgc_had_session && !kgc_status.valid && !kgc_session_present,
+        kgc_session_present: kgc_status.valid,
+        session_expired: core_session_expired,
         username: if kgc_status.valid {
             kgc_status.username
         } else {
@@ -548,6 +611,61 @@ async fn sync_backend_session_status_inner(
     })
 }
 
+async fn kgc_status_from_memory(app: &AppHandle, valid: bool) -> crate::commands::SessionStatus {
+    let state = app.state::<KgcState>();
+    let client = state.client.lock().await;
+    match client.session.as_ref() {
+        Some(session) => crate::commands::SessionStatus {
+            valid,
+            username: session.username.clone(),
+            display_name: session.display_name.clone(),
+            student_id: session.student_id.clone(),
+            faculty: session.faculty.clone(),
+            department: session.department.clone(),
+        },
+        None => crate::commands::SessionStatus {
+            valid: false,
+            username: String::new(),
+            display_name: String::new(),
+            student_id: String::new(),
+            faculty: String::new(),
+            department: String::new(),
+        },
+    }
+}
+
+async fn attempt_service_recovery(app: &AppHandle, service: SessionService) -> bool {
+    let state = app.state::<BackendRefreshState>();
+    let now = epoch_secs();
+    if !state.recovery_due(service, now) {
+        log::debug!(
+            "session recovery: {} skipped during backoff",
+            service.name()
+        );
+        return false;
+    }
+
+    log::info!("session recovery: attempting {}", service.name());
+    let succeeded = match crate::commands::sync_session(
+        app.clone(),
+        app.state::<KgcState>(),
+        app.state::<LunaState>(),
+        app.state::<KwicState>(),
+        service.name().to_string(),
+    )
+    .await
+    {
+        Ok(true) => true,
+        Ok(false) => false,
+        Err(e) => {
+            log::warn!("session recovery: {} failed: {}", service.name(), e);
+            false
+        }
+    };
+    state.record_recovery(service, now, succeeded);
+    succeeded
+}
+
 async fn maybe_renew_sessions(app: &AppHandle) {
     let state = app.state::<BackendRefreshState>();
     if state.session_sync_running.swap(true, Ordering::SeqCst) {
@@ -568,17 +686,36 @@ async fn maybe_renew_sessions(app: &AppHandle) {
 }
 
 async fn maybe_renew_sessions_inner(app: &AppHandle) -> Result<(), String> {
-    let Some(expiry_secs) = soonest_session_expiry_secs(app).await else {
+    // Reactive trigger: a core-service cookie is near its explicit expiry.
+    let expiry_due = soonest_core_session_expiry_secs(app)
+        .await
+        .is_some_and(|secs| secs <= SESSION_RENEW_THRESHOLD_SECS);
+
+    // Time-based keep-alive: only meaningful if we currently believe we're
+    // logged in to at least one service (otherwise renewal would just spawn a
+    // hidden Okta-login webview for nothing). This covers the session-only
+    // cookie case where expiry_due can never fire.
+    let any_session = current_core_session_present(app).await;
+    let state = app.state::<BackendRefreshState>();
+    let now = epoch_secs();
+    let last = state.last_session_keepalive.load(Ordering::Relaxed);
+    let keepalive_due = any_session && now.saturating_sub(last) >= SESSION_KEEPALIVE_INTERVAL_SECS;
+
+    if !expiry_due && !keepalive_due {
         return Ok(());
-    };
-    if expiry_secs > SESSION_RENEW_THRESHOLD_SECS {
+    }
+    if now.saturating_sub(last) < SESSION_RENEW_MIN_INTERVAL_SECS {
         return Ok(());
     }
 
     log::info!(
-        "background refresh: cookie expiry in {}s, attempting headless session renew",
-        expiry_secs
+        "background refresh: headless session renew (expiry_due={}, keepalive_due={})",
+        expiry_due,
+        keepalive_due
     );
+    // Record the attempt time up front so a dead Okta session doesn't make us
+    // retry every tick — the reactive path handles real usage in the meantime.
+    state.last_session_keepalive.store(now, Ordering::Relaxed);
     let _ = crate::commands::sync_session(
         app.clone(),
         app.state::<KgcState>(),
@@ -590,18 +727,20 @@ async fn maybe_renew_sessions_inner(app: &AppHandle) -> Result<(), String> {
     Ok(())
 }
 
-async fn soonest_session_expiry_secs(app: &AppHandle) -> Option<i64> {
-    let kgc_exp = app
-        .state::<KgcState>()
-        .client
-        .lock()
-        .await
-        .soonest_cookie_expiry_secs();
+/// Whether we currently believe at least one core service is authenticated.
+async fn current_core_session_present(app: &AppHandle) -> bool {
+    if app.state::<LunaState>().client.lock().await.authenticated {
+        return true;
+    }
+    app.state::<KwicState>().client.lock().await.authenticated
+}
+
+async fn soonest_core_session_expiry_secs(app: &AppHandle) -> Option<i64> {
     let luna_exp =
         client::soonest_cookie_expiry(&app.state::<LunaState>().client.lock().await.cookie_store);
     let kwic_exp =
         client::soonest_cookie_expiry(&app.state::<KwicState>().client.lock().await.cookie_store);
-    [kgc_exp, luna_exp, kwic_exp].into_iter().flatten().min()
+    [luna_exp, kwic_exp].into_iter().flatten().min()
 }
 
 fn cache_is_stale(db: &Database, key: &str, max_age_secs: i64) -> bool {

@@ -9,15 +9,47 @@ use tauri::Manager;
 #[cfg(target_os = "macos")]
 mod macos;
 #[cfg(target_os = "macos")]
-use macos::extract_all_cookies;
+use macos::{delete_university_cookies, extract_all_cookies, set_all_cookies};
 
 #[cfg(target_os = "windows")]
 mod windows;
 #[cfg(target_os = "windows")]
-use self::windows::extract_all_cookies;
+use self::windows::{delete_university_cookies, extract_all_cookies, set_all_cookies};
+
+/// Keychain key holding the JSON backup of the SSO/Okta session cookies. These
+/// normally live only in the OS webview store; backing them up lets headless
+/// re-auth survive the webview store being cleared (OS cleanup / reinstall),
+/// keeping the long-lived device token usable for far longer.
+const SSO_COOKIE_BACKUP_KEY: &str = "sso_cookie_backup";
+static SSO_RESTORE_ONCE: tokio::sync::OnceCell<()> = tokio::sync::OnceCell::const_new();
+
+/// All university cookies are deleted by a complete login reset.
+fn is_university_cookie(domain: &str) -> bool {
+    let d = domain.trim_start_matches('.');
+    d == "kwansei.ac.jp" || d.ends_with(".kwansei.ac.jp")
+}
+
+/// Only identity-provider cookies are backed up. Service-provider cookies,
+/// especially KGC's short-lived cookies, must retain their natural lifetime.
+fn is_backupable_sso_cookie(domain: &str) -> bool {
+    let d = domain.trim_start_matches('.');
+    d == "kwansei.ac.jp" || OKTA_HOSTS.contains(&d)
+}
+
+/// Remove all university/SSO cookies from the native webview store and delete
+/// the keychain backup so startup restoration cannot silently log back in.
+pub async fn clear_university_cookies(app: &tauri::AppHandle) -> Result<usize, String> {
+    crate::keychain::delete_secret(SSO_COOKIE_BACKUP_KEY);
+    let deleted = delete_university_cookies(app).await?;
+    // Platform cookie deletion APIs complete asynchronously. Give the native
+    // store a moment to settle before the caller opens a fresh login window.
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    log::info!("clear_university_cookies: removed {deleted} university cookies");
+    Ok(deleted)
+}
 
 /// Plain cookie data extracted from the webview (Send + Sync safe).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub(crate) struct CookieData {
     pub name: String,
     pub value: String,
@@ -141,6 +173,78 @@ fn is_okta_login_page(url: &url::Url) -> bool {
     OKTA_HOSTS.contains(&host)
 }
 
+/// Back up the current SSO/Okta cookies (kwansei.ac.jp family) from the webview
+/// store to the keychain. Called after a successful login or headless refresh
+/// so the stored device token always reflects the latest session. A read that
+/// yields nothing is ignored so we never clobber a good backup with an empty one.
+pub async fn persist_sso_cookies(app: &tauri::AppHandle) {
+    let all = match extract_all_cookies(app).await {
+        Ok(c) => c,
+        Err(e) => {
+            log::warn!("persist_sso_cookies: extraction failed: {e}");
+            return;
+        }
+    };
+    let sso: Vec<CookieData> = all
+        .into_iter()
+        .filter(|c| is_backupable_sso_cookie(&c.domain))
+        .collect();
+    if sso.is_empty() {
+        log::info!("persist_sso_cookies: no SSO cookies to back up (skipped)");
+        return;
+    }
+    match serde_json::to_string(&sso) {
+        Ok(json) => {
+            if let Err(e) = crate::keychain::set_secret(SSO_COOKIE_BACKUP_KEY, &json) {
+                log::warn!("persist_sso_cookies: keychain write failed: {e}");
+            } else {
+                log::info!("persist_sso_cookies: backed up {} SSO cookies", sso.len());
+            }
+        }
+        Err(e) => log::warn!("persist_sso_cookies: serialize failed: {e}"),
+    }
+}
+
+/// Restore the keychain-backed SSO/Okta cookies into the webview store. Called
+/// once at startup (before any headless re-auth) so a wiped webview store can
+/// still present a valid SSO session / device token. Expired cookies are
+/// dropped. Best-effort: any failure just means we fall back to normal login.
+pub async fn restore_sso_cookies(app: &tauri::AppHandle) {
+    SSO_RESTORE_ONCE
+        .get_or_init(|| async {
+            restore_sso_cookies_inner(app).await;
+        })
+        .await;
+}
+
+async fn restore_sso_cookies_inner(app: &tauri::AppHandle) {
+    let Some(json) = crate::keychain::get_secret(SSO_COOKIE_BACKUP_KEY) else {
+        return;
+    };
+    let cookies: Vec<CookieData> = match serde_json::from_str(&json) {
+        Ok(c) => c,
+        Err(e) => {
+            log::warn!("restore_sso_cookies: parse failed: {e}");
+            return;
+        }
+    };
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs_f64())
+        .unwrap_or(0.0);
+    let live: Vec<CookieData> = cookies
+        .into_iter()
+        .filter(|c| c.expires_unix.is_none_or(|exp| exp > now))
+        .collect();
+    if live.is_empty() {
+        return;
+    }
+    match set_all_cookies(app, &live).await {
+        Ok(n) => log::info!("restore_sso_cookies: restored {n} SSO cookies"),
+        Err(e) => log::warn!("restore_sso_cookies: webview write failed: {e}"),
+    }
+}
+
 pub async fn headless_saml_window(
     app: &tauri::AppHandle,
     window_label: &str,
@@ -205,5 +309,33 @@ pub async fn headless_saml_window(
             let _ = win.close();
             Ok(None)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{is_backupable_sso_cookie, is_university_cookie};
+
+    #[test]
+    fn sso_backup_excludes_service_provider_cookies() {
+        assert!(is_backupable_sso_cookie(".kwansei.ac.jp"));
+        assert!(is_backupable_sso_cookie("sso.kwansei.ac.jp"));
+        assert!(is_backupable_sso_cookie("idp.kwansei.ac.jp"));
+        assert!(is_backupable_sso_cookie("sts.kwansei.ac.jp"));
+
+        assert!(!is_backupable_sso_cookie("kg-course.kwansei.ac.jp"));
+        assert!(!is_backupable_sso_cookie("luna.kwansei.ac.jp"));
+        assert!(!is_backupable_sso_cookie("kwic.kwansei.ac.jp"));
+        assert!(!is_backupable_sso_cookie("example.com"));
+    }
+
+    #[test]
+    fn complete_reset_includes_all_university_cookies() {
+        assert!(is_university_cookie(".kwansei.ac.jp"));
+        assert!(is_university_cookie("sso.kwansei.ac.jp"));
+        assert!(is_university_cookie("kg-course.kwansei.ac.jp"));
+        assert!(is_university_cookie("luna.kwansei.ac.jp"));
+        assert!(is_university_cookie("kwic.kwansei.ac.jp"));
+        assert!(!is_university_cookie("example.com"));
     }
 }

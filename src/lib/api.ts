@@ -78,6 +78,12 @@ if (!__selahGlobal[__SELAH_LISTENERS_KEY]) {
     kwicAuthState.set({ authenticated: false });
   });
 
+  listen<UniversityLoginComplete>("university-login-complete", (event) => {
+    lunaAuthState.set({ authenticated: event.payload.luna_authenticated });
+    kwicAuthState.set({ authenticated: event.payload.kwic_authenticated });
+    sessionExpired.set(!(event.payload.luna_authenticated && event.payload.kwic_authenticated));
+  });
+
   listen<{ email: string; displayName: string }>("mail-login-success", (event) => {
     mailAuthState.set({
       authenticated: true,
@@ -133,13 +139,14 @@ if (!__selahGlobal[__SELAH_LISTENERS_KEY]) {
 function applyBackendSessionStatus(status: BackendSessionStatus) {
   lunaAuthState.set({ authenticated: status.luna_authenticated });
   kwicAuthState.set({ authenticated: status.kwic_authenticated });
+  sessionExpired.set(status.session_expired);
   mailAuthState.set({
     authenticated: status.mail_authenticated,
     email: status.mail_email,
     displayName: status.mail_display_name,
   });
 
-  if (status.kgc_valid) {
+  if (status.kgc_session_present) {
     setAuthFromSession({
       username: status.username,
       display_name: status.display_name,
@@ -147,12 +154,7 @@ function applyBackendSessionStatus(status: BackendSessionStatus) {
       faculty: status.faculty,
       department: status.department,
     });
-    if (get(sessionExpired)) sessionExpired.set(false);
     return;
-  }
-
-  if (status.session_expired) {
-    sessionExpired.set(true);
   }
 }
 
@@ -175,7 +177,7 @@ interface SessionStatus {
 }
 
 interface BackendSessionStatus {
-  kgc_valid: boolean;
+  kgc_session_present: boolean;
   session_expired: boolean;
   username: string;
   display_name: string;
@@ -187,6 +189,11 @@ interface BackendSessionStatus {
   mail_authenticated: boolean;
   mail_email: string;
   mail_display_name: string;
+}
+
+interface UniversityLoginComplete {
+  luna_authenticated: boolean;
+  kwic_authenticated: boolean;
 }
 
 interface BackendAiRefreshItemStatus {
@@ -337,18 +344,9 @@ export const serviceRegistry: Record<string, ServiceConfig> = {
     ],
     onRecovered: () => refreshKgcAuthState().catch(() => {}),
     onReset: () => {
-      // Don't wipe authState entirely — if sessionExpired is set, the user
-      // should see the Dashboard with cached data, not the Login page.
-      // Only wipe auth on explicit logout (which calls logout() directly).
-      if (get(sessionExpired)) {
-        debugLog("[Selah] kgc.onReset: sessionExpired=true, keeping authState for cached view");
-        return;
-      }
-      authState.set({
-        authenticated: false, username: "", displayName: "",
-        studentId: "", faculty: "", department: "",
-        loading: false, error: "",
-      });
+      // KGC is an auxiliary service. Keep the cached user identity and app
+      // shell available; explicit logout is the only action that clears it.
+      debugLog("[Selah] kgc.onReset: keeping cached identity");
     },
   },
 };
@@ -405,9 +403,9 @@ export function setAuthFromSession(session: { username: string; display_name?: s
   } catch {}
 }
 
-/** Re-fetch KG-Course user info and update authState store */
+/** Apply the KGC identity already verified and stored by a successful sync. */
 async function refreshKgcAuthState(): Promise<boolean> {
-  const status = await checkSession();
+  const status = await getKgcSessionSnapshot();
   if (!status.valid) return false;
   setAuthFromSession(status);
   return true;
@@ -420,157 +418,92 @@ interface SessionStates {
   [key: string]: boolean;
 }
 
-async function getSessionStates(): Promise<SessionStates> {
+export async function getStoredSessionStates(): Promise<SessionStates> {
   return invoke<SessionStates>("get_session_states");
 }
 
-/** Dedup map: only one syncSession per service at a time.
- * Prevents concurrent headless SAML windows from closing each other.
- * "all" waits for per-service syncs to finish; per-service waits for "all". */
+/** Only one sync per key runs at once. All SAML work is also serialized through
+ * `_samlSyncTail`, because the services share one upstream identity provider. */
 const _syncInFlight = new Map<string, Promise<boolean>>();
+let _samlSyncTail: Promise<void> = Promise.resolve();
 
 export async function syncSession(service: string): Promise<boolean> {
   if (_isDemo()) return true;
   const existing = _syncInFlight.get(service);
   if (existing) return existing;
 
-  // "all" internally refreshes all three — wait for per-service syncs
-  if (service === "all") {
-    const waits = [_syncInFlight.get("luna"), _syncInFlight.get("kwic"), _syncInFlight.get("kgc")].filter(Boolean);
-    if (waits.length) await Promise.allSettled(waits);
-  } else {
-    // Per-service sync — wait for "all" if it's in flight (it will refresh this service too)
-    const allSync = _syncInFlight.get("all");
-    if (allSync) {
-      return allSync;
-    }
-  }
-
-  const promise = invoke<boolean>("sync_session", { service })
-    .finally(() => _syncInFlight.delete(service));
+  // Queue every SAML operation. Never reuse an "all" result for KGC: "all"
+  // intentionally means Luna + KWIC only.
+  const promise = _samlSyncTail
+    .catch(() => {})
+    .then(() => invoke<boolean>("sync_session", { service }));
+  _samlSyncTail = promise.then(() => {}, () => {});
+  promise.then(
+    () => { _syncInFlight.delete(service); },
+    () => { _syncInFlight.delete(service); },
+  );
   _syncInFlight.set(service, promise);
 
-  const ok = await promise;
-
-  // Cross-renewal: if a single service sync succeeded, Okta is alive.
-  // Opportunistically refresh other expired services in the background.
-  if (ok && service !== "all") {
-    crossRenewOtherServices(service);
-  }
-
-  return ok;
-}
-
-const SAML_SERVICES = ["kgc", "luna", "kwic"] as const;
-
-/**
- * When one SAML service's headless refresh succeeds, Okta SSO is proven alive.
- * Fire-and-forget refresh for other services that are currently dead.
- */
-function crossRenewOtherServices(succeededService: string) {
-  for (const svc of SAML_SERVICES) {
-    if (svc === succeededService) continue;
-    // Skip if already in-flight
-    if (_syncInFlight.has(svc) || _syncInFlight.has("all")) continue;
-
-    const isAlive = svc === "kgc"
-      ? get(authState).authenticated
-      : svc === "luna"
-        ? get(lunaAuthState).authenticated
-        : get(kwicAuthState).authenticated;
-
-    if (!isAlive) {
-      debugLog(`[Selah] Cross-renewal: ${succeededService} alive -> trying ${svc}`);
-      syncSession(svc).then(ok => {
-        if (ok) {
-          serviceRegistry[svc].onRecovered();
-          debugLog(`[Selah] Cross-renewal: ${svc} recovered`);
-        }
-      }).catch(() => {});
-    }
-  }
-}
-
-// --- Recovery flow (shared by all services) ---
-
-let recoveryPromise: Promise<void> | null = null;
-let lastRecoveryTime = 0;
-const RECOVERY_COOLDOWN = 5_000; // 5 seconds cooldown after recovery completes
-
-/**
- * Unified session recovery: headless refresh all services -> visible login.
- * Multiple concurrent callers share the same promise (only one recovery at a time).
- */
-export function triggerRelogin(): Promise<void> {
-  if (recoveryPromise) return recoveryPromise;
-  // Skip if recovery just completed recently
-  if (Date.now() - lastRecoveryTime < RECOVERY_COOLDOWN) return Promise.resolve();
-
-  recoveryPromise = (async () => {
-    // Phase 1: Headless refresh (Okta SSO may still be alive)
-    debugLog("[Selah] Session expired, trying headless refresh...");
-    try {
-      const ok = await syncSession("all");
-      if (ok) {
-        debugLog("[Selah] Headless refresh: at least one service recovered");
-        // Verify each service individually
-        const [kgcOk, lunaOk, kwicOk] = await Promise.all([
-          checkSession().then(s => s.valid).catch(() => false),
-          lunaCheckSession().catch(() => false),
-          kwicCheckSession().catch(() => false),
-        ]);
-        if (kgcOk) { serviceRegistry.kgc.onRecovered(); sessionExpired.set(false); }
-        if (lunaOk) serviceRegistry.luna.onRecovered();
-        else serviceRegistry.luna.onReset();
-        if (kwicOk) serviceRegistry.kwic.onRecovered();
-        else serviceRegistry.kwic.onReset();
-        // If KGC recovered, we're good — app is usable
-        if (kgcOk) return;
-        // KGC failed but others may be alive — still need user to re-login for KGC
-        debugLog("[Selah] KGC failed but secondary services may be alive");
-      }
-    } catch (e) {
-      console.warn("[Selah] Headless refresh error:", e);
-    }
-
-    // Phase 2: Okta SSO expired — mark session as expired and let user initiate re-login
-    debugLog("[Selah] Okta expired, marking session as expired (user can re-verify from titlebar)");
-    sessionExpired.set(true);
-  })().finally(() => { recoveryPromise = null; lastRecoveryTime = Date.now(); });
-
-  return recoveryPromise;
+  return await promise;
 }
 
 /**
  * User-initiated re-login from the titlebar badge.
  * Opens a visible login window and on success clears sessionExpired + refreshes all data.
  */
-export async function initiateRelogin(): Promise<void> {
+export async function initiateRelogin(): Promise<UniversityLoginComplete | null> {
   if (_isDemo()) {
     sessionExpired.set(false);
-    return;
+    return { luna_authenticated: true, kwic_authenticated: true };
   }
   try {
-    await openVisibleLogin();
-    sessionExpired.set(false);
-    // Refresh all data after successful re-login
+    const result = await openVisibleLogin();
+    // The completion event is emitted after KGC, Luna, and KWIC phases finish.
     startBackgroundPolling();
+    return result;
   } catch (e: any) {
     if (e?.message !== "__login_cancelled__") {
       console.warn("[Selah] User-initiated relogin failed:", e);
     }
+    return null;
   }
 }
 
-function openVisibleLogin(): Promise<void> {
-  return new Promise<void>(async (resolve, reject) => {
+/**
+ * Remove all university sessions and native SSO cookies, then open a visible
+ * login window. App settings and cached user data are intentionally preserved.
+ */
+export async function resetUniversityLogin(): Promise<{ deleted: number; core: UniversityLoginComplete | null }> {
+  if (_isDemo()) {
+    sessionExpired.set(false);
+    return {
+      deleted: 0,
+      core: { luna_authenticated: true, kwic_authenticated: true },
+    };
+  }
+
+  stopBackgroundPolling();
+  const deleted = await invoke<number>("reset_university_login");
+  serviceRegistry.kgc.onReset();
+  serviceRegistry.luna.onReset();
+  serviceRegistry.kwic.onReset();
+  sessionExpired.set(true);
+  const core = await initiateRelogin();
+  startBackgroundPolling();
+  return { deleted, core };
+}
+
+function openVisibleLogin(): Promise<UniversityLoginComplete> {
+  return new Promise<UniversityLoginComplete>(async (resolve, reject) => {
     reloginInProgress.set(true);
 
     let unlisten: (() => void) | null = null;
+    let unlistenComplete: (() => void) | null = null;
     let unlistenErr: (() => void) | null = null;
     let unlistenCancel: (() => void) | null = null;
     const cleanup = () => {
       unlisten?.();
+      unlistenComplete?.();
       unlistenErr?.();
       unlistenCancel?.();
       reloginInProgress.set(false);
@@ -581,13 +514,14 @@ function openVisibleLogin(): Promise<void> {
         "login-success",
         (event) => {
           setAuthFromSession(event.payload);
-          // Don't mark secondary services here — backend Phase 2/3 runs
-          // asynchronously after this event. Global listeners for
-          // luna-login-success / kwic-login-success will set their states.
-          cleanup();
-          resolve();
+          // Core-service authentication continues in the same login window.
         },
       );
+
+      unlistenComplete = await listen<UniversityLoginComplete>("university-login-complete", (event) => {
+        cleanup();
+        resolve(event.payload);
+      });
 
       unlistenErr = await listen<string>("login-error", (_event) => {
         cleanup();
@@ -633,16 +567,20 @@ async function withSessionGuard<T>(fn: () => Promise<T>): Promise<T> {
     const expiredService = identifyExpiredService(err);
     if (!expiredService) throw err;
 
-    // KGC session expired → full recovery (headless all → visible login)
+    // KGC is auxiliary. Recover it independently and never escalate its
+    // isolated failure into the app-wide re-authentication state.
     if (expiredService === "kgc") {
       try {
-        await triggerRelogin();
-      } catch (recoveryErr: any) {
-        debugLog("[Selah] Recovery failed:", recoveryErr);
-        throw recoveryErr;
+        const ok = await syncSession("kgc");
+        if (ok) {
+          serviceRegistry.kgc.onRecovered();
+          return await fn();
+        }
+      } catch (recoveryErr) {
+        debugLog("[Selah] KGC targeted recovery failed:", recoveryErr);
       }
-      if (get(sessionExpired)) throw err;
-      return await fn();
+      serviceRegistry.kgc.onReset();
+      throw err;
     }
 
     // Mail expired → OAuth token revoked, no headless recovery possible
@@ -665,15 +603,18 @@ async function withSessionGuard<T>(fn: () => Promise<T>): Promise<T> {
       console.warn(`[Selah] ${expiredService} headless refresh failed:`, e);
     }
     // Targeted refresh failed — reset only this service, don't escalate to full recovery
-    // (Luna and KWIC share Okta SSO — triggerRelogin would kill the other service too)
     svc.onReset();
+    // Luna and KWIC are core services. A confirmed failure of either one
+    // exposes the global manual re-authentication action.
+    sessionExpired.set(true);
     throw err;
   }
 }
 
 /**
  * Restore all sessions on app startup.
- * Returns KGC session status, or null if KGC session is invalid.
+ * Returns the stored KGC identity snapshot, or null when no returning-user
+ * evidence exists. KGC itself is not contacted during startup restoration.
  */
 export async function restoreAllSessions(): Promise<SessionStatus | null> {
   if (_isDemo()) {
@@ -687,16 +628,14 @@ export async function restoreAllSessions(): Promise<SessionStatus | null> {
     };
   }
   const [initialStatus, states] = await Promise.all([
-    checkSession(),
-    getSessionStates().catch(() => ({ kgc: false, luna: false, kwic: false })),
+    getKgcSessionSnapshot(),
+    getStoredSessionStates().catch(() => ({ kgc: false, luna: false, kwic: false })),
   ]);
   let status = initialStatus;
-  debugLog("[Selah] restoreAllSessions: initial check_session =", JSON.stringify(status));
+  debugLog("[Selah] restoreAllSessions: stored KGC snapshot =", JSON.stringify(status));
   debugLog("[Selah] restoreAllSessions: session states =", JSON.stringify(states));
 
-  // If any service has expired disk cookies, refresh all in parallel.
-  // This avoids sequential 20s timeouts when Okta is expired.
-  const needsKgcSync = !status.valid;
+  // Restore only missing core services. KGC is never proactively renewed.
   const secondaryTasks = [
     { key: "luna" as const, hasSession: states.luna, validate: () => lunaCheckSession(), config: serviceRegistry.luna },
     { key: "kwic" as const, hasSession: states.kwic, validate: () => kwicCheckSession(), config: serviceRegistry.kwic },
@@ -706,36 +645,32 @@ export async function restoreAllSessions(): Promise<SessionStatus | null> {
   const secondaryValid: Record<string, boolean> = {};
   await Promise.allSettled(secondaryTasks.map(async ({ key, hasSession, validate }) => {
     if (hasSession) {
-      secondaryValid[key] = await validate().catch(() => false);
+      // A request error (including 429) is not proof that the session expired.
+      // The backend returns false only for a confirmed login redirect.
+      secondaryValid[key] = await validate().catch(() => true);
     }
   }));
 
   // Collect services that need headless sync
   const syncNeeded: string[] = [];
-  if (needsKgcSync) syncNeeded.push("kgc");
-  for (const { key, hasSession } of secondaryTasks) {
-    if (hasSession && !secondaryValid[key]) syncNeeded.push(key);
+  const hasSavedSession = states.kgc || states.luna || states.kwic
+    || !!(status.username || status.display_name || status.student_id);
+  for (const { key } of secondaryTasks) {
+    if (hasSavedSession && secondaryValid[key] !== true) syncNeeded.push(key);
   }
 
   if (syncNeeded.length > 0) {
-    debugLog(`[Selah] Disk sessions expired, syncing in parallel: ${syncNeeded.join(", ")}`);
-    // Run all headless syncs in parallel — shares Okta SSO, so if one fails they all will
+    debugLog(`[Selah] Disk sessions expired, syncing serially: ${syncNeeded.join(", ")}`);
+    // syncSession queues core-service SAML flows because they share the same IdP.
     const results = await Promise.allSettled(syncNeeded.map(svc => syncSession(svc)));
     for (let i = 0; i < syncNeeded.length; i++) {
       const svc = syncNeeded[i];
       const res = results[i];
       const ok = res.status === "fulfilled" && res.value;
-      if (svc === "kgc") {
-        if (ok) {
-          const fresh = await checkSession().catch(() => null);
-          if (fresh?.valid) status = fresh;
-          debugLog("[Selah] Headless KGC refresh succeeded");
-        }
-      } else {
-        const config = serviceRegistry[svc];
-        if (ok) config.onRecovered();
-        else config.onReset();
-      }
+      const config = serviceRegistry[svc];
+      secondaryValid[svc] = ok;
+      if (ok) config.onRecovered();
+      else config.onReset();
     }
   } else {
     // All disk cookies were valid — mark secondary services
@@ -744,21 +679,27 @@ export async function restoreAllSessions(): Promise<SessionStatus | null> {
     }
   }
 
-  // If KGC was not valid initially, cross-renewal from Luna/KWIC may have saved it.
   if (!status.valid) {
-    debugLog("[Selah] Re-checking KGC after parallel sync...");
-    const recheck = await checkSession().catch(() => null);
-    if (recheck?.valid) {
-      status = recheck;
-      debugLog("[Selah] KGC recovered via cross-renewal");
+    const coreReady = secondaryValid.luna === true && secondaryValid.kwic === true;
+    if (coreReady && !(status.username || status.display_name || status.student_id || states.kgc)) {
+      authState.set({
+        authenticated: true,
+        username: "",
+        displayName: "ユーザー",
+        studentId: "",
+        faculty: "",
+        department: "",
+        loading: false,
+        error: "",
+      });
+      try { localStorage.setItem(EVER_AUTH_KEY, "1"); } catch {}
+      sessionExpired.set(false);
+      debugLog("[Selah] restoreAllSessions: core services ready without KGC identity");
+      return status;
     }
-    // Keep original status (with disk user info) if re-check also failed
-  }
-
-  if (!status.valid) {
-    debugLog("[Selah] restoreAllSessions: KGC invalid after all recovery attempts. status =", JSON.stringify(status), "states.kgc =", states.kgc);
-    // KGC session is dead, but if we have disk-saved user info, show cached
-    // data with a re-auth prompt instead of dumping user to the login page.
+    debugLog("[Selah] restoreAllSessions: no stored KGC identity; coreReady =", coreReady);
+    // KGC may naturally expire between uses. Keep the shell available whenever
+    // core services or cached identity prove this is a returning user.
     if (status.username || status.display_name || status.student_id || states.kgc) {
       if (status.username || status.display_name) {
         setAuthFromSession(status);
@@ -777,8 +718,11 @@ export async function restoreAllSessions(): Promise<SessionStatus | null> {
         });
         try { localStorage.setItem(EVER_AUTH_KEY, "1"); } catch {}
       }
-      sessionExpired.set(true);
-      debugLog("[Selah] restoreAllSessions: showing cached Dashboard with re-auth badge");
+      sessionExpired.set(!coreReady);
+      debugLog(
+        "[Selah] restoreAllSessions: showing cached Dashboard; coreReady =",
+        coreReady,
+      );
       return status; // non-null: App.svelte will show Dashboard
     }
     debugLog("[Selah] restoreAllSessions: no disk session, returning null -> Login page");
@@ -1368,6 +1312,18 @@ async function syncBackendSessionStatusNow(): Promise<void> {
   applyBackendSessionStatus(status);
 }
 
+let lastForegroundSessionSyncAt = 0;
+const FOREGROUND_SESSION_SYNC_COOLDOWN_MS = 60_000;
+
+function syncForegroundSessionStatus() {
+  const now = Date.now();
+  if (now - lastForegroundSessionSyncAt < FOREGROUND_SESSION_SYNC_COOLDOWN_MS) return;
+  lastForegroundSessionSyncAt = now;
+  syncBackendSessionStatusNow().catch((err) => {
+    console.warn("[Selah] foreground session status sync failed:", err);
+  });
+}
+
 // ---------- Public API ----------
 
 export async function openLoginWindow(): Promise<void> {
@@ -1405,7 +1361,6 @@ export async function logout(): Promise<void> {
   stopBackgroundPolling();
   await invoke("logout");
   stopTrayStatus();
-  // Clear sessionExpired FIRST so kgc.onReset actually wipes authState
   sessionExpired.set(false);
   for (const svc of Object.values(serviceRegistry)) svc.onReset();
   invalidateCache();
@@ -1414,6 +1369,10 @@ export async function logout(): Promise<void> {
     localStorage.removeItem(EVER_AUTH_KEY);
     localStorage.removeItem(EVER_AUTH_SOURCE_KEY);
   } catch {}
+}
+
+async function getKgcSessionSnapshot(): Promise<SessionStatus> {
+  return await invoke<SessionStatus>("get_kgc_session_snapshot");
 }
 
 async function checkSession(): Promise<SessionStatus> {
@@ -1431,7 +1390,7 @@ export async function validateSession(): Promise<SessionStatus> {
       department: "情報科学科",
     };
   }
-  return await invoke<SessionStatus>("validate_session");
+  return await checkSession();
 }
 
 // ── AI-driven schedule (DB-backed, KGC+Luna raw + AI analysis) ──
@@ -2572,9 +2531,6 @@ export function startBackgroundPolling() {
     console.warn("[Selah] backend AI task status hydration failed:", err);
   });
   refreshVisibleBackendCaches();
-  syncBackendSessionStatusNow().catch((err) => {
-    console.warn("[Selah] backend session status sync failed:", err);
-  });
 }
 
 export function stopBackgroundPolling() {
@@ -2584,9 +2540,7 @@ export function stopBackgroundPolling() {
 function handlePollVisibility() {
   if (document.visibilityState === "visible") {
     refreshVisibleBackendCaches();
-    syncBackendSessionStatusNow().catch((err) => {
-      console.warn("[Selah] backend session status visibility sync failed:", err);
-    });
+    syncForegroundSessionStatus();
     refreshBackendAiTaskStatus().catch((err) => {
       console.warn("[Selah] backend AI status visibility sync failed:", err);
     });

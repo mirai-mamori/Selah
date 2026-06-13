@@ -638,7 +638,6 @@ pub fn delete_local_model(app: tauri::AppHandle, model_id: String) -> Result<(),
     Ok(())
 }
 
-
 #[tauri::command]
 pub async fn test_notification(
     app: tauri::AppHandle,
@@ -693,4 +692,3 @@ pub async fn debug_test_notification(title: String, body: String) -> Result<Stri
         Err("debug_test_notification: use test_notification on non-macOS".to_string())
     }
 }
-

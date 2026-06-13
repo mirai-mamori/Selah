@@ -7,6 +7,8 @@ use std::sync::LazyLock;
 const GOOGLE_AUTH_URL: &str = "https://accounts.google.com/o/oauth2/v2/auth";
 const GOOGLE_TOKEN_URL: &str = "https://oauth2.googleapis.com/token";
 const GCAL_API_BASE: &str = "https://www.googleapis.com/calendar/v3";
+// Reads and writes both stay confined to the app's own "Selah 時間割"
+// calendar — the agent never touches the user's other (primary) calendars.
 const SCOPES: &str = "https://www.googleapis.com/auth/calendar.app.created";
 const TOKEN_FILE: &str = "google_calendar_token.json";
 const SYNC_STATE_FILE: &str = "google_calendar_sync.json";
@@ -733,6 +735,79 @@ impl GoogleCalendarClient {
                 .then(b.1.start_time.cmp(&a.1.start_time))
         });
         items
+    }
+
+    /// Read the actual upcoming events on the app's own "Selah 時間割" calendar
+    /// (the true Google state, including timetable-synced entries — not just the
+    /// locally-tracked agent event map).
+    pub async fn list_upcoming_events(
+        &mut self,
+        days_ahead: i64,
+        max_results: u32,
+    ) -> Result<Vec<serde_json::Value>, String> {
+        if !self.is_authenticated() {
+            return Err("Google Calendarにログインしていません。".into());
+        }
+        let cal_id = self.ensure_calendar().await?;
+        let token = self.ensure_token().await?;
+        let now = chrono::Utc::now();
+        let time_min = now.to_rfc3339();
+        let time_max = (now + chrono::Duration::days(days_ahead.clamp(1, 90))).to_rfc3339();
+        let max_results = max_results.clamp(1, 100).to_string();
+        let resp = self
+            .http
+            .get(format!(
+                "{}/calendars/{}/events",
+                GCAL_API_BASE,
+                urlencoding::encode(&cal_id)
+            ))
+            .bearer_auth(&token)
+            .query(&[
+                ("timeMin", time_min.as_str()),
+                ("timeMax", time_max.as_str()),
+                ("singleEvents", "true"),
+                ("orderBy", "startTime"),
+                ("maxResults", max_results.as_str()),
+            ])
+            .send()
+            .await
+            .map_err(|e| format!("予定取得失敗: {}", e))?;
+        if !resp.status().is_success() {
+            let err: serde_json::Value = resp.json().await.unwrap_or_default();
+            return Err(format!("予定取得失敗: {}", err));
+        }
+        let body: serde_json::Value = resp
+            .json()
+            .await
+            .map_err(|e| format!("予定レスポンス解析失敗: {}", e))?;
+        let events = body["items"]
+            .as_array()
+            .map(|items| {
+                items
+                    .iter()
+                    .map(|it| {
+                        let start = it.get("start");
+                        let end = it.get("end");
+                        // Timed events carry "dateTime"; all-day events carry "date".
+                        let pick = |slot: Option<&serde_json::Value>| {
+                            slot.and_then(|s| s.get("dateTime").or_else(|| s.get("date")))
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("")
+                                .to_string()
+                        };
+                        let all_day = start.and_then(|s| s.get("date")).is_some();
+                        serde_json::json!({
+                            "title": it.get("summary").and_then(|v| v.as_str()).unwrap_or("(無題)"),
+                            "start": pick(start),
+                            "end": pick(end),
+                            "all_day": all_day,
+                            "location": it.get("location").and_then(|v| v.as_str()),
+                        })
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        Ok(events)
     }
 
     /// Delete an agent-created event by its Google event ID.

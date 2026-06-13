@@ -4,6 +4,8 @@
   import { listen, type UnlistenFn } from "@tauri-apps/api/event";
   import { marked } from "marked";
   import DOMPurify from "dompurify";
+  import AgentThinkingStatus from "../AgentThinkingStatus.svelte";
+  import AgentIslandIconButton from "../AgentIslandIconButton.svelte";
   import Icon from "../Icon.svelte";
   import FirstVisitTip from "../onboarding/FirstVisitTip.svelte";
   import selahLogoUrl from "../../assets/logo.png";
@@ -19,6 +21,7 @@
     isDemoActive,
     isAiReady,
     type AgentConversationSummary,
+    type AgentImagePart,
     type AgentMessage,
     type AgentStreamEvent,
   } from "../api";
@@ -35,6 +38,8 @@
   let activeConvId = $state<string | null>(null);
   let messages = $state<UIMessage[]>([]);
   let inputText = $state("");
+  let attachments = $state<AgentImagePart[]>([]);
+  let fileInput = $state<HTMLInputElement | null>(null);
 
   let sending = $state(false);
   let sttListening = $state(false);
@@ -46,12 +51,12 @@
   let chipCounter = 0;
   let unlisten: UnlistenFn | null = null;
   let unlistenActiveConv: UnlistenFn | null = null;
+  let unlistenConversationsChanged: UnlistenFn | null = null;
   let unlistenSttPartial: UnlistenFn | null = null;
   let unlistenSttFinal: UnlistenFn | null = null;
   let unlistenSttState: UnlistenFn | null = null;
   let unlistenSttError: UnlistenFn | null = null;
   let msgListEl: HTMLElement | null = null;
-  let thinkTraceEl = $state<HTMLElement | null>(null);
   let composerTextarea = $state<HTMLTextAreaElement | null>(null);
   let composerComposing = false;
   let suppressEnterUntil = 0;
@@ -59,8 +64,6 @@
   let aiCfg = $state<AiConfig | null>(null);
   let historyOpen = $state(false);
   let headerMenuEl: HTMLElement | null = null;
-  let currentPhase = $state<"idle" | "planning" | "answering">("idle");
-  let thinkBuffer = $state("");
   const activeConv = $derived(conversations.find((c) => c.id === activeConvId) ?? null);
   const assistantIsStreaming = $derived.by(() => {
     const last = messages[messages.length - 1];
@@ -71,7 +74,7 @@
     sttListening ||
     !!sttCommittedText.trim() ||
     !!sttPartialText.trim() ||
-    ($agentReady && !inputText.trim())
+    ($agentReady && !inputText.trim() && attachments.length === 0)
   );
   const actionMode = $derived<ActionMode>(sending ? "stop" : showVoiceAction ? "mic" : "send");
 
@@ -217,8 +220,6 @@
     // backend / scheduled turn) stays on the same continuous chat.
     void invoke("agent_set_active_conversation", { convId: id }).catch(() => {});
     toolChips = [];
-    thinkBuffer = "";
-    currentPhase = "idle";
     try {
       const rows = await agentLoadMessages(id);
       messages = rows;
@@ -339,7 +340,6 @@
     armTurnWatchdog(turnSeq);
     switch (ev.type) {
       case "phase":
-        currentPhase = ev.stage;
         scheduleScroll();
         break;
       case "plan":
@@ -374,11 +374,6 @@
         break;
       }
       case "think":
-        thinkBuffer += ev.text;
-        scheduleScroll();
-        tick().then(() => {
-          if (thinkTraceEl) thinkTraceEl.scrollTop = thinkTraceEl.scrollHeight;
-        });
         break;
       case "token": {
         streamTokenBuffer += ev.text;
@@ -411,9 +406,7 @@
 
   function finalizeTurn(refresh = true) {
     sending = false;
-    currentPhase = "idle";
     toolChips = [];
-    thinkBuffer = "";
     clearTurnWatchdog();
     clearStreamBuffer();
     messages = messages.map((m) => (m._streaming ? { ...m, _streaming: false } : m));
@@ -439,13 +432,88 @@
     await reloadConversationMessages(convId);
   }
 
+  const MAX_ATTACHMENTS = 4;
+  const MAX_IMAGE_BYTES = 10 * 1024 * 1024;
+
+  function imageSrc(part: AgentImagePart): string {
+    return `data:${part.mime};base64,${part.data_base64}`;
+  }
+
+  function fileToImagePart(file: File): Promise<AgentImagePart | null> {
+    return new Promise((resolve) => {
+      if (!file.type.startsWith("image/")) return resolve(null);
+      if (file.size > MAX_IMAGE_BYTES) {
+        alert("画像が大きすぎます（10MBまで）");
+        return resolve(null);
+      }
+      const reader = new FileReader();
+      reader.onload = () => {
+        const result = typeof reader.result === "string" ? reader.result : "";
+        const comma = result.indexOf(",");
+        if (comma < 0) return resolve(null);
+        resolve({ mime: file.type || "image/png", data_base64: result.slice(comma + 1) });
+      };
+      reader.onerror = () => resolve(null);
+      reader.readAsDataURL(file);
+    });
+  }
+
+  async function addFiles(files: Iterable<File>): Promise<void> {
+    for (const file of files) {
+      if (attachments.length >= MAX_ATTACHMENTS) break;
+      const part = await fileToImagePart(file);
+      if (part) attachments = [...attachments, part];
+    }
+  }
+
+  function openFilePicker(): void {
+    fileInput?.click();
+  }
+
+  async function onPickFiles(event: Event): Promise<void> {
+    const input = event.currentTarget as HTMLInputElement;
+    if (input.files) await addFiles(Array.from(input.files));
+    input.value = "";
+  }
+
+  function removeAttachment(index: number): void {
+    attachments = attachments.filter((_, i) => i !== index);
+  }
+
+  async function handlePaste(event: ClipboardEvent): Promise<void> {
+    const items = event.clipboardData?.items;
+    if (!items) return;
+    const images: File[] = [];
+    for (const item of items) {
+      if (item.kind === "file" && item.type.startsWith("image/")) {
+        const file = item.getAsFile();
+        if (file) images.push(file);
+      }
+    }
+    if (images.length) {
+      event.preventDefault();
+      await addFiles(images);
+    }
+  }
+
+  async function handleDrop(event: DragEvent): Promise<void> {
+    const files = event.dataTransfer?.files;
+    if (!files?.length) return;
+    const images = Array.from(files).filter((f) => f.type.startsWith("image/"));
+    if (images.length) {
+      event.preventDefault();
+      await addFiles(images);
+    }
+  }
+
   async function send() {
     if (isDemoActive()) {
       alert("デモモードでは Agent チャットは無効です。");
       return;
     }
     let text = inputText.trim();
-    if (!text) return;
+    const images = attachments;
+    if (!text && images.length === 0) return;
     if (sending) return;
     if (!activeConvId) {
       await newConversation();
@@ -475,10 +543,12 @@
         conv_id: convId,
         role: "user",
         content: text,
+        images: images.length ? images : null,
         created_at: now,
       },
     ];
     inputText = "";
+    attachments = [];
     sttBaseText = "";
     sttCommittedText = "";
     sttPartialText = "";
@@ -486,14 +556,12 @@
     sending = true;
     const seq = ++turnSeq;
     toolChips = [];
-    thinkBuffer = "";
-    currentPhase = "planning";
     autoFollow = true;
     armTurnWatchdog(seq);
     scheduleScroll();
 
     try {
-      await agentSend(convId, text);
+      await agentSend(convId, text, images);
       await recoverCompletedTurnWithoutDone(convId, seq);
     } catch (e) {
       if (seq !== turnSeq) return;
@@ -727,6 +795,9 @@
       if (!conversations.some((c) => c.id === id)) await refreshConversations();
       await selectConversation(id);
     });
+    unlistenConversationsChanged = await listen("agent-conversations-changed", () => {
+      void refreshConversations();
+    });
     const sharedConv = (await invoke<string | null>("agent_active_conversation").catch(() => null)) || "";
     if (sharedConv && conversations.some((c) => c.id === sharedConv)) {
       if (activeConvId !== sharedConv) await selectConversation(sharedConv);
@@ -740,6 +811,7 @@
     clearStreamBuffer();
     if (unlisten) unlisten();
     unlistenActiveConv?.();
+    unlistenConversationsChanged?.();
     unlistenSttPartial?.();
     unlistenSttFinal?.();
     unlistenSttState?.();
@@ -817,9 +889,22 @@
       list_google_calendar_events: "予定一覧",
       delete_google_calendar_event: "予定削除",
       update_google_calendar_event: "予定更新",
+      browser_mouse_click: "座標クリック",
+      browser_mouse_drag: "ドラッグ",
+      computer_screenshot: "画面確認",
+      computer_mouse_click: "画面クリック",
+      computer_mouse_drag: "画面ドラッグ",
+      computer_scroll: "画面スクロール",
     };
     return map[n] ?? n;
   }
+
+  const currentPlanText = $derived.by(() => {
+    const active = toolChips.find((chip) => chip.state === "running")
+      ?? toolChips.find((chip) => chip.state === "pending")
+      ?? toolChips.at(-1);
+    return active?.detail?.trim() || (active ? toolLabel(active.name) : "");
+  });
 
   let copiedId = $state<number | null>(null);
   let copiedIdTimer: ReturnType<typeof setTimeout> | null = null;
@@ -907,19 +992,9 @@
 
       <div class="island-actions">
         {#if activeConv && !editingTitle}
-          <button class="island-icon-btn" onclick={startRename} title="タイトルを変更">
-            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
-              <path d="M12 20h9"/>
-              <path d="M16.5 3.5a2.121 2.121 0 0 1 3 3L7 19l-4 1 1-4L16.5 3.5z"/>
-            </svg>
-          </button>
+          <AgentIslandIconButton icon="pencil" size={14} title="タイトルを変更" onclick={startRename} />
         {/if}
-        <button class="island-icon-btn" onclick={newConversation} title="新しい会話">
-          <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round">
-            <line x1="12" y1="5" x2="12" y2="19"/>
-            <line x1="5" y1="12" x2="19" y2="12"/>
-          </svg>
-        </button>
+        <AgentIslandIconButton icon="plus" size={15} title="新しい会話" onclick={newConversation} />
       </div>
     </div>
 
@@ -992,6 +1067,13 @@
           {#if m.role === "user"}
             <div class="row user">
               <div class="bubble user-bubble">
+                {#if m.images?.length}
+                  <div class="bubble-images">
+                    {#each m.images as img}
+                      <img class="bubble-image" src={imageSrc(img)} alt="添付画像" />
+                    {/each}
+                  </div>
+                {/if}
                 {#if m.content}
                   <div class="text">{displayContent(m)}</div>
                 {/if}
@@ -1042,37 +1124,7 @@
         <div class="row assistant status-row">
           <img src={selahLogoUrl} alt="" class="avatar pulse" />
           <div class="status-area">
-            {#if toolChips.length}
-              <div class="tool-steps">
-                {#each toolChips as chip (chip.id)}
-                  <div
-                    class="tool-step"
-                    class:ok={chip.state === "ok"}
-                    class:err={chip.state === "err"}
-                    title={chip.preview ? `${toolLabel(chip.name)} ${chip.preview}` : toolLabel(chip.name)}
-                  >
-                    {#if chip.state === "pending"}
-                      <span class="step-pending"></span>
-                    {:else if chip.state === "running"}
-                      <span class="spin"></span>
-                    {:else if chip.state === "ok"}
-                      <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg>
-                    {:else}
-                      <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
-                    {/if}
-                    <span class="tool-step-label">{toolLabel(chip.name)}{chip.detail ? `: ${chip.detail}` : ""}</span>
-                  </div>
-                {/each}
-              </div>
-            {:else}
-              <div class="phase-wait">
-                <span>{currentPhase === "planning" ? "計画を整理中" : "結果をまとめ中"}</span>
-                <div class="wait-dots" aria-hidden="true"><span></span><span></span><span></span></div>
-              </div>
-            {/if}
-            {#if thinkBuffer}
-              <p class="think-trace" bind:this={thinkTraceEl}>{thinkBuffer}</p>
-            {/if}
+            <AgentThinkingStatus text={currentPlanText} />
           </div>
         </div>
       {/if}
@@ -1081,7 +1133,15 @@
     </div>
 
     <!-- Floating bottom composer + action capsule -->
-    <div class="composer-bottom">
+    <div class="composer-bottom" role="group" ondragover={(e) => e.preventDefault()} ondrop={handleDrop}>
+      <input
+        bind:this={fileInput}
+        type="file"
+        accept="image/*"
+        multiple
+        class="chat-file-input"
+        onchange={onPickFiles}
+      />
       {#if quotedMessage}
         <div class="quote-bar">
           <span class="quote-label">返信：</span>
@@ -1091,9 +1151,31 @@
           </button>
         </div>
       {/if}
+      {#if attachments.length}
+        <div class="chat-attachments">
+          {#each attachments as att, i}
+            <div class="chat-attachment">
+              <img src={imageSrc(att)} alt="添付画像" />
+              <button type="button" class="chat-attachment-remove" title="削除" aria-label="画像を削除" onclick={() => removeAttachment(i)}>
+                <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+              </button>
+            </div>
+          {/each}
+        </div>
+      {/if}
       <div class="send-row">
         <div class="composer-island">
           <div class="composer-row">
+            <button
+              type="button"
+              class="chat-attach-button"
+              title="画像を添付"
+              aria-label="画像を添付"
+              onclick={openFilePicker}
+              disabled={sending}
+            >
+              <Icon name="plus" size={18} />
+            </button>
             <textarea
               bind:value={inputText}
               bind:this={composerTextarea}
@@ -1101,6 +1183,7 @@
               oncompositionstart={onCompositionStart}
               oncompositionend={onCompositionEnd}
               onkeydown={onKeydown}
+              onpaste={handlePaste}
               placeholder={sending ? "返事を書いている途中……" : "なにか書いてみて。"}
               rows="1"
               disabled={sending}
@@ -1147,6 +1230,76 @@
   /* ═══════════════════════════════════════════════
      Agent Chat — Floating Island Design
      ═══════════════════════════════════════════════ */
+  .chat-file-input { display: none; }
+
+  .chat-attachments {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+    padding: 0 6px 8px;
+  }
+  .chat-attachment {
+    position: relative;
+    width: 64px;
+    height: 64px;
+    border-radius: 12px;
+    overflow: hidden;
+    border: 1px solid var(--border-color, rgba(0, 0, 0, 0.12));
+    background: var(--bg-card, rgba(0, 0, 0, 0.04));
+  }
+  .chat-attachment img { width: 100%; height: 100%; object-fit: cover; display: block; }
+  .chat-attachment-remove {
+    position: absolute;
+    top: 3px;
+    right: 3px;
+    width: 18px;
+    height: 18px;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    border: none;
+    border-radius: 50%;
+    color: #fff;
+    background: rgba(0, 0, 0, 0.6);
+    cursor: pointer;
+    padding: 0;
+  }
+  .chat-attachment-remove:hover { background: rgba(0, 0, 0, 0.82); }
+  .chat-attach-button {
+    flex: 0 0 auto;
+    width: 28px;
+    height: 28px;
+    align-self: flex-end;
+    margin-right: 6px;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    border: none;
+    border-radius: 50%;
+    background: var(--bg-hover, rgba(0, 0, 0, 0.05));
+    color: var(--text-secondary, #8a8a8a);
+    cursor: pointer;
+    transition: background 0.15s, color 0.15s;
+  }
+  .chat-attach-button:hover:not(:disabled) {
+    background: var(--bg-hover, rgba(0, 0, 0, 0.1));
+    color: var(--text-primary, #333);
+  }
+  .chat-attach-button:disabled { opacity: 0.4; cursor: default; }
+  .bubble-images {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+    margin-bottom: 6px;
+  }
+  .bubble-image {
+    max-width: 200px;
+    max-height: 200px;
+    border-radius: 12px;
+    object-fit: cover;
+    display: block;
+  }
+
 
   .agent-root {
     display: flex;
@@ -1240,25 +1393,6 @@
     align-items: center;
     gap: 1px;
     margin-left: 2px;
-  }
-
-  .island-icon-btn {
-    display: inline-flex;
-    align-items: center;
-    justify-content: center;
-    width: 28px;
-    height: 28px;
-    border: none;
-    border-radius: 10px;
-    background: transparent;
-    color: var(--text-tertiary);
-    cursor: pointer;
-    transition: background 0.15s, color 0.15s;
-    padding: 0;
-  }
-  .island-icon-btn:hover {
-    background: color-mix(in srgb, var(--text-primary) 8%, transparent);
-    color: var(--text-primary);
   }
 
   /* ── History Dropdown ── */
@@ -1419,7 +1553,14 @@
   /* ── Markdown ── */
   .md :global(p) { margin: 0 0 8px; }
   .md :global(p:last-child) { margin-bottom: 0; }
-  .md :global(ul), .md :global(ol) { margin: 0 0 8px; padding-left: 20px; }
+  .md :global(ul), .md :global(ol) {
+    max-width: 100%;
+    margin: 0 0 8px;
+    padding-inline-start: 1.25em;
+    list-style-position: inside;
+  }
+  .md :global(li) { max-width: 100%; overflow-wrap: anywhere; }
+  .md :global(li > p) { display: inline; }
   .md :global(code) {
     background: color-mix(in srgb, var(--text-primary) 7%, transparent);
     padding: 2px 5px;
@@ -1427,6 +1568,8 @@
     font-size: 0.84em;
   }
   .md :global(pre) {
+    width: 100%;
+    max-width: 100%;
     background: color-mix(in srgb, var(--text-primary) 5%, transparent);
     padding: 10px 12px;
     border-radius: 10px;
@@ -1435,12 +1578,15 @@
   }
   .md :global(pre code) { background: transparent; padding: 0; }
   .md :global(blockquote) {
+    max-width: 100%;
     margin: 0 0 8px;
     padding-left: 10px;
     color: var(--text-secondary);
   }
   .md :global(a) { color: var(--accent); text-decoration: none; }
   .md :global(a:hover) { text-decoration: underline; }
+  .md :global(table) { width: 100%; max-width: 100%; display: block; overflow-x: auto; }
+  .md :global(img), .md :global(video), .md :global(svg) { max-width: 100%; height: auto; }
   .streaming-md {
     white-space: pre-wrap;
   }
@@ -1493,24 +1639,6 @@
   .user-bubble .msg-act-btn:hover { background: rgba(255,255,255,0.2); color: #fff; }
   .assistant-bubble .msg-act-btn:hover { background: rgba(0,0,0,0.07); color: rgba(0,0,0,0.75); }
 
-  /* ── Spinner ── */
-  .spin {
-    width: 8px;
-    height: 8px;
-    border: 1.25px solid var(--glass-border);
-    border-top-color: var(--accent);
-    border-radius: 50%;
-    animation: spin 0.8s linear infinite;
-  }
-  .step-pending {
-    width: 8px;
-    height: 8px;
-    box-sizing: border-box;
-    border: 1px solid currentColor;
-    border-radius: 50%;
-    opacity: 0.45;
-  }
-
   /* ── Status Area ── */
   .status-row .status-area {
     display: flex;
@@ -1526,86 +1654,6 @@
     -webkit-backdrop-filter: blur(20px) var(--glass-saturate);
     border: 0.5px solid var(--glass-border);
     box-shadow: var(--shadow-sm);
-  }
-
-  .tool-steps {
-    display: flex;
-    flex-direction: row;
-    flex-wrap: wrap;
-    align-items: center;
-    gap: 5px;
-    max-width: 100%;
-  }
-  .tool-step {
-    display: inline-flex;
-    align-items: center;
-    justify-content: center;
-    gap: 4px;
-    min-width: 0;
-    max-width: min(100%, 190px);
-    min-height: 22px;
-    padding: 3px 8px;
-    border-radius: 999px;
-    border: 0.5px solid color-mix(in srgb, var(--accent) 24%, var(--glass-border));
-    background: color-mix(in srgb, var(--accent) 8%, var(--glass-bg, rgba(255, 255, 255, 0.58)));
-    box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.22);
-    font-size: 11px;
-    color: var(--text-secondary);
-    line-height: 1.25;
-    white-space: nowrap;
-    overflow: hidden;
-  }
-  .tool-step-label {
-    min-width: 0;
-    overflow: hidden;
-    text-overflow: ellipsis;
-  }
-  .tool-step.ok {
-    color: var(--green);
-    border-color: color-mix(in srgb, var(--green) 38%, var(--glass-border));
-    background: color-mix(in srgb, var(--green) 9%, var(--glass-bg, rgba(255, 255, 255, 0.58)));
-  }
-  .tool-step.err {
-    color: var(--red);
-    border-color: color-mix(in srgb, var(--red) 40%, var(--glass-border));
-    background: color-mix(in srgb, var(--red) 8%, var(--glass-bg, rgba(255, 255, 255, 0.58)));
-  }
-
-  .wait-dots {
-    display: inline-flex;
-    align-items: center;
-    gap: 5px;
-    padding: 4px 0;
-  }
-  .phase-wait {
-    display: inline-flex;
-    flex-direction: column;
-    align-items: flex-start;
-    gap: 6px;
-    color: var(--text-secondary);
-    font-size: 11px;
-    text-align: left;
-  }
-  .wait-dots span {
-    width: 5px;
-    height: 5px;
-    border-radius: 50%;
-    background: var(--accent);
-    animation: dot-bounce 1.4s ease-in-out infinite;
-  }
-  .wait-dots span:nth-child(1) { animation-delay: 0s; }
-  .wait-dots span:nth-child(2) { animation-delay: 0.2s; }
-  .wait-dots span:nth-child(3) { animation-delay: 0.4s; }
-
-  .think-trace {
-    font-size: 11.5px;
-    line-height: 1.5;
-    color: var(--text-tertiary);
-    white-space: pre-wrap;
-    word-break: break-word;
-    margin: 0;
-    max-height: 100px;
-    overflow-y: auto;
   }
 
   .avatar.pulse {

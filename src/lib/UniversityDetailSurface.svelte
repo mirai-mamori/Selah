@@ -48,6 +48,7 @@
     LunaSurveyDetail,
     MetaPair,
   } from "./luna-detail/types";
+  import { splitLunaCourseHeading } from "./luna-detail/courseHeading";
 
   const target = readDetailParam("tabLabel");
   const owner = readDetailParam("ownerLabel") || "document-tabs";
@@ -97,7 +98,7 @@
   let loadRunning = false;
 
   const pageTitle = $derived(
-    course?.course_name
+    (course?.course_name ? splitLunaCourseHeading(course.course_name).title : "")
       || detail?.title
       || survey?.title
       || discussion?.title
@@ -594,7 +595,7 @@
       if (mode === "course" || mode === "attendance") {
         if (!idnumberParam) throw new Error("idnumber がありません");
         course = await invoke<LunaCourseContents>("luna_fetch_course_detail", { idnumber: idnumberParam });
-        document.title = course.course_name || titleParam;
+        document.title = splitLunaCourseHeading(course.course_name).title || titleParam;
         await checkDownloaded((course.materials || []).flatMap((item) => (item.files || []).map((file) => file.display_name || file.file_name)));
       } else if (mode === "material") {
         detail = {

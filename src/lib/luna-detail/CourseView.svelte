@@ -3,6 +3,7 @@
   import { tick } from "svelte";
   import Icon, { type IconName } from "../Icon.svelte";
   import CourseSupplemental from "./CourseSupplemental.svelte";
+  import { splitLunaCourseHeading } from "./courseHeading";
   import { lunaDraftKey, readDraft, writeDraft } from "./drafts";
   import type {
     DownloadMark,
@@ -54,6 +55,7 @@
   let attendanceError = $state("");
   let attendanceMeta = $state<{ open_start?: string; open_end?: string; late_start?: string; late_end?: string; content?: string } | null>(null);
   let attendancePassInput = $state<HTMLInputElement | null>(null);
+  const courseHeading = $derived(splitLunaCourseHeading(course.course_name));
 
   function shortDate(value: string): string {
     const match = String(value || "").match(/(\d{4})\/(\d{1,2})\/(\d{1,2})/);
@@ -266,18 +268,28 @@
 <svelte:window onkeydown={handleWindowKeydown} />
 
 {#if mode === "attendance"}
-  <h1 class="attendance-title">{course.course_name}</h1>
+  <header class="attendance-heading">
+    <h1>{courseHeading.title}</h1>
+    {#if courseHeading.subtitle}<div class="course-subtitle">{courseHeading.subtitle}</div>{/if}
+  </header>
 {:else}
   {@const heroTools = (course.online_tools || []).filter((tool) => toolKind(tool.name, tool.url) === "default")}
   <section class="hero">
     <div class="hero-main">
-      <h1>{course.course_name}</h1>
-      <div class="hero-meta">
-        {#if course.semester}<span class="semester">{course.semester}</span>{/if}
-        {#if course.teachers}<span class="teacher"><Icon name="book" size={16} />{course.teachers}</span>{/if}
-        {#if course.ta_info}<span class="staff"><strong>TA</strong>{course.ta_info}</span>{/if}
-        {#if course.la_info}<span class="staff"><strong>LA</strong>{course.la_info}</span>{/if}
-      </div>
+      <h1>{courseHeading.title}</h1>
+      {#if courseHeading.subtitle || course.semester || course.teachers}
+        <div class="course-subtitle">
+          {#if courseHeading.subtitle}<span>{courseHeading.subtitle}</span>{/if}
+          {#if course.semester}<span>{course.semester}</span>{/if}
+          {#if course.teachers}<span class="course-teacher"><Icon name="book" size={12} />{course.teachers}</span>{/if}
+        </div>
+      {/if}
+      {#if course.ta_info || course.la_info}
+        <div class="hero-meta">
+          {#if course.ta_info}<span class="staff"><strong>TA</strong>{course.ta_info}</span>{/if}
+          {#if course.la_info}<span class="staff"><strong>LA</strong>{course.la_info}</span>{/if}
+        </div>
+      {/if}
     </div>
     {#if heroTools.length}
       <div class="hero-actions">

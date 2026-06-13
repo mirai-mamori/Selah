@@ -22,9 +22,7 @@ pub(in crate::luna_parser) fn extract_first_quill_rich_html(html: &str) -> Optio
 }
 
 /// Extract all named Quill payloads in occurrence order.
-pub(in crate::luna_parser) fn extract_named_quill_payloads(
-    html: &str,
-) -> Vec<(String, String)> {
+pub(in crate::luna_parser) fn extract_named_quill_payloads(html: &str) -> Vec<(String, String)> {
     let mut payloads = Vec::new();
     let marker = "_QuillUtil.";
     let call = ".setJsonData(\"";

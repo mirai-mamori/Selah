@@ -314,7 +314,7 @@ async fn refresh_schedule_analysis(
     force: bool,
     session: &BackendSessionStatusPayload,
 ) -> Result<(), String> {
-    if !session.kgc_valid {
+    if !session.kgc_session_present {
         return Err("KGC未ログインのため時間割AI分析をスキップします".to_string());
     }
     let snap = db.get_snapshot_state()?.unwrap_or_default();
@@ -340,7 +340,7 @@ async fn refresh_notification_analysis(
     session: &BackendSessionStatusPayload,
 ) -> Result<(), String> {
     let has_fresh_kgc =
-        session.kgc_valid && cache_is_fresh(db, "notifications", FAST_INPUT_MAX_AGE_SECS);
+        session.kgc_session_present && cache_is_fresh(db, "notifications", FAST_INPUT_MAX_AGE_SECS);
     let has_fresh_luna =
         session.luna_authenticated && cache_is_fresh(db, "luna_updates", FAST_INPUT_MAX_AGE_SECS);
     let has_fresh_kwic =
@@ -677,14 +677,16 @@ async fn ai_session_block_reason(app: &AppHandle) -> Result<Option<String>, Stri
 }
 
 async fn current_ai_session(app: &AppHandle) -> Result<BackendSessionStatusPayload, String> {
-    crate::background_refresh::sync_backend_session_status(app, true).await
+    // Scheduling only needs a local availability snapshot. It must not trigger
+    // network validation or hidden SAML recovery on its own.
+    crate::background_refresh::sync_backend_session_status(app, false).await
 }
 
 fn ai_session_block_reason_from_status(status: &BackendSessionStatusPayload) -> Option<String> {
     if status.session_expired {
         return Some("セッション期限切れのためAI定期更新を実行しません".to_string());
     }
-    if !status.kgc_valid {
+    if !status.kgc_session_present {
         return Some("未ログインのためAI定期更新を実行しません".to_string());
     }
     None

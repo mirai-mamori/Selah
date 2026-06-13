@@ -265,6 +265,13 @@ impl AgentProvider {
     pub fn supports_prefill(&self) -> bool {
         matches!(self, Self::Local { .. })
     }
+
+    /// Whether the provider can see images. Remote (OpenAI/Gemini vision) models
+    /// can; the on-device Qwen models are text-only. Gates whether agent
+    /// screenshots are fed back as real images.
+    pub fn supports_vision(&self) -> bool {
+        matches!(self, Self::Remote { .. })
+    }
 }
 
 fn agent_error_from_model(e: String) -> AgentError {
@@ -357,6 +364,35 @@ async fn remote_chat_completion(
     }
 }
 
+/// OpenAI chat message JSON — multimodal `content` array when the message
+/// carries images (e.g. an agent screenshot), plain string otherwise.
+fn openai_message_json(m: &ChatMessage) -> serde_json::Value {
+    if m.images.is_empty() {
+        return serde_json::json!({ "role": m.role, "content": m.content });
+    }
+    let mut parts = vec![serde_json::json!({ "type": "text", "text": m.content })];
+    for img in &m.images {
+        parts.push(serde_json::json!({
+            "type": "image_url",
+            "image_url": { "url": format!("data:{};base64,{}", img.mime, img.data_base64) },
+        }));
+    }
+    serde_json::json!({ "role": m.role, "content": parts })
+}
+
+/// Gemini content parts — appends inline image data parts when present.
+fn gemini_parts_json(m: &ChatMessage) -> Vec<serde_json::Value> {
+    let mut parts = vec![serde_json::json!({
+        "text": agent_text::neutralize_pseudo_tool_calls(&m.content)
+    })];
+    for img in &m.images {
+        parts.push(serde_json::json!({
+            "inlineData": { "mimeType": img.mime, "data": img.data_base64 },
+        }));
+    }
+    parts
+}
+
 async fn remote_openai_non_streaming(
     config: &AiConfig,
     messages: Vec<ChatMessage>,
@@ -366,7 +402,7 @@ async fn remote_openai_non_streaming(
     let url = format!("{}/chat/completions", config.base_url.trim_end_matches('/'));
     let body = serde_json::json!({
         "model": config.model,
-        "messages": messages,
+        "messages": messages.iter().map(openai_message_json).collect::<Vec<_>>(),
         "max_tokens": if max_tokens == 0 { 8192 } else { max_tokens },
         "temperature": temperature,
     });
@@ -429,7 +465,7 @@ async fn remote_gemini_non_streaming(
         .map(|m| {
             serde_json::json!({
                 "role": if m.role == "assistant" { "model" } else { "user" },
-                "parts": [{ "text": agent_text::neutralize_pseudo_tool_calls(&m.content) }]
+                "parts": gemini_parts_json(&m)
             })
         })
         .collect();
@@ -675,7 +711,7 @@ where
     let url = format!("{}/chat/completions", config.base_url.trim_end_matches('/'));
     let body = serde_json::json!({
         "model": config.model,
-        "messages": messages,
+        "messages": messages.iter().map(openai_message_json).collect::<Vec<_>>(),
         "max_tokens": if config.max_tokens == 0 { 32768u32 } else { config.max_tokens },
         "temperature": config.temperature,
         "stream": true,
@@ -783,7 +819,7 @@ where
         .map(|m| {
             serde_json::json!({
                 "role": if m.role == "assistant" { "model" } else { "user" },
-                "parts": [{ "text": agent_text::neutralize_pseudo_tool_calls(&m.content) }]
+                "parts": gemini_parts_json(&m)
             })
         })
         .collect();
@@ -940,6 +976,45 @@ fn extract_pseudo_call_from_finish_message(message: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ai::ImagePart;
+
+    fn msg_with_image() -> ChatMessage {
+        ChatMessage {
+            role: "user".into(),
+            content: "what is on screen?".into(),
+            images: vec![ImagePart {
+                mime: "image/png".into(),
+                data_base64: "QUJD".into(),
+            }],
+        }
+    }
+
+    #[test]
+    fn openai_message_json_is_multimodal_with_image() {
+        let v = openai_message_json(&msg_with_image());
+        let content = v.get("content").and_then(|c| c.as_array()).unwrap();
+        assert_eq!(content[0]["type"], "text");
+        assert_eq!(content[1]["type"], "image_url");
+        assert_eq!(content[1]["image_url"]["url"], "data:image/png;base64,QUJD");
+    }
+
+    #[test]
+    fn openai_message_json_plain_string_without_image() {
+        let m = ChatMessage {
+            role: "user".into(),
+            content: "hi".into(),
+            images: vec![],
+        };
+        assert_eq!(openai_message_json(&m)["content"], "hi");
+    }
+
+    #[test]
+    fn gemini_parts_json_appends_inline_image() {
+        let parts = gemini_parts_json(&msg_with_image());
+        assert!(parts[0].get("text").is_some());
+        assert_eq!(parts[1]["inlineData"]["mimeType"], "image/png");
+        assert_eq!(parts[1]["inlineData"]["data"], "QUJD");
+    }
 
     #[test]
     fn extracts_gemini_malformed_call_finish_message() {

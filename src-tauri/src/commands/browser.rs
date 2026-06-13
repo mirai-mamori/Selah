@@ -99,9 +99,7 @@ pub async fn open_files_tab(
     // already exists open_files_tab just re-focuses it — re-emit focus-course so
     // the surface narrows to (or clears) the requested course either way.
     let _ = app.emit_to(
-        tauri::EventTarget::AnyLabel {
-            label: info.target,
-        },
+        tauri::EventTarget::AnyLabel { label: info.target },
         "focus-course",
         course.unwrap_or_default(),
     );
