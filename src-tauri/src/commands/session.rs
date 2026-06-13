@@ -7,14 +7,21 @@ use crate::luna_client;
 use crate::parser;
 use crate::{KgcState, KwicState, LunaState};
 use serde::Serialize;
+use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::LazyLock;
-use tauri::State;
+use tauri::{Manager, State};
 
 static SESSION_SYNC_GATE: LazyLock<tokio::sync::Mutex<()>> =
     LazyLock::new(|| tokio::sync::Mutex::new(()));
 static SESSION_SYNC_LAST_START: LazyLock<std::sync::Mutex<Option<std::time::Instant>>> =
     LazyLock::new(|| std::sync::Mutex::new(None));
 const SESSION_SYNC_MIN_GAP: std::time::Duration = std::time::Duration::from_secs(2);
+const KGC_AUTO_RECOVERY_COOLDOWN_SECS: i64 = 30 * 60;
+const KGC_AUTO_PREFLIGHT_REUSE_SECS: i64 = 60;
+static KGC_AUTO_RECOVERY_LAST_ATTEMPT: AtomicI64 = AtomicI64::new(0);
+static KGC_AUTO_PREFLIGHT_LAST_SUCCESS: AtomicI64 = AtomicI64::new(0);
+static KGC_AUTO_PREFLIGHT_GATE: LazyLock<tokio::sync::Mutex<()>> =
+    LazyLock::new(|| tokio::sync::Mutex::new(()));
 
 pub(super) async fn lock_session_sync() -> tokio::sync::MutexGuard<'static, ()> {
     SESSION_SYNC_GATE.lock().await
@@ -34,6 +41,98 @@ async fn pace_session_sync() {
         .lock()
         .unwrap_or_else(|e| e.into_inner());
     *last = Some(std::time::Instant::now());
+}
+
+/// Allow an automatic KGC data task to make one hidden-login attempt when the
+/// short-lived KGC session is absent. The shared cooldown prevents the data and
+/// notification loops from repeatedly opening competing SAML flows.
+pub(crate) async fn auto_recover_kgc_session_once(app: &tauri::AppHandle) -> bool {
+    if app
+        .state::<KgcState>()
+        .client
+        .lock()
+        .await
+        .is_authenticated()
+    {
+        return true;
+    }
+
+    let now = crate::db::epoch_secs();
+    let previous = KGC_AUTO_RECOVERY_LAST_ATTEMPT.swap(now, Ordering::SeqCst);
+    if previous > 0 && now.saturating_sub(previous) < KGC_AUTO_RECOVERY_COOLDOWN_SECS {
+        log::info!("KGC automatic recovery skipped during cooldown");
+        return false;
+    }
+
+    log::info!("KGC automatic data request: attempting one hidden login");
+    match sync_session(
+        app.clone(),
+        app.state::<KgcState>(),
+        app.state::<LunaState>(),
+        app.state::<KwicState>(),
+        "kgc".to_string(),
+    )
+    .await
+    {
+        Ok(true) => true,
+        Ok(false) => {
+            log::warn!("KGC automatic recovery did not establish a session");
+            false
+        }
+        Err(error) => {
+            log::warn!("KGC automatic recovery failed: {}", error);
+            false
+        }
+    }
+}
+
+/// Confirm KGC immediately before an automatic KGC-backed data run. Validation
+/// is request-driven rather than periodic; a server-confirmed expiry may cause
+/// one hidden-login attempt, while transient validation errors retain the
+/// existing session and let the real data request decide.
+pub(crate) async fn ensure_kgc_session_for_automatic_request(app: &tauri::AppHandle) -> bool {
+    let _preflight_gate = KGC_AUTO_PREFLIGHT_GATE.lock().await;
+    let now = crate::db::epoch_secs();
+    if app
+        .state::<KgcState>()
+        .client
+        .lock()
+        .await
+        .is_authenticated()
+    {
+        let last_success = KGC_AUTO_PREFLIGHT_LAST_SUCCESS.load(Ordering::Relaxed);
+        if last_success > 0 && now.saturating_sub(last_success) < KGC_AUTO_PREFLIGHT_REUSE_SECS {
+            return true;
+        }
+        match crate::commands::check_session(app.state::<KgcState>()).await {
+            Ok(status) if status.valid => {
+                KGC_AUTO_PREFLIGHT_LAST_SUCCESS.store(now, Ordering::Relaxed);
+                return true;
+            }
+            Ok(_) => {}
+            Err(error) => {
+                log::warn!("KGC automatic preflight validation failed: {}", error);
+            }
+        }
+
+        // check_session only clears the stored session after a server-confirmed
+        // expiry. Retain it after transient validation failures.
+        if app
+            .state::<KgcState>()
+            .client
+            .lock()
+            .await
+            .is_authenticated()
+        {
+            return true;
+        }
+    }
+
+    let recovered = auto_recover_kgc_session_once(app).await;
+    if recovered {
+        KGC_AUTO_PREFLIGHT_LAST_SUCCESS.store(crate::db::epoch_secs(), Ordering::Relaxed);
+    }
+    recovered
 }
 
 #[derive(Debug, Serialize)]

@@ -250,11 +250,6 @@
       font-size: 24px;
     }
 
-    .hero-meta .teacher {
-      padding-left: 0;
-      border-left: 0;
-    }
-
     .meta-table div {
       grid-template-columns: 1fr;
     }

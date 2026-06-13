@@ -62,6 +62,25 @@
     return match ? `${Number(match[2])}/${Number(match[3])}` : value;
   }
 
+  function courseTimeTags(value: string): string[] {
+    const parts = String(value || "")
+      .replace(/[()（）]/g, "")
+      .split(/[\/／]/)
+      .map((part) => part.trim())
+      .filter(Boolean);
+    const tags: string[] = [];
+    for (const part of parts) {
+      if (/^\d{4}$/.test(part)) continue;
+      const dayPeriod = part.match(/^([月火水木金土日])(?:曜)?\s*(\d+)$/);
+      if (dayPeriod) {
+        tags.push(`${dayPeriod[1]}曜`, `${dayPeriod[2]}限`);
+      } else {
+        tags.push(part);
+      }
+    }
+    return [...new Set(tags)];
+  }
+
   function toolKind(name: string, url = ""): "zoom" | "panopto" | "syllabus" | "default" {
     const text = `${name || ""} ${url || ""}`.toLowerCase();
     if (text.includes("zoom")) return "zoom";
@@ -276,18 +295,24 @@
   {@const heroTools = (course.online_tools || []).filter((tool) => toolKind(tool.name, tool.url) === "default")}
   <section class="hero">
     <div class="hero-main">
-      <h1>{courseHeading.title}</h1>
-      {#if courseHeading.subtitle || course.semester || course.teachers}
+      <div class="course-titlebar">
+        <h1>{courseHeading.title}</h1>
+        {#if course.semester || course.teachers}
+          <div class="course-title-meta">
+            {#each courseTimeTags(course.semester) as tag (tag)}
+              <span class="course-time-tag">{tag}</span>
+            {/each}
+            {#if course.teachers}
+              <span class="course-teacher"><Icon name="person" size={13} />{course.teachers}</span>
+            {/if}
+          </div>
+        {/if}
+      </div>
+      {#if courseHeading.subtitle || course.ta_info || course.la_info}
         <div class="course-subtitle">
-          {#if courseHeading.subtitle}<span>{courseHeading.subtitle}</span>{/if}
-          {#if course.semester}<span>{course.semester}</span>{/if}
-          {#if course.teachers}<span class="course-teacher"><Icon name="book" size={12} />{course.teachers}</span>{/if}
-        </div>
-      {/if}
-      {#if course.ta_info || course.la_info}
-        <div class="hero-meta">
-          {#if course.ta_info}<span class="staff"><strong>TA</strong>{course.ta_info}</span>{/if}
-          {#if course.la_info}<span class="staff"><strong>LA</strong>{course.la_info}</span>{/if}
+          {#if courseHeading.subtitle}<span class="course-affiliation">{courseHeading.subtitle}</span>{/if}
+          {#if course.ta_info}<span class="course-staff"><strong>TA</strong><span>{course.ta_info}</span></span>{/if}
+          {#if course.la_info}<span class="course-staff"><strong>LA</strong><span>{course.la_info}</span></span>{/if}
         </div>
       {/if}
     </div>

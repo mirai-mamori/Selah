@@ -305,10 +305,16 @@ async fn refresh_backend_data_inner(
 
     let db = app.state::<Database>();
     let session_status = sync_backend_session_status(app, true).await?;
-    let kgc_authenticated = session_status.kgc_session_present;
+    let mut kgc_authenticated = session_status.kgc_session_present;
     let luna_authenticated = session_status.luna_authenticated;
     let mut updated_keys = Vec::new();
     let mut schedule_changed = false;
+
+    // KGC is not kept alive on a timer. When an automatic KGC-backed data task
+    // is actually due, allow that run to make one hidden-login attempt.
+    if kgc_data_request_due(request, &db) {
+        kgc_authenticated = crate::commands::ensure_kgc_session_for_automatic_request(app).await;
+    }
 
     if request.wants("luna_todo")
         && luna_authenticated
@@ -749,6 +755,25 @@ fn cache_is_stale(db: &Database, key: &str, max_age_secs: i64) -> bool {
         Ok(None) => true,
         Err(_) => true,
     }
+}
+
+fn kgc_data_request_due(request: &BackendRefreshRequest, db: &Database) -> bool {
+    (request.wants("schedule_data") && (request.force || schedule_refresh_is_stale(db)))
+        || (request.wants("grades")
+            && (request.force || cache_is_stale(db, "grades", ACADEMIC_RECORD_CACHE_MAX_AGE_SECS)))
+        || (request.wants("registration")
+            && (request.force
+                || cache_is_stale(db, "registration", ACADEMIC_RECORD_CACHE_MAX_AGE_SECS)))
+        || (request.wants("cancellations")
+            && (request.force || cache_is_stale(db, "cancellations", STABLE_CACHE_MAX_AGE_SECS)))
+        || (request.wants("makeup")
+            && (request.force || cache_is_stale(db, "makeup", STABLE_CACHE_MAX_AGE_SECS)))
+        || (request.wants("rooms")
+            && (request.force || cache_is_stale(db, "rooms", STABLE_CACHE_MAX_AGE_SECS)))
+        || (request.wants("student_profile")
+            && (request.force || cache_is_stale(db, "student_profile", STABLE_CACHE_MAX_AGE_SECS)))
+        || (request.wants("exams")
+            && (request.force || cache_is_stale(db, "exam_timetable", STABLE_CACHE_MAX_AGE_SECS)))
 }
 
 fn schedule_refresh_is_stale(db: &Database) -> bool {

@@ -10,6 +10,7 @@
     | "moon"
     | "xmark"
     | "book"
+    | "person"
     | "chevron.left"
     | "chevron.right"
     | "checkmark.circle"
@@ -109,6 +110,9 @@
     <path d="M4 4.5A2.5 2.5 0 0 1 6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5v-15z" />
     <circle cx="14" cy="10" r="3" />
     <line x1="16.2" y1="12.2" x2="18" y2="14" />
+  {:else if name === "person"}
+    <circle cx="12" cy="8" r="4" />
+    <path d="M4.5 21a7.5 7.5 0 0 1 15 0" />
   {:else if name === "chevron.left"}
     <polyline points="15 18 9 12 15 6" />
   {:else if name === "chevron.right"}

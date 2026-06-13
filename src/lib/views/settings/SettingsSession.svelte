@@ -6,6 +6,7 @@
     lunaCheckSession,
     kwicCheckSession,
     resetUniversityLogin,
+    serviceRegistry,
     syncSession,
     validateSession,
   } from "../../api";
@@ -19,14 +20,14 @@
 
   let checkBusy = $state(false);
   let repairBusy = $state(false);
+  let kgcRefreshBusy = $state(false);
   let resetBusy = $state(false);
   let resetArmed = $state(false);
   let statusMsg = $state("");
   let statusColor = $state("");
   let resetTimer: ReturnType<typeof setTimeout> | null = null;
 
-  let disconnected = $derived([
-    ...(kg.state === "ng" ? ["kgc" as const] : []),
+  let disconnectedCore = $derived([
     ...(luna.state === "ng" ? ["luna" as const] : []),
     ...(kwic.state === "ng" ? ["kwic" as const] : []),
   ]);
@@ -35,7 +36,7 @@
     (luna.state === "ok" || luna.state === "saved")
       && (kwic.state === "ok" || kwic.state === "saved"),
   );
-  let checking = $derived(checkBusy || repairBusy || resetBusy);
+  let checking = $derived(checkBusy || repairBusy || kgcRefreshBusy || resetBusy);
 
   function clearStatusLater() {
     setTimeout(() => { statusMsg = ""; }, 5000);
@@ -131,21 +132,23 @@
       state: ok ? "ok" : "ng",
       label: ok ? "有効・復旧済み" : "復旧できませんでした",
     };
+    if (ok) serviceRegistry[service].onRecovered();
+    else serviceRegistry[service].onReset();
     if (service === "kgc") kg = next;
     if (service === "luna") luna = next;
     if (service === "kwic") kwic = next;
   }
 
   async function repairDisconnected() {
-    if (disconnected.length === 0) {
+    if (disconnectedCore.length === 0) {
       await checkAll();
       return;
     }
 
     repairBusy = true;
     statusColor = "var(--text-secondary)";
-    statusMsg = "切れた接続を復旧しています...";
-    const targets = [...disconnected];
+    statusMsg = "Luna・KWIC の接続を復旧しています...";
+    const targets = [...disconnectedCore];
     try {
       for (const service of targets) {
         setRepairing(service);
@@ -163,6 +166,41 @@
       }
     } finally {
       repairBusy = false;
+      clearStatusLater();
+    }
+  }
+
+  async function refreshKgcAndCore() {
+    kgcRefreshBusy = true;
+    statusColor = "var(--text-secondary)";
+    statusMsg = "KG Course を更新しています...";
+    setRepairing("kgc");
+    try {
+      const kgcOk = await syncSession("kgc").catch(() => false);
+      setRepairResult("kgc", kgcOk);
+      if (!kgcOk) {
+        statusColor = "var(--orange, #ff9500)";
+        statusMsg = "KG Course を更新できませんでした。Luna・KWIC は変更していません";
+        return;
+      }
+
+      statusMsg = "KG Course を更新しました。Luna・KWIC の Cookie を更新しています...";
+      setRepairing("luna");
+      setRepairing("kwic");
+      const lunaOk = await syncSession("luna").catch(() => false);
+      setRepairResult("luna", lunaOk);
+      const kwicOk = await syncSession("kwic").catch(() => false);
+      setRepairResult("kwic", kwicOk);
+
+      if (lunaOk && kwicOk) {
+        statusColor = "var(--green)";
+        statusMsg = "KG Course・Luna・KWIC の Cookie を更新しました";
+      } else {
+        statusColor = "var(--orange, #ff9500)";
+        statusMsg = "KG Course は更新しましたが、一部の主要サービスを更新できませんでした";
+      }
+    } finally {
+      kgcRefreshBusy = false;
       clearStatusLater();
     }
   }
@@ -221,7 +259,10 @@
   }
 
   onMount(() => {
-    void loadStoredStates();
+    void (async () => {
+      await loadStoredStates();
+      await checkAll(false);
+    })();
   });
 
   onDestroy(() => {
@@ -240,7 +281,7 @@
   </div>
   <div class="hero-text">
     <h2 class="panel-title">セッション</h2>
-    <p class="panel-desc">Luna と KWIC を主要サービスとして監視します。KG Course は自動復旧せず、切れている場合もアプリ全体の再認証は要求しません。</p>
+    <p class="panel-desc">Luna と KWIC を主要サービスとして監視します。KG Course は自動復旧せず、状態行の更新操作で KG Course に続けて Luna・KWIC の Cookie を更新します。</p>
   </div>
 </div>
 
@@ -257,6 +298,9 @@
         {:else}<span class="session-dot ng"></span>{/if}
         {kg.label}
       </div>
+      <button class="btn-test session-update" disabled={checking} onclick={refreshKgcAndCore}>
+        {kgcRefreshBusy ? "更新中..." : "KGCを更新"}
+      </button>
     </div>
   </div>
   <div class="row">
@@ -289,13 +333,13 @@
 
 <div class:ready={coreReady} class:stored={!coreReady && coreStored} class="core-summary">
   <strong>{coreReady ? "主要サービスは利用可能です" : coreStored ? "主要サービスのセッションは保存されています" : "主要サービスの状態を確認してください"}</strong>
-  <span>{coreReady ? "KG Course が切れていても通常利用を継続できます。" : coreStored ? "必要なときに状態を確認します。画面を開いただけでは通信しません。" : "Luna または KWIC が未接続の場合は、まず切れた接続の復旧を試してください。"}</span>
+  <span>{coreReady ? "KG Course が切れていても通常利用を継続できます。" : coreStored ? "保存済みの状態を確認しています。" : "Luna または KWIC が未接続の場合は、主要サービスの復旧を試してください。"}</span>
 </div>
 
 <div class="action-bar">
   <button class="btn-test" disabled={checking} onclick={() => checkAll()}>状態を確認</button>
-  <button class="btn-test primary" disabled={checking || disconnected.length === 0} onclick={repairDisconnected}>
-    {repairBusy ? "復旧中..." : `切れた接続を復旧${disconnected.length ? ` (${disconnected.length})` : ""}`}
+  <button class="btn-test primary" disabled={checking || disconnectedCore.length === 0} onclick={repairDisconnected}>
+    {repairBusy ? "Luna・KWICを復旧中..." : `Luna・KWICを復旧${disconnectedCore.length ? ` (${disconnectedCore.length})` : ""}`}
   </button>
   <button class:armed={resetArmed} class="btn-test danger" disabled={checking} onclick={clearCookiesAndRelogin}>
     {resetBusy ? "初期化中..." : resetArmed ? "もう一度押して完全再ログイン" : "Cookieを削除して完全再ログイン"}
@@ -364,6 +408,19 @@
   .action-status {
     flex-basis: 100%;
     margin-top: 2px;
+  }
+  .row-input {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+  }
+  .session-indicator {
+    flex: 1;
+    min-width: 0;
+  }
+  .session-update {
+    flex: 0 0 auto;
+    min-width: 88px;
   }
   :global(.settings-main .btn-test.primary) {
     background: color-mix(in srgb, var(--accent) 10%, transparent);

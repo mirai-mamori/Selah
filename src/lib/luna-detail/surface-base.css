@@ -116,38 +116,108 @@ html,
     display: flex;
     flex-wrap: wrap;
     align-items: center;
-    gap: 3px 0;
-    margin: -3px 0 11px;
+    gap: 6px 16px;
+    margin: 0;
     color: var(--detail-muted);
     font-size: 12px;
     font-weight: 650;
-    line-height: 1.4;
+    line-height: 1.55;
   }
 
   .course-subtitle > span {
     min-width: 0;
     display: inline-flex;
-    align-items: center;
-    gap: 5px;
-  }
-
-  .course-subtitle > span + span::before {
-    content: "·";
-    margin: 0 8px;
-    color: var(--detail-faint);
-  }
-
-  .course-subtitle .course-teacher {
+    align-items: baseline;
+    gap: 7px;
     overflow-wrap: anywhere;
   }
 
-  .course-subtitle .course-teacher svg {
+  .course-subtitle .course-affiliation {
+    flex-basis: 100%;
+    font-size: 12px;
+    line-height: 1.4;
+  }
+
+  .course-subtitle .course-staff {
+    align-items: flex-start;
+    max-width: min(100%, 860px);
+    color: var(--detail-muted);
+  }
+
+  .course-subtitle .course-staff > span {
+    min-width: 0;
+    overflow-wrap: anywhere;
+  }
+
+  .course-subtitle strong {
+    flex: 0 0 auto;
+    min-width: 18px;
+    padding-top: 1px;
+    color: var(--detail-faint);
+    font-size: 10px;
+    font-weight: 820;
+  }
+
+  .course-titlebar {
+    min-width: 0;
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 10px 16px;
+  }
+
+  .hero .course-titlebar h1 {
+    min-width: 0;
+    margin: 0;
+  }
+
+  .course-title-meta {
+    min-width: 0;
+    display: inline-flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 6px;
+  }
+
+  .course-time-tag {
+    min-height: 22px;
+    display: inline-flex;
+    align-items: center;
+    padding: 0 8px;
+    border: 0.5px solid color-mix(in srgb, var(--detail-accent) 14%, var(--detail-border));
+    border-radius: 999px;
+    color: var(--detail-accent);
+    background: color-mix(in srgb, var(--detail-accent) 5%, var(--detail-surface));
+    font-size: 11px;
+    font-weight: 760;
+    line-height: 1;
+  }
+
+  .course-title-meta .course-teacher {
+    min-width: 0;
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    min-height: 22px;
+    margin-left: 3px;
+    padding: 0 8px;
+    border: 0.5px solid color-mix(in srgb, var(--detail-muted) 18%, var(--detail-border));
+    border-radius: 999px;
+    color: var(--detail-muted);
+    background: color-mix(in srgb, var(--detail-muted) 5%, var(--detail-surface));
+    font-size: 11px;
+    font-weight: 720;
+    line-height: 1;
+    overflow-wrap: anywhere;
+  }
+
+  .course-title-meta .course-teacher svg {
     flex: 0 0 auto;
     color: var(--detail-faint);
   }
 
   .attendance-heading .course-subtitle {
-    margin: 3px 0 0;
+    margin: 5px 0 0;
     color: var(--detail-faint);
     font-size: 11px;
   }
@@ -163,6 +233,8 @@ html,
   .hero-main {
     min-width: 0;
     max-width: 1260px;
+    display: grid;
+    gap: 9px;
   }
 
   .hero h1,
@@ -198,27 +270,6 @@ html,
     background: transparent;
     border: 0;
     padding: 0;
-  }
-
-  .hero-meta .semester {
-    color: var(--detail-faint);
-    font-size: 16px;
-    font-weight: 780;
-  }
-
-  .hero-meta .teacher {
-    display: inline-flex;
-    align-items: center;
-    gap: 7px;
-    padding-left: 15px;
-    border-left: 0.5px solid var(--detail-border);
-    color: var(--detail-muted);
-    font-size: 15px;
-    font-weight: 720;
-  }
-
-  .hero-meta .teacher svg {
-    color: var(--detail-faint);
   }
 
   .hero-meta .staff {

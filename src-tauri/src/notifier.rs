@@ -17,6 +17,7 @@ use crate::{KgcState, KwicState, LunaState, MailState};
 
 const INITIAL_SYNC_DELAY: Duration = Duration::from_secs(10);
 const POLL_INTERVAL: Duration = Duration::from_secs(5 * 60);
+const KGC_NOTIFICATION_MAX_AGE_SECS: i64 = 12 * 60 * 60;
 const BOOTSTRAP_GRACE_PERIOD: Duration = Duration::from_secs(6 * 60);
 
 pub struct NotificationPollState {
@@ -267,13 +268,17 @@ pub async fn sync_notifications_now(app: &AppHandle) -> Result<Vec<String>, Stri
 
 async fn sync_notifications_inner(app: &AppHandle) -> Result<Vec<String>, String> {
     let cfg = commands::load_notification_config();
-    let (kgc_authenticated, luna_authenticated, kwic_authenticated, mail_authenticated) = tokio::join!(
+    let (mut kgc_authenticated, luna_authenticated, kwic_authenticated, mail_authenticated) = tokio::join!(
         is_kgc_authenticated(app),
         is_luna_authenticated(app),
         is_kwic_authenticated(app),
         is_mail_authenticated(app)
     );
     let db = app.state::<Database>();
+    let kgc_notifications_due = kgc_notification_refresh_due(&db);
+    if kgc_notifications_due {
+        kgc_authenticated = crate::commands::ensure_kgc_session_for_automatic_request(app).await;
+    }
 
     let stored_version = crate::read_state::get_seen_notif_format_version(&db);
     if stored_version != crate::read_state::CURRENT_SEEN_NOTIF_FORMAT_VERSION {
@@ -309,7 +314,7 @@ async fn sync_notifications_inner(app: &AppHandle) -> Result<Vec<String>, String
     };
     let mut updated_keys = Vec::new();
 
-    if kgc_authenticated {
+    if kgc_authenticated && kgc_notifications_due {
         match fetch_kgc_notifications(app).await {
             Ok(data) => {
                 sync_kgc_notifications(app, &cfg, data, suppress_push, &mut run);
@@ -389,6 +394,16 @@ async fn sync_notifications_inner(app: &AppHandle) -> Result<Vec<String>, String
 
 async fn fetch_kgc_notifications(app: &AppHandle) -> Result<NotificationsData, String> {
     crate::commands::fetch_notifications(app.state::<KgcState>(), app.state::<Database>()).await
+}
+
+fn kgc_notification_refresh_due(db: &Database) -> bool {
+    match db.get_data_cache("notifications") {
+        Ok(Some((_, updated_at))) => {
+            epoch_secs().saturating_sub(updated_at) >= KGC_NOTIFICATION_MAX_AGE_SECS
+        }
+        Ok(None) => true,
+        Err(_) => true,
+    }
 }
 
 async fn fetch_luna_notifications(
