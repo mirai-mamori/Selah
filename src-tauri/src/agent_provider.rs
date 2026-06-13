@@ -266,12 +266,29 @@ impl AgentProvider {
         matches!(self, Self::Local { .. })
     }
 
-    /// Whether the provider can see images. Remote (OpenAI/Gemini vision) models
-    /// can; the on-device Qwen models are text-only. Gates whether agent
-    /// screenshots are fed back as real images.
+    /// Whether to attempt sending images to this provider. On-device Qwen is
+    /// text-only, so never. For Remote we always TRY (we don't pre-judge any
+    /// model — including DeepSeek): vision models receive the image, and if a
+    /// text-only endpoint rejects the `image_url` part the request layer falls
+    /// back to text-only for that one call instead of failing.
     pub fn supports_vision(&self) -> bool {
         matches!(self, Self::Remote { .. })
     }
+}
+
+/// Whether an API error body indicates the model/endpoint refused image input
+/// (so the request can be retried text-only instead of hard-failing).
+fn is_image_unsupported_error(body: &str) -> bool {
+    let b = body.to_ascii_lowercase();
+    b.contains("image_url")
+        || b.contains("inlinedata")
+        || b.contains("multimodal")
+        || (b.contains("image")
+            && (b.contains("unknown variant")
+                || b.contains("not support")
+                || b.contains("unsupported")
+                || b.contains("invalid")
+                || b.contains("deserialize")))
 }
 
 fn agent_error_from_model(e: String) -> AgentError {
@@ -393,6 +410,32 @@ fn gemini_parts_json(m: &ChatMessage) -> Vec<serde_json::Value> {
     parts
 }
 
+/// OpenAI messages array; `with_images=false` drops image parts (text-only
+/// fallback for endpoints that reject `image_url`).
+fn openai_messages_json(messages: &[ChatMessage], with_images: bool) -> Vec<serde_json::Value> {
+    messages
+        .iter()
+        .map(|m| {
+            if with_images && !m.images.is_empty() {
+                openai_message_json(m)
+            } else {
+                serde_json::json!({ "role": m.role, "content": m.content })
+            }
+        })
+        .collect()
+}
+
+/// Gemini content parts for one message; `with_images=false` drops image parts.
+fn gemini_message_parts(m: &ChatMessage, with_images: bool) -> Vec<serde_json::Value> {
+    if with_images {
+        gemini_parts_json(m)
+    } else {
+        vec![serde_json::json!({
+            "text": agent_text::neutralize_pseudo_tool_calls(&m.content)
+        })]
+    }
+}
+
 async fn remote_openai_non_streaming(
     config: &AiConfig,
     messages: Vec<ChatMessage>,
@@ -400,29 +443,40 @@ async fn remote_openai_non_streaming(
     temperature: f32,
 ) -> Result<String, String> {
     let url = format!("{}/chat/completions", config.base_url.trim_end_matches('/'));
-    let body = serde_json::json!({
-        "model": config.model,
-        "messages": messages.iter().map(openai_message_json).collect::<Vec<_>>(),
-        "max_tokens": if max_tokens == 0 { 8192 } else { max_tokens },
-        "temperature": temperature,
-    });
-    let resp = http_client()
-        .post(&url)
-        .header("Authorization", format!("Bearer {}", config.api_key))
-        .header("Content-Type", "application/json")
-        .json(&body)
-        .send()
-        .await
-        .map_err(|e| format!("リクエスト失敗: {}", e))?;
+    let has_images = messages.iter().any(|m| !m.images.is_empty());
+    let mut with_images = has_images;
+    let text = loop {
+        let body = serde_json::json!({
+            "model": config.model,
+            "messages": openai_messages_json(&messages, with_images),
+            "max_tokens": if max_tokens == 0 { 8192 } else { max_tokens },
+            "temperature": temperature,
+        });
+        let resp = http_client()
+            .post(&url)
+            .header("Authorization", format!("Bearer {}", config.api_key))
+            .header("Content-Type", "application/json")
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| format!("リクエスト失敗: {}", e))?;
 
-    let status = resp.status();
-    let text = resp
-        .text()
-        .await
-        .map_err(|e| format!("レスポンス読み取り失敗: {}", e))?;
-    if !status.is_success() {
-        return Err(format!("API error ({}): {}", status, truncate(&text, 300)));
-    }
+        let status = resp.status();
+        let text = resp
+            .text()
+            .await
+            .map_err(|e| format!("レスポンス読み取り失敗: {}", e))?;
+        if !status.is_success() {
+            // Endpoint refused the image part → retry once text-only.
+            if with_images && is_image_unsupported_error(&text) {
+                log::warn!("plan: model rejected image input, retrying text-only");
+                with_images = false;
+                continue;
+            }
+            return Err(format!("API error ({}): {}", status, truncate(&text, 300)));
+        }
+        break text;
+    };
     let v: serde_json::Value =
         serde_json::from_str(&text).map_err(|e| format!("JSON解析失敗: {}", e))?;
     v.get("choices")
@@ -459,46 +513,56 @@ async fn remote_gemini_non_streaming(
             "parts": [{ "text": system_text.join("\n") }]
         })
     };
-    let contents: Vec<serde_json::Value> = messages
-        .into_iter()
-        .filter(|m| m.role != "system")
-        .map(|m| {
-            serde_json::json!({
-                "role": if m.role == "assistant" { "model" } else { "user" },
-                "parts": gemini_parts_json(&m)
+    let has_images = messages.iter().any(|m| !m.images.is_empty());
+    let mut with_images = has_images;
+    let text = loop {
+        let contents: Vec<serde_json::Value> = messages
+            .iter()
+            .filter(|m| m.role != "system")
+            .map(|m| {
+                serde_json::json!({
+                    "role": if m.role == "assistant" { "model" } else { "user" },
+                    "parts": gemini_message_parts(m, with_images)
+                })
             })
-        })
-        .collect();
-    let mut body = serde_json::json!({
-        "contents": contents,
-        "generationConfig": {
-            "maxOutputTokens": if max_tokens == 0 { 8192 } else { max_tokens },
-            "temperature": temperature,
-        },
-    });
-    if json_mode {
-        body["generationConfig"]["responseMimeType"] =
-            serde_json::Value::String("application/json".into());
-    }
-    if !system_instruction.is_null() {
-        body["systemInstruction"] = system_instruction;
-    }
-    let resp = http_client()
-        .post(&url)
-        .header("Content-Type", "application/json")
-        .header("x-goog-api-key", &config.api_key)
-        .json(&body)
-        .send()
-        .await
-        .map_err(|e| format!("リクエスト失敗: {}", e))?;
-    let status = resp.status();
-    let text = resp
-        .text()
-        .await
-        .map_err(|e| format!("レスポンス読み取り失敗: {}", e))?;
-    if !status.is_success() {
-        return Err(format!("API error ({}): {}", status, truncate(&text, 300)));
-    }
+            .collect();
+        let mut body = serde_json::json!({
+            "contents": contents,
+            "generationConfig": {
+                "maxOutputTokens": if max_tokens == 0 { 8192 } else { max_tokens },
+                "temperature": temperature,
+            },
+        });
+        if json_mode {
+            body["generationConfig"]["responseMimeType"] =
+                serde_json::Value::String("application/json".into());
+        }
+        if !system_instruction.is_null() {
+            body["systemInstruction"] = system_instruction.clone();
+        }
+        let resp = http_client()
+            .post(&url)
+            .header("Content-Type", "application/json")
+            .header("x-goog-api-key", &config.api_key)
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| format!("リクエスト失敗: {}", e))?;
+        let status = resp.status();
+        let text = resp
+            .text()
+            .await
+            .map_err(|e| format!("レスポンス読み取り失敗: {}", e))?;
+        if !status.is_success() {
+            if with_images && is_image_unsupported_error(&text) {
+                log::warn!("plan(gemini): model rejected image input, retrying text-only");
+                with_images = false;
+                continue;
+            }
+            return Err(format!("API error ({}): {}", status, truncate(&text, 300)));
+        }
+        break text;
+    };
     let v: serde_json::Value =
         serde_json::from_str(&text).map_err(|e| format!("JSON解析失敗: {}", e))?;
     let content = collect_gemini_text_parts(
@@ -709,28 +773,40 @@ where
     F: FnMut(&str, bool) + Send + 'static,
 {
     let url = format!("{}/chat/completions", config.base_url.trim_end_matches('/'));
-    let body = serde_json::json!({
-        "model": config.model,
-        "messages": messages.iter().map(openai_message_json).collect::<Vec<_>>(),
-        "max_tokens": if config.max_tokens == 0 { 32768u32 } else { config.max_tokens },
-        "temperature": config.temperature,
-        "stream": true,
-    });
+    let has_images = messages.iter().any(|m| !m.images.is_empty());
+    let mut with_images = has_images;
+    // Retry once text-only if the endpoint refuses images. on_chunk is untouched
+    // until streaming begins, so re-POSTing here is safe.
+    let resp = loop {
+        let body = serde_json::json!({
+            "model": config.model,
+            "messages": openai_messages_json(&messages, with_images),
+            "max_tokens": if config.max_tokens == 0 { 32768u32 } else { config.max_tokens },
+            "temperature": config.temperature,
+            "stream": true,
+        });
 
-    let resp = http_client()
-        .post(&url)
-        .header("Authorization", format!("Bearer {}", config.api_key))
-        .header("Content-Type", "application/json")
-        .json(&body)
-        .send()
-        .await
-        .map_err(|e| format!("リクエスト失敗: {}", e))?;
+        let resp = http_client()
+            .post(&url)
+            .header("Authorization", format!("Bearer {}", config.api_key))
+            .header("Content-Type", "application/json")
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| format!("リクエスト失敗: {}", e))?;
 
-    if !resp.status().is_success() {
-        let status = resp.status();
-        let text = resp.text().await.unwrap_or_default();
-        return Err(format!("API error ({}): {}", status, truncate(&text, 300)));
-    }
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let text = resp.text().await.unwrap_or_default();
+            if with_images && is_image_unsupported_error(&text) {
+                log::warn!("answer: model rejected image input, retrying text-only");
+                with_images = false;
+                continue;
+            }
+            return Err(format!("API error ({}): {}", status, truncate(&text, 300)));
+        }
+        break resp;
+    };
 
     // Read SSE byte stream.
     let mut full_text = String::new();
@@ -813,41 +889,51 @@ where
             "parts": [{ "text": system_text.join("\n") }]
         })
     };
-    let contents: Vec<serde_json::Value> = messages
-        .into_iter()
-        .filter(|m| m.role != "system")
-        .map(|m| {
-            serde_json::json!({
-                "role": if m.role == "assistant" { "model" } else { "user" },
-                "parts": gemini_parts_json(&m)
+    let has_images = messages.iter().any(|m| !m.images.is_empty());
+    let mut with_images = has_images;
+    let resp = loop {
+        let contents: Vec<serde_json::Value> = messages
+            .iter()
+            .filter(|m| m.role != "system")
+            .map(|m| {
+                serde_json::json!({
+                    "role": if m.role == "assistant" { "model" } else { "user" },
+                    "parts": gemini_message_parts(m, with_images)
+                })
             })
-        })
-        .collect();
-    let mut body = serde_json::json!({
-        "contents": contents,
-        "generationConfig": {
-            "maxOutputTokens": if config.max_tokens == 0 { 32768u32 } else { config.max_tokens },
-            "temperature": config.temperature,
-        },
-    });
-    if !system_instruction.is_null() {
-        body["systemInstruction"] = system_instruction;
-    }
+            .collect();
+        let mut body = serde_json::json!({
+            "contents": contents,
+            "generationConfig": {
+                "maxOutputTokens": if config.max_tokens == 0 { 32768u32 } else { config.max_tokens },
+                "temperature": config.temperature,
+            },
+        });
+        if !system_instruction.is_null() {
+            body["systemInstruction"] = system_instruction.clone();
+        }
 
-    let resp = http_client()
-        .post(&url)
-        .header("Content-Type", "application/json")
-        .header("x-goog-api-key", &config.api_key)
-        .json(&body)
-        .send()
-        .await
-        .map_err(|e| format!("リクエスト失敗: {}", e))?;
+        let resp = http_client()
+            .post(&url)
+            .header("Content-Type", "application/json")
+            .header("x-goog-api-key", &config.api_key)
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| format!("リクエスト失敗: {}", e))?;
 
-    if !resp.status().is_success() {
-        let status = resp.status();
-        let text = resp.text().await.unwrap_or_default();
-        return Err(format!("API error ({}): {}", status, truncate(&text, 300)));
-    }
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let text = resp.text().await.unwrap_or_default();
+            if with_images && is_image_unsupported_error(&text) {
+                log::warn!("answer(gemini): model rejected image input, retrying text-only");
+                with_images = false;
+                continue;
+            }
+            return Err(format!("API error ({}): {}", status, truncate(&text, 300)));
+        }
+        break resp;
+    };
 
     let mut full_text = String::new();
     let mut buffer = String::new();
@@ -1006,6 +1092,14 @@ mod tests {
             images: vec![],
         };
         assert_eq!(openai_message_json(&m)["content"], "hi");
+    }
+
+    #[test]
+    fn image_unsupported_error_detected_for_deepseek_style_400() {
+        assert!(is_image_unsupported_error(
+            "Failed to deserialize the JSON body: messages[6]: unknown variant `image_url`, expected `text`"
+        ));
+        assert!(!is_image_unsupported_error("rate limit exceeded"));
     }
 
     #[test]

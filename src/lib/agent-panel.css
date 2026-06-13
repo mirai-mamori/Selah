@@ -802,23 +802,22 @@
 
 .agent-attach-button {
   flex: 0 0 auto;
-  width: 26px;
-  height: 26px;
-  align-self: flex-end;
-  margin-right: 4px;
+  width: 28px;
+  height: 28px;
+  align-self: center;
+  margin-right: 2px;
+  padding: 0;
   display: inline-flex;
   align-items: center;
   justify-content: center;
   border: none;
-  border-radius: 50%;
-  background: var(--bg-hover, rgba(0, 0, 0, 0.05));
+  background: transparent;
   color: var(--text-secondary, #8a8a8a);
   cursor: pointer;
-  transition: background 0.15s, color 0.15s;
+  transition: color 0.15s;
 }
 
 .agent-attach-button:hover {
-  background: var(--bg-hover, rgba(0, 0, 0, 0.1));
   color: var(--text-primary, #333);
 }
 

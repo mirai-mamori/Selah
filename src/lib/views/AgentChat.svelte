@@ -1267,22 +1267,21 @@
   .chat-attachment-remove:hover { background: rgba(0, 0, 0, 0.82); }
   .chat-attach-button {
     flex: 0 0 auto;
-    width: 28px;
-    height: 28px;
-    align-self: flex-end;
-    margin-right: 6px;
+    width: 30px;
+    height: 30px;
+    align-self: center;
+    margin-right: 4px;
+    padding: 0;
     display: inline-flex;
     align-items: center;
     justify-content: center;
     border: none;
-    border-radius: 50%;
-    background: var(--bg-hover, rgba(0, 0, 0, 0.05));
+    background: transparent;
     color: var(--text-secondary, #8a8a8a);
     cursor: pointer;
-    transition: background 0.15s, color 0.15s;
+    transition: color 0.15s;
   }
   .chat-attach-button:hover:not(:disabled) {
-    background: var(--bg-hover, rgba(0, 0, 0, 0.1));
     color: var(--text-primary, #333);
   }
   .chat-attach-button:disabled { opacity: 0.4; cursor: default; }
