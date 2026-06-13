@@ -10,7 +10,6 @@
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::HashSet;
-use std::sync::{LazyLock, Mutex};
 use tauri::{AppHandle, Emitter, Manager};
 
 use crate::agent_error::AgentError;
@@ -156,23 +155,6 @@ const CFG: AgentConfig = AgentConfig {
     max_agent_steps: 8,
 };
 
-static ACTIVE_AGENT_TURNS: LazyLock<Mutex<HashSet<String>>> =
-    LazyLock::new(|| Mutex::new(HashSet::new()));
-
-fn mark_turn_active(conv_id: &str) {
-    ACTIVE_AGENT_TURNS
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .insert(conv_id.to_string());
-}
-
-fn mark_turn_inactive(conv_id: &str) {
-    ACTIVE_AGENT_TURNS
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .remove(conv_id);
-}
-
 // ─────────────────────── Stream Events ───────────────────────
 
 #[derive(Debug, Serialize)]
@@ -301,7 +283,6 @@ pub async fn agent_send_with_context(
     turn_context: AgentTurnContext,
 ) -> Result<(), String> {
     AgentProvider::clear_cancel(&conv_id);
-    mark_turn_active(&conv_id);
     let mut turn_context = turn_context;
     // Widen the browser target lock to the whole current split view: collect the
     // live pane targets of the Copilot window's active tab so the agent may read
@@ -311,7 +292,6 @@ pub async fn agent_send_with_context(
             crate::document_tabs::active_view_panes(&app, "document-tabs");
     }
     let result = run_turn(&app, &conv_id, user_text, user_images, turn_context).await;
-    mark_turn_inactive(&conv_id);
     AgentProvider::clear_cancel(&conv_id);
     match &result {
         Ok(()) => emit(&app, &conv_id, &StreamEvent::Done),
@@ -333,20 +313,6 @@ pub async fn agent_send_with_context(
 /// Exposed for the cancel command.
 pub fn cancel(conv_id: &str) {
     AgentProvider::cancel(conv_id);
-}
-
-/// Cancel every currently running agent turn. Browser toolbar stop buttons do
-/// not know the conversation id, so they route through this app-wide escape hatch.
-pub fn cancel_active() {
-    let ids: Vec<String> = ACTIVE_AGENT_TURNS
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .iter()
-        .cloned()
-        .collect();
-    for id in ids {
-        AgentProvider::cancel(&id);
-    }
 }
 
 // ─────────────────────── Turn Pipeline ───────────────────────
@@ -643,7 +609,6 @@ struct Plan {
     #[serde(default)]
     tools: Vec<ToolCall>,
     #[serde(default)]
-    #[allow(dead_code)]
     image_only: bool,
 }
 
@@ -2865,7 +2830,7 @@ fn numbered_click_labels_from_text(text: &str, index: usize) -> Option<Vec<Strin
 fn numbered_line_index(line: &str) -> Option<usize> {
     let trimmed = line
         .trim_start()
-        .trim_start_matches(|c: char| matches!(c, '*' | '-' | '・' | '•'))
+        .trim_start_matches(['*', '-', '・', '•'])
         .trim_start();
     let mut chars = trimmed.chars();
     let first = chars.next()?;

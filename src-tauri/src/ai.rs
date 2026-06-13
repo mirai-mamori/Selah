@@ -638,16 +638,6 @@ pub fn delete_local_model(app: tauri::AppHandle, model_id: String) -> Result<(),
     Ok(())
 }
 
-#[tauri::command]
-pub async fn test_notification(
-    app: tauri::AppHandle,
-    title: String,
-    body: String,
-) -> Result<String, String> {
-    log::info!("test_notification called: title={}, body={}", title, body);
-    send_native_notification(&app, &title, &body)
-}
-
 /// Send a native notification.
 pub fn send_native_notification(
     app: &tauri::AppHandle,

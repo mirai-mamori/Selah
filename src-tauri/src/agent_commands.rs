@@ -187,11 +187,6 @@ pub fn agent_cancel(conv_id: String) {
 }
 
 #[tauri::command]
-pub fn agent_cancel_active() {
-    agent::cancel_active();
-}
-
-#[tauri::command]
 pub fn open_agent_popup(
     app: AppHandle,
     owner_label: Option<String>,

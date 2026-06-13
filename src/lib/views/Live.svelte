@@ -5,6 +5,7 @@
   import { getCurrentWindow } from "@tauri-apps/api/window";
   import { onCacheUpdate } from "../stores";
   import LiveNotice from "./live/LiveNotice.svelte";
+  import LiveOverallSummaryCard from "./live/LiveOverallSummaryCard.svelte";
   import LiveRightRail from "./live/LiveRightRail.svelte";
   import LiveScrollToBottomButton from "./live/LiveScrollToBottomButton.svelte";
   import LiveSummaryCard from "./live/LiveSummaryCard.svelte";
@@ -29,6 +30,7 @@
     liveClearDayCache,
     liveFinishSession,
     liveFlushSummary,
+    liveGenerateOverallSummary,
     liveGetSession,
     livePeekDayCache,
     liveStartSession,
@@ -74,6 +76,7 @@
   let todoDraftSaving = $state(false);
   let summaryViewIndex = $state(-1); // -1 = auto (latest)
   let summaryExpanded = $state(false);
+  let overallSummary = $state("");
   let noticeTimer: ReturnType<typeof setTimeout> | null = null;
   let scheduleFocusTimer: ReturnType<typeof setInterval> | null = null;
   let aiReplyLanguage = $state("ja");
@@ -587,6 +590,7 @@
   const canStart = $derived(!snapshot.active && !!selectedCourse && liveReady && !busy);
   const canStartFreeNote = $derived(!snapshot.active && liveReady && !busy);
   const canStop = $derived(snapshot.active && !busy);
+  const canGenerateOverallSummary = $derived(snapshot.active && snapshot.transcript_lines.length > 0 && !busy);
 
   // When the selected course changes (and session not active), load cached history
   $effect(() => {
@@ -840,6 +844,7 @@
       sttPhase = "starting";
       setSttNotice("音声入力を起動中…");
       snapshot = await liveStartSession(course);
+      overallSummary = "";
       partialText = "";
       lastSaved = null;
       if (isDemoActive()) {
@@ -981,6 +986,7 @@
         : "TODO候補とDDLを判定中…";
       const saved = await liveFinishSession();
       lastSaved = saved.saved ? saved : null;
+      overallSummary = "";
       if (saved.saved && saved.suggested_todos?.length) {
         todoDrafts = saved.suggested_todos.map((item) => ({ ...item, selected: true }));
         todoDraftSourcePath = saved.path;
@@ -1040,6 +1046,23 @@
     await stopLiveInternal(false);
   }
 
+  async function generateOverallSummary() {
+    if (!canGenerateOverallSummary) return;
+    busy = true;
+    clearNotice();
+    saveProgress = "全体要約を生成中…";
+    try {
+      overallSummary = await liveGenerateOverallSummary();
+      snapshot = await liveGetSession();
+      setMessage("success", "現在までの全体要約を生成しました");
+    } catch (e: any) {
+      setMessage("error", e?.message || String(e));
+    } finally {
+      saveProgress = "";
+      busy = false;
+    }
+  }
+
   async function cancelLive() {
     busy = true;
     try {
@@ -1054,6 +1077,7 @@
       }
       await liveCancelSession();
       snapshot = await liveGetSession();
+      overallSummary = "";
       partialText = "";
       sttListening = false;
       clearLiveAutoLifecycle();
@@ -1087,6 +1111,7 @@
     try {
       await liveClearDayCache(toLiveCourse(selectedCourse));
       snapshot = { active: false, course: null, started_at: null, transcript_lines: [], pending_lines: [], summaries: [] };
+      overallSummary = "";
       setMessage("success", `${name} のキャッシュをクリアしました`);
     } catch (e: any) {
       setMessage("error", e?.message || String(e));
@@ -1282,6 +1307,7 @@
     {canStart}
     {canStartFreeNote}
     {canStop}
+    {canGenerateOverallSummary}
     {sttListening}
     {sttBooting}
     {confirmClear}
@@ -1293,6 +1319,7 @@
     onCancelClear={cancelClearCourseData}
     onConfirmClear={confirmClearCourseData}
     onStopLive={stopLive}
+    onGenerateOverallSummary={generateOverallSummary}
     onPauseLive={pauseLive}
     onResumeLive={resumeLive}
   />
@@ -1302,6 +1329,12 @@
     <div class="scroll-spacer-top"></div>
 
     <LiveNotice {notice} onOpenAiSettings={() => openSettingsWindow("ai")} />
+
+    <LiveOverallSummaryCard
+      summary={overallSummary}
+      {renderMd}
+      onClose={() => { overallSummary = ""; }}
+    />
 
     <LiveSummaryCard
       summaries={snapshot.summaries}

@@ -1420,52 +1420,6 @@ pub async fn browser_navigate(
     Ok(())
 }
 
-#[tauri::command]
-pub async fn browser_get_page_title(
-    app: tauri::AppHandle,
-    target: String,
-) -> Result<String, String> {
-    let wv = app.get_webview(&target).ok_or("Webview not found")?;
-    let request_id = uuid::Uuid::new_v4().to_string();
-    let (tx, rx) = tokio::sync::oneshot::channel::<Value>();
-    BROWSER_ACTION_WAITERS
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .insert(request_id.clone(), tx);
-    let script = format!(
-        r#"(function() {{
-          var invoke = window.__TAURI__?.core?.invoke || window.__TAURI_INTERNALS__?.invoke;
-          if (!invoke) return;
-          invoke('browser_report_action_result', {{
-            report: {{
-              requestId: {request_id:?},
-              payload: {{
-                title: String(document.title || '').trim()
-              }}
-            }}
-          }}).catch(function(){{}});
-        }})();"#
-    );
-    if let Err(e) = wv.eval(&script) {
-        BROWSER_ACTION_WAITERS
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .remove(&request_id);
-        return Err(e.to_string());
-    }
-    let value = tokio::time::timeout(std::time::Duration::from_millis(900), rx)
-        .await
-        .ok()
-        .and_then(Result::ok)
-        .unwrap_or(Value::Null);
-    Ok(value
-        .get("title")
-        .and_then(|v| v.as_str())
-        .unwrap_or("")
-        .trim()
-        .to_string())
-}
-
 /// Close the browser window that owns `target` (which may be either the window
 /// label, the `-ct` content webview label, or the `-tb` toolbar webview label).
 /// Removes the label from the registry so subsequent `list_browser_windows`

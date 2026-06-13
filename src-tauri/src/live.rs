@@ -1091,6 +1091,38 @@ async fn summarize_overall(
     Ok(sanitize_model_output(&raw))
 }
 
+async fn generate_overall_summary(
+    course: &LiveCourseInfo,
+    started_at: DateTime<Local>,
+    ended_at: DateTime<Local>,
+    summaries: &[LiveSummaryChunk],
+    transcript_lines: &[LiveTranscriptLine],
+) -> String {
+    let ai_config = crate::ai::load_ai_config();
+    let reply_language = ai_config.reply_language.clone();
+    if should_skip_ai_summarization(started_at, ended_at) {
+        return short_session_overall_summary(course, transcript_lines.len(), &reply_language);
+    }
+    if !should_run_finish_ai(&ai_config.provider, started_at, ended_at) {
+        return fallback_overall_summary(
+            course,
+            transcript_lines.len(),
+            summaries.len(),
+            &reply_language,
+        );
+    }
+    summarize_overall(course, summaries, transcript_lines)
+        .await
+        .unwrap_or_else(|_| {
+            fallback_overall_summary(
+                course,
+                transcript_lines.len(),
+                summaries.len(),
+                &reply_language,
+            )
+        })
+}
+
 async fn extract_todo_suggestions(
     app: &tauri::AppHandle,
     course: &LiveCourseInfo,
@@ -1693,6 +1725,42 @@ pub async fn live_flush_summary(
 }
 
 #[tauri::command]
+pub async fn live_generate_overall_summary(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, LiveState>,
+) -> Result<String, String> {
+    live_flush_summary_with_side_effects(&app, state.inner(), true).await?;
+
+    let (course, started_at, transcript_lines, summaries) = {
+        let guard = state
+            .0
+            .lock()
+            .map_err(|_| "Live state lock failed".to_string())?;
+        let session = guard
+            .as_ref()
+            .ok_or_else(|| "Liveセッションが開始されていません".to_string())?;
+        if session.transcript_lines.is_empty() {
+            return Err("全体要約を生成できる文字起こしがまだありません".to_string());
+        }
+        (
+            session.course.clone(),
+            session.started_at,
+            session.transcript_lines.clone(),
+            session.summaries.clone(),
+        )
+    };
+
+    Ok(generate_overall_summary(
+        &course,
+        started_at,
+        Local::now(),
+        &summaries,
+        &transcript_lines,
+    )
+    .await)
+}
+
+#[tauri::command]
 pub fn live_cancel_session(
     app: tauri::AppHandle,
     state: tauri::State<'_, LiveState>,
@@ -1826,29 +1894,10 @@ pub async fn live_finish_session(
 
     let ended_at = Local::now();
     let ai_config = crate::ai::load_ai_config();
-    let reply_language = ai_config.reply_language.clone();
     let should_run_finish_ai = should_run_finish_ai(&ai_config.provider, started_at, ended_at);
-    let overall_summary = if should_skip_ai_summarization(started_at, ended_at) {
-        short_session_overall_summary(&course, transcript_lines.len(), &reply_language)
-    } else if !should_run_finish_ai {
-        fallback_overall_summary(
-            &course,
-            transcript_lines.len(),
-            summaries.len(),
-            &reply_language,
-        )
-    } else {
-        summarize_overall(&course, &summaries, &transcript_lines)
-            .await
-            .unwrap_or_else(|_| {
-                fallback_overall_summary(
-                    &course,
-                    transcript_lines.len(),
-                    summaries.len(),
-                    &reply_language,
-                )
-            })
-    };
+    let overall_summary =
+        generate_overall_summary(&course, started_at, ended_at, &summaries, &transcript_lines)
+            .await;
     let markdown = build_markdown(
         &course,
         started_at,

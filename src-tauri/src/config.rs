@@ -1,5 +1,3 @@
-use chrono::Weekday;
-
 /// Base URLs for all backend services
 pub const KG_COURSE_BASE: &str = "https://kg-course.kwansei.ac.jp";
 pub const LUNA_BASE: &str = "https://luna.kwansei.ac.jp";
@@ -23,31 +21,6 @@ pub const PERIOD_TIMES: [(u32, u32, u32, u32); 7] = [
     (18, 30, 20, 0),  // 6限
     (20, 10, 21, 40), // 7限
 ];
-
-/// Day-of-week labels (shared by tray, timetable, commands)
-pub fn day_label(day: &str) -> &str {
-    match day {
-        "月" => "月曜",
-        "火" => "火曜",
-        "水" => "水曜",
-        "木" => "木曜",
-        "金" => "金曜",
-        "土" => "土曜",
-        _ => day,
-    }
-}
-
-pub fn day_to_chrono_weekday(day: &str) -> Option<Weekday> {
-    match day {
-        "月" => Some(Weekday::Mon),
-        "火" => Some(Weekday::Tue),
-        "水" => Some(Weekday::Wed),
-        "木" => Some(Weekday::Thu),
-        "金" => Some(Weekday::Fri),
-        "土" => Some(Weekday::Sat),
-        _ => None,
-    }
-}
 
 /// Day-of-week short labels indexed by day number (1=Mon .. 6=Sat). Index 0 is unused.
 pub const DAY_SHORT: [&str; 7] = ["", "月", "火", "水", "木", "金", "土"];

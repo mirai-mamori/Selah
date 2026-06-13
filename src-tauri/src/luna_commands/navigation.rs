@@ -1,6 +1,4 @@
-use super::luna_http;
-use crate::{config, luna_client, LunaState};
-use tauri::State;
+use crate::config;
 
 /// Infer `(mode, idnumber, info_id)` from a Luna detail URL when the caller
 /// did not pass an explicit `mode`.
@@ -313,19 +311,6 @@ pub async fn luna_open_detail_window(
         split,
     )
     .await
-}
-
-/// Launch an LTI tool (Zoom, Panopto, etc.) and open the final URL in app webview
-#[tauri::command]
-pub async fn luna_launch_lti(
-    app: tauri::AppHandle,
-    state: State<'_, LunaState>,
-    path: String,
-) -> Result<(), String> {
-    let http = luna_http(&state).await?;
-    let final_url = luna_client::launch_lti(&http, &path).await?;
-    crate::commands::open_external_url(app, final_url, None).await?;
-    Ok(())
 }
 
 /// Reveal a file in Finder (restricted to app download directory)

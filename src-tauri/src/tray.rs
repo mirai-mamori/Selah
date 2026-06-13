@@ -1,4 +1,3 @@
-use serde::{Deserialize, Serialize};
 use std::sync::{
     atomic::{AtomicBool, Ordering},
     Arc, Mutex,
@@ -10,22 +9,11 @@ use tauri::{
     AppHandle, Emitter, Manager,
 };
 
-use crate::config;
-
 const TRAY_MENU_HOME: &str = "tray-home";
 const TRAY_MENU_AGENT: &str = "tray-agent";
 const TRAY_MENU_TIMETABLE: &str = "tray-timetable";
 const TRAY_MENU_TODO: &str = "tray-todo";
 const TRAY_MENU_QUIT: &str = "tray-quit";
-
-#[derive(Debug, Deserialize, Serialize)]
-pub struct TrayClassEntry {
-    pub day: String,
-    pub period: i32,
-    pub course_name: String,
-    pub room: String,
-    pub is_cancelled: bool,
-}
 
 pub fn setup_tray(app: &AppHandle) -> tauri::Result<()> {
     // macOS: monochrome template icon for the menu bar.
@@ -104,107 +92,6 @@ pub fn show_main_window(app: AppHandle) -> Result<(), String> {
 #[tauri::command]
 pub fn show_main_agent_window(app: AppHandle) -> Result<(), String> {
     show_main_window_with_tab(&app, Some("agent"))
-}
-
-#[tauri::command]
-pub fn quit_app(app: AppHandle) -> Result<(), String> {
-    app.exit(0);
-    Ok(())
-}
-
-/// Update the tray tooltip with next class info
-#[tauri::command]
-pub fn update_tray(app: AppHandle, entries: Vec<TrayClassEntry>) -> Result<(), String> {
-    use chrono::{Datelike, Local, Timelike};
-
-    let now = Local::now();
-    let current_weekday = now.weekday();
-    let current_h = now.hour();
-    let current_m = now.minute();
-    let current_minutes = current_h * 60 + current_m;
-
-    // Find the next class
-    let mut best: Option<(&TrayClassEntry, i32, i32)> = None;
-
-    for entry in &entries {
-        if entry.is_cancelled {
-            continue;
-        }
-        let Some(entry_weekday) = config::day_to_chrono_weekday(&entry.day) else {
-            continue;
-        };
-        if entry.period < 1 || entry.period > 7 {
-            continue;
-        }
-        let (sh, sm, _, _) = config::PERIOD_TIMES[(entry.period - 1) as usize];
-        let start_minutes = (sh * 60 + sm) as i32;
-
-        let entry_day_num = entry_weekday.num_days_from_monday() as i32;
-        let current_day_num = current_weekday.num_days_from_monday() as i32;
-        let mut days_ahead = entry_day_num - current_day_num;
-        if days_ahead < 0 {
-            days_ahead += 7;
-        }
-        if days_ahead == 0 {
-            let (_, _, eh, em) = config::PERIOD_TIMES[(entry.period - 1) as usize];
-            let end_minutes = (eh * 60 + em) as i32;
-            if current_minutes as i32 >= end_minutes {
-                days_ahead = 7;
-            }
-        }
-
-        let is_better = match &best {
-            None => true,
-            Some((_, bd, bs)) => days_ahead < *bd || (days_ahead == *bd && start_minutes < *bs),
-        };
-        if is_better {
-            best = Some((entry, days_ahead, start_minutes));
-        }
-    }
-
-    let tray = app.tray_by_id("main-tray").ok_or("tray not found")?;
-
-    if let Some((entry, days_ahead, start_minutes)) = best {
-        let sh = start_minutes / 60;
-        let sm = start_minutes % 60;
-        let (_, _, eh, em) = config::PERIOD_TIMES[(entry.period - 1) as usize];
-        let end_minutes = eh as i32 * 60 + em as i32;
-
-        let name: String = if entry.course_name.chars().count() > 18 {
-            entry
-                .course_name
-                .chars()
-                .take(17)
-                .chain(std::iter::once('\u{2026}'))
-                .collect()
-        } else {
-            entry.course_name.clone()
-        };
-
-        let time_label = if days_ahead == 0 {
-            if current_minutes as i32 >= start_minutes {
-                let left = end_minutes - current_minutes as i32;
-                format!("残{}分", left.max(0))
-            } else {
-                let diff = start_minutes - current_minutes as i32;
-                if diff <= 60 {
-                    format!("{}分後", diff)
-                } else {
-                    format!("今日 {}:{:02}", sh, sm)
-                }
-            }
-        } else if days_ahead == 1 {
-            format!("明日 {}:{:02}", sh, sm)
-        } else {
-            format!("{} {}:{:02}", config::day_label(&entry.day), sh, sm)
-        };
-
-        let _ = tray.set_tooltip(Some(&format!("{} | {}", time_label, name)));
-    } else {
-        let _ = tray.set_tooltip(Some("Selah"));
-    }
-
-    Ok(())
 }
 
 // ============ Tray Status Cycling ============

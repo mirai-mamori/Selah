@@ -19,7 +19,7 @@
     "@sveltejs/vite-plugin-svelte": "^7.0.0",
     "@tauri-apps/cli": "^2.10.1",
     "@types/node": "^25.5.2",
-    "esbuild": "^0.27.5",
+    "esbuild": "^0.28.1",
     "svelte": "^5.55.1",
     "typescript": "^6.0.2",
     "vite": "^8.0.3",
@@ -28,8 +28,6 @@
   "dependencies": {
     "@tauri-apps/api": "^2.10.1",
     "@tauri-apps/plugin-updater": "^2.10.1",
-    "@types/dompurify": "^3.0.5",
-    "@types/marked": "^5.0.2",
     "dompurify": "^3.3.3",
     "html-to-image": "^1.11.13",
     "marked": "^18.0.1"

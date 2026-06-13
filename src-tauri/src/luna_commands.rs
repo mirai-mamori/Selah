@@ -685,20 +685,6 @@ pub async fn luna_fetch_updates(
     .await
 }
 
-/// Fetch course content page
-#[tauri::command]
-pub async fn luna_fetch_course_content(
-    state: State<'_, LunaState>,
-    idnumber: String,
-) -> Result<String, String> {
-    if !is_safe_param(&idnumber) {
-        return Err("無効なパラメータです".into());
-    }
-    let http = luna_http(&state).await?;
-    let path = format!("/lms/contents?idnumber={}", idnumber);
-    luna_get(&http, &path).await
-}
-
 /// Fetch and parse a Luna detail page (any path)
 #[tauri::command]
 pub async fn luna_fetch_detail(

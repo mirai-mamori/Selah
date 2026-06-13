@@ -380,7 +380,6 @@ impl Database {
         Ok(conn.last_insert_rowid())
     }
 
-    #[allow(dead_code)]
     pub fn get_kgc_courses(&self, week_label: &str) -> Result<Vec<KgcCourseRow>, String> {
         let conn = self.conn.lock().map_err(|e| format!("DB lock: {}", e))?;
         Self::query_kgc_courses(&conn, week_label)
@@ -456,7 +455,6 @@ impl Database {
         Ok(conn.last_insert_rowid())
     }
 
-    #[allow(dead_code)]
     pub fn get_luna_courses(&self) -> Result<Vec<LunaCourseRow>, String> {
         let conn = self.conn.lock().map_err(|e| format!("DB lock: {}", e))?;
         Self::query_luna_courses(&conn)
@@ -530,7 +528,6 @@ impl Database {
         Ok(())
     }
 
-    #[allow(dead_code)]
     pub fn get_all_session_plans(&self) -> Result<Vec<(String, Vec<SessionPlanRow>)>, String> {
         let conn = self.conn.lock().map_err(|e| format!("DB lock: {}", e))?;
         Self::query_all_session_plans(&conn)
@@ -616,12 +613,6 @@ impl Database {
         Ok(())
     }
 
-    #[allow(dead_code)]
-    pub fn get_all_kgc_course_details(&self) -> Result<Vec<KgcCourseDetailRow>, String> {
-        let conn = self.conn.lock().map_err(|e| format!("DB lock: {}", e))?;
-        Self::query_all_kgc_course_details(&conn)
-    }
-
     pub fn get_kgc_course_detail(
         &self,
         kgc_code: &str,
@@ -688,7 +679,6 @@ impl Database {
         Ok(())
     }
 
-    #[allow(dead_code)]
     pub fn get_all_luna_counts(&self) -> Result<Vec<(String, LunaCountsRow)>, String> {
         let conn = self.conn.lock().map_err(|e| format!("DB lock: {}", e))?;
         Self::query_all_luna_counts(&conn)
@@ -753,7 +743,6 @@ impl Database {
         Ok(())
     }
 
-    #[allow(dead_code)]
     pub fn get_all_luna_activities(&self) -> Result<Vec<LunaActivityRow>, String> {
         let conn = self.conn.lock().map_err(|e| format!("DB lock: {}", e))?;
         Self::query_all_luna_activities(&conn)
@@ -979,17 +968,6 @@ impl Database {
             .map_err(|e| format!("DB delete msgs: {}", e))?;
         conn.execute("DELETE FROM agent_conversations WHERE id=?1", params![id])
             .map_err(|e| format!("DB delete conv: {}", e))?;
-        Ok(())
-    }
-
-    #[allow(dead_code)]
-    pub fn agent_touch_conversation(&self, id: &str) -> Result<(), String> {
-        let conn = self.conn.lock().map_err(|e| format!("DB lock: {}", e))?;
-        conn.execute(
-            "UPDATE agent_conversations SET updated_at=?2 WHERE id=?1",
-            params![id, epoch_secs()],
-        )
-        .map_err(|e| format!("DB touch: {}", e))?;
         Ok(())
     }
 

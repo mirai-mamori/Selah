@@ -777,7 +777,7 @@ fn notify_tab_activated(app: &tauri::AppHandle, owner: &str, tab: &DocumentTab) 
         // Make the freshly activated content webview the key responder so clicks
         // and keyboard input land on the page, not the (now hidden) old tab.
         let _ = webview.set_focus();
-        if let Err(err) = webview.eval(&activation_probe_script(owner, tab)) {
+        if let Err(err) = webview.eval(activation_probe_script(owner, tab)) {
             log::warn!(
                 "document tab activation probe failed owner={} target={} kind={} err={}",
                 owner,
@@ -1100,7 +1100,7 @@ fn open_tab(
         // Browser tabs start with a host-name placeholder title; pull the real
         // <title> from the loaded page and reflect it on the tab.
         if finished {
-            let _ = webview.eval(&title_report_script(&target_for_load));
+            let _ = webview.eval(title_report_script(&target_for_load));
         }
     });
 
@@ -1944,43 +1944,6 @@ pub fn document_tabs_close_pane(
 }
 
 #[tauri::command]
-pub fn document_tabs_resize_split(
-    app: tauri::AppHandle,
-    owner: Option<String>,
-    parent: Option<String>,
-    ratios: Vec<f64>,
-) -> Result<Vec<f64>, String> {
-    let owner = owner.unwrap_or_else(|| OWNER_LABEL.to_string());
-    let parent_id = match parent {
-        Some(id) => id,
-        None => active_tab_for_owner(&owner)
-            .map(|tab| tab.id)
-            .ok_or_else(|| "アクティブなタブがありません".to_string())?,
-    };
-    let applied = {
-        let mut states = DOCUMENT_WINDOWS.lock().unwrap_or_else(|e| e.into_inner());
-        let state = states
-            .get_mut(&owner)
-            .ok_or_else(|| format!("タブウィンドウが見つかりません: {}", owner))?;
-        let tab = state
-            .tabs
-            .iter_mut()
-            .find(|tab| tab.id == parent_id || tab.target == parent_id || tab.label == parent_id)
-            .ok_or_else(|| format!("タブが見つかりません: {}", parent_id))?;
-        let columns = 1 + pane_chain(&tab.child).len();
-        if columns <= 1 {
-            return Err("分割ペインがありません".to_string());
-        }
-        let next = clamped_split_weights(&ratios, columns);
-        tab.split_weights = next.clone();
-        next
-    };
-    resize_current_for_owner(&app, &owner)?;
-    emit_tabs_changed(&app, &owner);
-    Ok(applied)
-}
-
-#[tauri::command]
 pub fn document_tabs_drag_split(
     app: tauri::AppHandle,
     owner: Option<String>,
@@ -2173,11 +2136,6 @@ pub fn document_tabs_open_agent(
     } else {
         open_agent_workspace(&app)
     }
-}
-
-#[tauri::command]
-pub fn document_tabs_close_agent(app: tauri::AppHandle) -> Result<(), String> {
-    close_agent_panel(&app)
 }
 
 #[tauri::command]

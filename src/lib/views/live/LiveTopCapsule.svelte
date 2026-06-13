@@ -18,6 +18,7 @@
     canStart: boolean;
     canStartFreeNote: boolean;
     canStop: boolean;
+    canGenerateOverallSummary: boolean;
     sttListening: boolean;
     sttBooting: boolean;
     confirmClear: boolean;
@@ -29,6 +30,7 @@
     onCancelClear: () => void;
     onConfirmClear: () => void;
     onStopLive: () => void;
+    onGenerateOverallSummary: () => void;
     onPauseLive: () => void;
     onResumeLive: () => void;
   }
@@ -48,6 +50,7 @@
     canStart,
     canStartFreeNote,
     canStop,
+    canGenerateOverallSummary,
     sttListening,
     sttBooting,
     confirmClear,
@@ -59,6 +62,7 @@
     onCancelClear,
     onConfirmClear,
     onStopLive,
+    onGenerateOverallSummary,
     onPauseLive,
     onResumeLive,
   }: Props = $props();
@@ -120,6 +124,9 @@
           </div>
         {/if}
       {:else}
+        <button class="capsule-act ghost note" onclick={onGenerateOverallSummary} disabled={!canGenerateOverallSummary}>
+          全体要約
+        </button>
         <button class="capsule-act stop" onclick={onStopLive} disabled={!canStop}>
           <svg width="10" height="10" viewBox="0 0 24 24" fill="currentColor"><rect x="4" y="4" width="16" height="16" rx="2"/></svg>
           保存

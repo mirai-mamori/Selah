@@ -536,9 +536,10 @@
         return;
       } catch (e) {
         console.error("Failed to open Luna detail:", e);
+        return;
       }
     }
-    // Fallback to KG-Course
+    // Use KG-Course only when no Luna detail is available.
     if (entry.detail_path) {
       try {
         await invoke("open_detail_window", { path: entry.detail_path, courseName: entry.name });

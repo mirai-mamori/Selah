@@ -2,6 +2,11 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { openExternalUrl } from "./system";
 import { startTrayStatus, stopTrayStatus } from "./trayStatus";
+import {
+  DETAIL_GENERATED_TODO_KEY,
+  LIVE_GENERATED_TODO_KEY,
+  repairMailSourceUrl,
+} from "./generatedTodoSupport";
 import type {
   GradesData,
   CancellationsData,
@@ -17,7 +22,7 @@ import type {
   AiChatMessage,
 } from "./stores";
 import type { ScheduleResponse, AiScheduleResult, AiTodoAnalysis, LunaTodoItem } from "./types";
-import { authState, lunaAuthState, kwicAuthState, mailAuthState, gcalAuthState, invalidateCache, reloginInProgress, sessionExpired, refreshCache, refreshBackendManagedCache, registerTask, updateTask, updateTaskInterval, cacheStatus, aiNotifStore, aiTodoStore, aiRefreshing, aiReady, agentReady, activeTab, activeSettingsPanel, replaceCacheEntry, getCached, requestedMailMessageId } from "./stores";
+import { authState, lunaAuthState, kwicAuthState, mailAuthState, gcalAuthState, invalidateCache, reloginInProgress, sessionExpired, refreshBackendManagedCache, registerTask, updateTask, updateTaskInterval, cacheStatus, aiNotifStore, aiTodoStore, aiRefreshing, aiReady, agentReady, activeTab, activeSettingsPanel, replaceCacheEntry, getCached, requestedMailMessageId } from "./stores";
 import type { RefreshItemStatus } from "./stores";
 import { get } from "svelte/store";
 
@@ -1792,8 +1797,6 @@ export interface LiveGeneratedTodo extends LiveTodoSuggestion {
 }
 
 const DEMO_LIVE_KEY = "selah-demo-live-session";
-const LIVE_GENERATED_TODO_KEY = "live_generated_todo";
-
 function emptyDemoLiveSession(): LiveSessionSnapshot {
   return {
     active: false,
@@ -1952,6 +1955,15 @@ export async function liveFlushSummary(force: boolean = false): Promise<LiveSess
   return invoke<LiveSessionSnapshot>("live_flush_summary", { force });
 }
 
+export async function liveGenerateOverallSummary(): Promise<string> {
+  if (_isDemo()) {
+    const snapshot = await liveFlushSummary(true);
+    const content = snapshot.transcript_lines.map((line) => line.text).join(" / ");
+    return `### 全体要約\n${content || "このセッションの内容はまだありません。"}\n\n### 今回の論点\n- 現在までの文字起こし全体を対象に生成したデモ要約`;
+  }
+  return invoke<string>("live_generate_overall_summary");
+}
+
 export async function liveCancelSession(): Promise<void> {
   if (_isDemo()) {
     saveDemoLiveSession(emptyDemoLiveSession());
@@ -2026,47 +2038,6 @@ async function readGeneratedTodos<T>(cacheKey: string): Promise<T[]> {
   } catch {
     return [];
   }
-}
-
-function commonAsciiSuffixLength(left: string, right: string): number {
-  let count = 0;
-  let i = left.length - 1;
-  let j = right.length - 1;
-  while (i >= 0 && j >= 0 && left.charCodeAt(i) === right.charCodeAt(j)) {
-    count += 1;
-    i -= 1;
-    j -= 1;
-  }
-  return count;
-}
-
-function hasMatchingIdPrefix(partial: string, full: string): boolean {
-  const prefixLength = Math.min(partial.length, 24);
-  return prefixLength >= 8 && full.startsWith(partial.slice(0, prefixLength));
-}
-
-function repairMailSourceUrl(sourceUrl: string, messages: MailMessage[]): string {
-  const trimmed = (sourceUrl || "").trim();
-  if (!trimmed.startsWith("mail://")) return trimmed;
-  const id = trimmed.slice("mail://".length).trim();
-  if (!id || messages.some((msg) => msg.id === id)) return trimmed;
-
-  let bestId = "";
-  let bestScore = 0;
-  let tied = false;
-  for (const msg of messages) {
-    if (!hasMatchingIdPrefix(id, msg.id)) continue;
-    const score = commonAsciiSuffixLength(id, msg.id);
-    if (score < 12) continue;
-    if (score === bestScore) {
-      tied = true;
-    } else if (score > bestScore) {
-      bestId = msg.id;
-      bestScore = score;
-      tied = false;
-    }
-  }
-  return bestId && !tied ? `mail://${bestId}` : trimmed;
 }
 
 async function repairDetailGeneratedTodoSourceUrls(items: DetailGeneratedTodo[]): Promise<DetailGeneratedTodo[]> {
@@ -2258,8 +2229,6 @@ export async function deleteLiveGeneratedTodo(id: string): Promise<void> {
 }
 
 // ── 詳細TODO (AI extracted from Luna 消息/課題/通知) ────────────────────────
-
-const DETAIL_GENERATED_TODO_KEY = "detail_generated_todo";
 
 export interface DetailGeneratedTodo extends DetailTodoSuggestion {
   id: string;

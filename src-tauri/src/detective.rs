@@ -2511,7 +2511,7 @@ fn apply_ai_case_draft(
         });
     case.title = title;
 
-    case.session_num = draft.session_num.unwrap_or(0).max(0).min(99) as u8;
+    case.session_num = draft.session_num.unwrap_or(0).clamp(0, 99) as u8;
 
     case.generation_mode = "ai".to_string();
     Ok(case)

@@ -1,6 +1,11 @@
-import { writable, get } from "svelte/store";
+import { writable } from "svelte/store";
 import { invoke } from "@tauri-apps/api/core";
 import { setAppTheme } from "./system";
+import {
+  DETAIL_GENERATED_TODO_KEY,
+  LIVE_GENERATED_TODO_KEY,
+  repairMailSourceUrl,
+} from "./generatedTodoSupport";
 
 interface AuthState {
   authenticated: boolean;
@@ -557,9 +562,6 @@ function saveDiskCache(key: string, data: any, ts: number) {
 
 // SWR update listeners: components subscribe to be notified when background refresh completes
 const swrListeners = new Map<string, Set<(data: any) => void>>();
-const LIVE_GENERATED_TODO_KEY = "live_generated_todo";
-const DETAIL_GENERATED_TODO_KEY = "detail_generated_todo";
-
 export function onCacheUpdate<T>(key: string, cb: (data: T) => void): () => void {
   if (!swrListeners.has(key)) swrListeners.set(key, new Set());
   swrListeners.get(key)!.add(cb as (data: any) => void);
@@ -623,48 +625,6 @@ async function loadLiveGeneratedTodos(): Promise<any[]> {
   } catch {
     return [];
   }
-}
-
-function commonAsciiSuffixLength(left: string, right: string): number {
-  let count = 0;
-  let i = left.length - 1;
-  let j = right.length - 1;
-  while (i >= 0 && j >= 0 && left.charCodeAt(i) === right.charCodeAt(j)) {
-    count += 1;
-    i -= 1;
-    j -= 1;
-  }
-  return count;
-}
-
-function hasMatchingIdPrefix(partial: string, full: string): boolean {
-  const prefixLength = Math.min(partial.length, 24);
-  return prefixLength >= 8 && full.startsWith(partial.slice(0, prefixLength));
-}
-
-function repairMailSourceUrl(sourceUrl: string, messages: any[]): string {
-  const trimmed = String(sourceUrl || "").trim();
-  if (!trimmed.startsWith("mail://")) return trimmed;
-  const id = trimmed.slice("mail://".length).trim();
-  if (!id || messages.some((msg) => msg?.id === id)) return trimmed;
-
-  let bestId = "";
-  let bestScore = 0;
-  let tied = false;
-  for (const msg of messages) {
-    const candidate = String(msg?.id || "");
-    if (!hasMatchingIdPrefix(id, candidate)) continue;
-    const score = commonAsciiSuffixLength(id, candidate);
-    if (score < 12) continue;
-    if (score === bestScore) {
-      tied = true;
-    } else if (score > bestScore) {
-      bestId = candidate;
-      bestScore = score;
-      tied = false;
-    }
-  }
-  return bestId && !tied ? `mail://${bestId}` : trimmed;
 }
 
 async function repairDetailGeneratedTodoSourceUrls(items: any[]): Promise<any[]> {

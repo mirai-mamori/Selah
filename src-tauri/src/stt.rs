@@ -1035,7 +1035,7 @@ fn decode_samples(recognizer: &OfflineRecognizer, sample_rate: i32, samples: &[f
 
 fn read_f32_samples(path: &Path) -> Result<Vec<f32>, String> {
     let bytes = std::fs::read(path).map_err(|e| format!("STT helper sample read failed: {e}"))?;
-    if bytes.len() % 4 != 0 {
+    if !bytes.len().is_multiple_of(4) {
         return Err("STT helper sample file is not aligned to f32".into());
     }
     f32_samples_from_bytes(&bytes)
@@ -1050,7 +1050,7 @@ fn f32_samples_to_base64(samples: &[f32]) -> String {
 }
 
 fn f32_samples_from_bytes(bytes: &[u8]) -> Result<Vec<f32>, String> {
-    if bytes.len() % 4 != 0 {
+    if !bytes.len().is_multiple_of(4) {
         return Err("STT helper sample payload is not aligned to f32".into());
     }
     Ok(bytes

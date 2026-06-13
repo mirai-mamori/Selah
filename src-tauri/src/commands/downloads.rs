@@ -535,15 +535,6 @@ pub fn delete_downloaded_files(paths: Vec<String>) -> Result<DuplicateCleanupRes
 }
 
 #[tauri::command]
-pub fn check_file_downloaded(
-    filename: String,
-    course_name: Option<String>,
-) -> Option<DownloadRecord> {
-    let records = load_download_history();
-    find_downloaded_record(&records, &filename, course_name.as_deref())
-}
-
-#[tauri::command]
 pub fn check_files_downloaded(
     filenames: Vec<String>,
     course_name: Option<String>,
