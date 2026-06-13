@@ -173,6 +173,20 @@ fn is_okta_login_page(url: &url::Url) -> bool {
     OKTA_HOSTS.contains(&host)
 }
 
+#[derive(Debug, PartialEq, Eq)]
+enum HeadlessSamlPageState {
+    Complete,
+    Continue,
+}
+
+fn headless_saml_page_state(url: &url::Url, sp_host: &str) -> HeadlessSamlPageState {
+    if is_post_saml_sp_url(url, sp_host) {
+        HeadlessSamlPageState::Complete
+    } else {
+        HeadlessSamlPageState::Continue
+    }
+}
+
 /// Back up the current SSO/Okta cookies (kwansei.ac.jp family) from the webview
 /// store to the keychain. Called after a successful login or headless refresh
 /// so the stored device token always reflects the latest session. A read that
@@ -256,7 +270,7 @@ pub async fn headless_saml_window(
         let _ = w.close();
     }
 
-    let (tx, mut rx) = tokio::sync::mpsc::channel::<bool>(1);
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<()>(1);
 
     let parsed_url: url::Url = saml_url
         .parse()
@@ -277,35 +291,37 @@ pub async fn headless_saml_window(
             return;
         }
         let url = payload.url();
-        if is_post_saml_sp_url(url, &sp_domain_owned) {
-            log::info!("{}: page loaded on SP domain", label_for_log);
-            let _ = tx.try_send(true);
-        } else if is_okta_login_page(url) {
-            log::info!(
-                "{}: Okta login page detected - session expired",
-                label_for_log
-            );
-            let _ = tx.try_send(false);
+        match headless_saml_page_state(url, &sp_domain_owned) {
+            HeadlessSamlPageState::Complete => {
+                log::info!("{}: page loaded on SP domain", label_for_log);
+                let _ = tx.try_send(());
+            }
+            HeadlessSamlPageState::Continue if is_okta_login_page(url) => {
+                log::info!(
+                    "{}: Okta page detected; waiting for automatic SSO continuation",
+                    label_for_log
+                );
+            }
+            HeadlessSamlPageState::Continue => {}
         }
     })
     .build()
     .map_err(|e| format!("Failed to build headless window '{}': {}", window_label, e))?;
 
     match tokio::time::timeout(std::time::Duration::from_secs(timeout_secs), rx.recv()).await {
-        Ok(Some(true)) => {
+        Ok(Some(())) => {
             tokio::time::sleep(std::time::Duration::from_millis(500)).await;
             Ok(Some(win))
-        }
-        Ok(Some(false)) => {
-            let _ = win.close();
-            Ok(None)
         }
         Ok(None) => {
             log::info!("{}: window closed without completing", window_label);
             Ok(None)
         }
         Err(_) => {
-            log::info!("{}: timed out - Okta session likely expired", window_label);
+            log::info!(
+                "{}: timed out waiting for automatic SSO continuation",
+                window_label
+            );
             let _ = win.close();
             Ok(None)
         }
@@ -314,7 +330,10 @@ pub async fn headless_saml_window(
 
 #[cfg(test)]
 mod tests {
-    use super::{is_backupable_sso_cookie, is_university_cookie};
+    use super::{
+        headless_saml_page_state, is_backupable_sso_cookie, is_university_cookie,
+        HeadlessSamlPageState,
+    };
 
     #[test]
     fn sso_backup_excludes_service_provider_cookies() {
@@ -337,5 +356,21 @@ mod tests {
         assert!(is_university_cookie("luna.kwansei.ac.jp"));
         assert!(is_university_cookie("kwic.kwansei.ac.jp"));
         assert!(!is_university_cookie("example.com"));
+    }
+
+    #[test]
+    fn headless_saml_waits_through_okta_before_service_redirect() {
+        let okta = url::Url::parse("https://sso.kwansei.ac.jp/login").unwrap();
+        let kgc =
+            url::Url::parse("https://kg-course.kwansei.ac.jp/uniasv2/UnSSOLoginControl2").unwrap();
+
+        assert_eq!(
+            headless_saml_page_state(&okta, "kg-course.kwansei.ac.jp"),
+            HeadlessSamlPageState::Continue
+        );
+        assert_eq!(
+            headless_saml_page_state(&kgc, "kg-course.kwansei.ac.jp"),
+            HeadlessSamlPageState::Complete
+        );
     }
 }

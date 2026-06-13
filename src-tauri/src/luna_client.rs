@@ -5,7 +5,7 @@ use crate::client::{
     build_http_client, data_dir, load_cookie_jar, new_cookie_client, save_cookie_jar,
 };
 
-const LUNA_COOKIES_FILE: &str = "luna_cookies.json";
+pub(crate) const LUNA_COOKIES_FILE: &str = "luna_cookies.json";
 
 /// Check if Luna response body indicates session expired
 pub(crate) fn is_luna_session_expired(body: &str) -> bool {

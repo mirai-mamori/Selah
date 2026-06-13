@@ -84,7 +84,8 @@ impl AgentProvider {
         }
         match cfg.provider.as_str() {
             "local" => Self::resolve_local(&cfg),
-            "openai" | "gemini" => Ok(Self::Remote { config: cfg }),
+            // OpenRouter is OpenAI-compatible, so it routes through the OpenAI path.
+            "openai" | "openrouter" | "gemini" => Ok(Self::Remote { config: cfg }),
             other => Err(AgentError::config(format!("不明なプロバイダー: {}", other))),
         }
     }

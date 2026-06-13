@@ -154,6 +154,18 @@ pub async fn get_session_states(
     Ok(SessionStates { kgc, luna, kwic })
 }
 
+#[tauri::command]
+pub fn get_saved_cookie_summaries() -> Vec<client::SavedCookieSummary> {
+    [
+        ("kgc", client::COOKIES_FILE),
+        ("luna", luna_client::LUNA_COOKIES_FILE),
+        ("kwic", kwic_client::KWIC_COOKIES_FILE),
+    ]
+    .into_iter()
+    .map(|(service, filename)| client::saved_cookie_summary(service, filename))
+    .collect()
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn headless_saml_refresh(
     app: &tauri::AppHandle,

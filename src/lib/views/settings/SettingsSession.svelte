@@ -2,6 +2,7 @@
   import { onDestroy, onMount } from "svelte";
   import {
     isDemoActive,
+    getSavedCookieSummaries,
     getStoredSessionStates,
     lunaCheckSession,
     kwicCheckSession,
@@ -9,6 +10,7 @@
     serviceRegistry,
     syncSession,
     validateSession,
+    type SavedCookieSummary,
   } from "../../api";
 
   type SvcState = { state: "loading" | "saved" | "ok" | "ng" | "error"; label: string };
@@ -25,6 +27,8 @@
   let resetArmed = $state(false);
   let statusMsg = $state("");
   let statusColor = $state("");
+  let cookieSummaries = $state<SavedCookieSummary[]>([]);
+  let cookieSummaryError = $state(false);
   let resetTimer: ReturnType<typeof setTimeout> | null = null;
 
   let disconnectedCore = $derived([
@@ -99,6 +103,7 @@
       clearStatusLater();
     } finally {
       checkBusy = false;
+      await loadCookieSummaries();
     }
   }
 
@@ -119,6 +124,37 @@
       luna = { state: "error", label: "状態を読み込めません" };
       kwic = { state: "error", label: "状態を読み込めません" };
     }
+  }
+
+  async function loadCookieSummaries() {
+    cookieSummaryError = false;
+    try {
+      cookieSummaries = await getSavedCookieSummaries();
+    } catch {
+      cookieSummaries = [];
+      cookieSummaryError = true;
+    }
+  }
+
+  function cookieSummary(service: ServiceKey): SavedCookieSummary | undefined {
+    return cookieSummaries.find(summary => summary.service === service);
+  }
+
+  function formatDateTime(timestamp: number | null): string {
+    if (!timestamp) return "記録なし";
+    return new Intl.DateTimeFormat("ja-JP", {
+      year: "numeric",
+      month: "2-digit",
+      day: "2-digit",
+      hour: "2-digit",
+      minute: "2-digit",
+    }).format(new Date(timestamp * 1000));
+  }
+
+  function expiryLabel(summary: SavedCookieSummary): string {
+    if (summary.active_cookie_count === 0) return "保存内容なし";
+    if (summary.earliest_expiry_at) return formatDateTime(summary.earliest_expiry_at);
+    return "固定期限なし";
   }
 
   function setRepairing(service: ServiceKey) {
@@ -166,6 +202,7 @@
       }
     } finally {
       repairBusy = false;
+      await loadCookieSummaries();
       clearStatusLater();
     }
   }
@@ -201,6 +238,7 @@
       }
     } finally {
       kgcRefreshBusy = false;
+      await loadCookieSummaries();
       clearStatusLater();
     }
   }
@@ -254,6 +292,7 @@
       statusMsg = "失敗: " + String(e);
     } finally {
       resetBusy = false;
+      await loadCookieSummaries();
       clearStatusLater();
     }
   }
@@ -261,6 +300,7 @@
   onMount(() => {
     void (async () => {
       await loadStoredStates();
+      await loadCookieSummaries();
       await checkAll(false);
     })();
   });
@@ -331,6 +371,37 @@
   </div>
 </div>
 
+<div class="card-label">保存済み Cookie の概要</div>
+<div class="card cookie-summary-card">
+  {#each [
+    { key: "kgc" as const, label: "KG Course" },
+    { key: "luna" as const, label: "Luna LMS" },
+    { key: "kwic" as const, label: "KWIC Portal" },
+  ] as service}
+    {@const summary = cookieSummary(service.key)}
+    <div class="cookie-summary-row">
+      <strong class="cookie-service-name">{service.label}</strong>
+      <div class="cookie-summary-detail">
+        {#if summary?.saved}
+          <span>{formatDateTime(summary.saved_at)}</span>
+          <span>{summary.active_cookie_count} 件{summary.session_cookie_count ? `（セッション型 ${summary.session_cookie_count} 件）` : ""}</span>
+          <span>期限: {expiryLabel(summary)}</span>
+        {:else}
+          <span>保存内容なし</span>
+        {/if}
+      </div>
+      <span class:saved={summary?.saved} class="cookie-save-state">
+        {summary?.saved ? "保存済み" : "未保存"}
+      </span>
+    </div>
+  {/each}
+  {#if cookieSummaryError}
+    <div class="hint cookie-summary-error">Cookie の概要を読み込めませんでした。</div>
+  {:else}
+    <div class="hint cookie-summary-note">Cookie の名前・値・ドメイン・パスなどの認証情報は表示しません。</div>
+  {/if}
+</div>
+
 <div class:ready={coreReady} class:stored={!coreReady && coreStored} class="core-summary">
   <strong>{coreReady ? "主要サービスは利用可能です" : coreStored ? "主要サービスのセッションは保存されています" : "主要サービスの状態を確認してください"}</strong>
   <span>{coreReady ? "KG Course が切れていても通常利用を継続できます。" : coreStored ? "保存済みの状態を確認しています。" : "Luna または KWIC が未接続の場合は、主要サービスの復旧を試してください。"}</span>
@@ -359,6 +430,58 @@
     font-size: 10px;
     font-weight: 650;
     vertical-align: 2px;
+  }
+  .cookie-summary-card {
+    overflow: hidden;
+  }
+  .cookie-summary-row {
+    display: grid;
+    grid-template-columns: minmax(110px, 0.7fr) minmax(0, 2fr) auto;
+    align-items: center;
+    gap: 12px;
+    padding: 10px 14px;
+    border-bottom: 1px solid var(--border);
+  }
+  .cookie-service-name {
+    font-size: 12px;
+  }
+  .cookie-summary-detail {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 3px 12px;
+    min-width: 0;
+    color: var(--text-secondary);
+    font-size: 10.5px;
+  }
+  .cookie-summary-detail span {
+    white-space: nowrap;
+  }
+  .cookie-save-state {
+    justify-self: end;
+    color: var(--text-secondary);
+    font-size: 10px;
+    font-weight: 650;
+    white-space: nowrap;
+  }
+  .cookie-save-state.saved {
+    color: var(--green, #34c759);
+  }
+  .cookie-summary-note,
+  .cookie-summary-error {
+    display: block;
+    padding: 10px 14px;
+  }
+  .cookie-summary-error {
+    color: var(--orange, #ff9500);
+  }
+  @media (max-width: 700px) {
+    .cookie-summary-row {
+      grid-template-columns: 1fr auto;
+    }
+    .cookie-summary-detail {
+      grid-column: 1 / -1;
+      grid-row: 2;
+    }
   }
   .service-role.core {
     color: var(--green, #34c759);

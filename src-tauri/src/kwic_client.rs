@@ -5,7 +5,7 @@ use crate::client::{
     build_http_client, data_dir, load_cookie_jar, new_cookie_client, save_cookie_jar,
 };
 
-const KWIC_COOKIES_FILE: &str = "kwic_portal_cookies.json";
+pub(crate) const KWIC_COOKIES_FILE: &str = "kwic_portal_cookies.json";
 
 /// Check if KWIC Portal response indicates session expired
 pub(crate) fn is_kwic_session_expired(body: &str) -> bool {

@@ -37,7 +37,7 @@ pub(crate) fn ceil_char_boundary(s: &str, byte_pos: usize) -> usize {
 }
 
 const SESSION_FILE: &str = "session.json";
-const COOKIES_FILE: &str = "cookies.json";
+pub(crate) const COOKIES_FILE: &str = "cookies.json";
 
 pub(crate) const USER_AGENT: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15";
 
@@ -151,8 +151,7 @@ pub(crate) fn data_dir() -> std::path::PathBuf {
 pub(crate) fn save_cookie_jar(store: &reqwest_cookie_store::CookieStoreMutex, filename: &str) {
     let dir = data_dir();
     let store = store.lock().unwrap_or_else(|e| e.into_inner());
-    let mut buf = Vec::new();
-    if cookie_store::serde::json::save(&store, &mut buf).is_ok() {
+    if let Ok(buf) = serialize_unexpired_cookie_jar(&store) {
         let path = dir.join(filename);
         if let Err(e) = std::fs::write(&path, &buf) {
             log::warn!("Failed to save cookies ({}): {}", filename, e);
@@ -168,6 +167,17 @@ pub(crate) fn save_cookie_jar(store: &reqwest_cookie_store::CookieStoreMutex, fi
     }
 }
 
+/// Serialize unexpired persistent and session cookies. The cookie_store default
+/// serializer intentionally drops session cookies, which breaks app restart recovery.
+fn serialize_unexpired_cookie_jar(
+    store: &cookie_store::CookieStore,
+) -> Result<Vec<u8>, serde_json::Error> {
+    let cookies: Vec<_> = store.iter_unexpired().cloned().collect();
+    let mut buf = serde_json::to_vec_pretty(&cookies)?;
+    buf.push(b'\n');
+    Ok(buf)
+}
+
 /// Load a cookie jar from a JSON file in the data directory.
 /// Returns None if the file doesn't exist or can't be parsed.
 pub(crate) fn load_cookie_jar(filename: &str) -> Option<cookie_store::CookieStore> {
@@ -175,11 +185,94 @@ pub(crate) fn load_cookie_jar(filename: &str) -> Option<cookie_store::CookieStor
     let file = std::fs::File::open(&path).ok()?;
     let reader = std::io::BufReader::new(file);
     match cookie_store::serde::json::load(reader) {
-        Ok(store) => Some(store),
+        Ok(store) if store.iter_unexpired().next().is_some() => Some(store),
+        Ok(_) => None,
         Err(e) => {
             log::warn!("Failed to load cookies ({}): {}", filename, e);
             None
         }
+    }
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct SavedCookieSummary {
+    pub service: String,
+    pub saved: bool,
+    pub saved_at: Option<i64>,
+    pub active_cookie_count: usize,
+    pub session_cookie_count: usize,
+    pub earliest_expiry_at: Option<i64>,
+}
+
+/// Return only non-sensitive aggregate information about a persisted cookie jar.
+/// Cookie names, values, domains, and paths never leave the backend.
+pub(crate) fn saved_cookie_summary(service: &str, filename: &str) -> SavedCookieSummary {
+    let path = data_dir().join(filename);
+    let saved_at = path
+        .metadata()
+        .ok()
+        .and_then(|metadata| metadata.modified().ok())
+        .and_then(|modified| modified.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|duration| duration.as_secs() as i64);
+
+    let Some(store) = load_cookie_jar(filename) else {
+        return SavedCookieSummary {
+            service: service.to_string(),
+            saved: false,
+            saved_at,
+            active_cookie_count: 0,
+            session_cookie_count: 0,
+            earliest_expiry_at: None,
+        };
+    };
+
+    let mut active_cookie_count = 0;
+    let mut session_cookie_count = 0;
+    let mut earliest_expiry_at: Option<i64> = None;
+    for cookie in store.iter_unexpired() {
+        active_cookie_count += 1;
+        match &cookie.expires {
+            cookie_store::CookieExpiration::AtUtc(expiry) => {
+                let timestamp = expiry.unix_timestamp();
+                earliest_expiry_at =
+                    Some(earliest_expiry_at.map_or(timestamp, |current| current.min(timestamp)));
+            }
+            cookie_store::CookieExpiration::SessionEnd => session_cookie_count += 1,
+        }
+    }
+
+    SavedCookieSummary {
+        service: service.to_string(),
+        saved: active_cookie_count > 0,
+        saved_at,
+        active_cookie_count,
+        session_cookie_count,
+        earliest_expiry_at,
+    }
+}
+
+#[cfg(test)]
+mod cookie_persistence_tests {
+    use super::serialize_unexpired_cookie_jar;
+
+    #[test]
+    fn persisted_cookie_json_keeps_session_cookies() {
+        let mut store = cookie_store::CookieStore::default();
+        let url = url::Url::parse("https://example.com").unwrap();
+        store
+            .insert_raw(
+                &cookie_store::RawCookie::build(("session", "secret"))
+                    .path("/")
+                    .build(),
+                &url,
+            )
+            .unwrap();
+
+        let buf = serialize_unexpired_cookie_jar(&store).unwrap();
+        let restored = cookie_store::serde::json::load(std::io::BufReader::new(buf.as_slice()))
+            .expect("session cookie JSON should load");
+
+        assert_eq!(restored.iter_unexpired().count(), 1);
     }
 }
 

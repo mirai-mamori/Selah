@@ -35,7 +35,7 @@
   let purposes = $state<OnboardingPurpose[]>([]);
 
   // AI step state
-  type Provider = "openai" | "gemini";
+  type Provider = "openai" | "openrouter" | "gemini";
   let provider = $state<Provider>("openai");
   let apiKey = $state("");
   let testing = $state(false);
@@ -49,6 +49,12 @@
       baseUrl: "https://api.openai.com/v1",
       keyUrl: "https://platform.openai.com/api-keys",
       hint: "OpenAI API キーは platform.openai.com で取得できます。",
+    },
+    openrouter: {
+      model: "moonshotai/kimi-k2.6",
+      baseUrl: "https://openrouter.ai/api/v1",
+      keyUrl: "https://openrouter.ai/keys",
+      hint: "OpenRouter の API キーは openrouter.ai/keys で取得できます。1つのキーで Kimi・Claude・MiniMax 等を利用できます。",
     },
     gemini: {
       model: "gemini-3-flash-preview",
@@ -372,6 +378,10 @@
               <div class="provider-name">OpenAI <span class="badge">推奨</span></div>
               <div class="provider-desc">GPT-5.4 系。応答が速く、ほとんどの機能で安定して動作します。</div>
             </button>
+            <button class="provider-card" class:selected={provider === "openrouter"} onclick={() => { provider = "openrouter"; }}>
+              <div class="provider-name">OpenRouter</div>
+              <div class="provider-desc">1つのキーで Kimi・Claude・MiniMax 等を切替。多くが画像認識に対応。</div>
+            </button>
             <button class="provider-card" class:selected={provider === "gemini"} onclick={() => { provider = "gemini"; }}>
               <div class="provider-name">Google Gemini</div>
               <div class="provider-desc">無料枠あり。日本語の長文要約に強い傾向があります。</div>
@@ -386,7 +396,7 @@
             <input
               type="password"
               bind:value={apiKey}
-              placeholder={provider === "openai" ? "sk-..." : "AIza..."}
+              placeholder={provider === "gemini" ? "AIza..." : "sk-..."}
               autocomplete="off"
               spellcheck="false"
             />

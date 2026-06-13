@@ -427,6 +427,20 @@ export async function getStoredSessionStates(): Promise<SessionStates> {
   return invoke<SessionStates>("get_session_states");
 }
 
+export interface SavedCookieSummary {
+  service: "kgc" | "luna" | "kwic";
+  saved: boolean;
+  saved_at: number | null;
+  active_cookie_count: number;
+  session_cookie_count: number;
+  earliest_expiry_at: number | null;
+}
+
+export async function getSavedCookieSummaries(): Promise<SavedCookieSummary[]> {
+  if (_isDemo()) return [];
+  return invoke<SavedCookieSummary[]>("get_saved_cookie_summaries");
+}
+
 /** Only one sync per key runs at once. All SAML work is also serialized through
  * `_samlSyncTail`, because the services share one upstream identity provider. */
 const _syncInFlight = new Map<string, Promise<boolean>>();

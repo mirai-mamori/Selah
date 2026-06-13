@@ -1580,6 +1580,9 @@ async fn run_browser_action_tool(
     let action_label = browser_action_label(&action);
     let status_guard =
         crate::webview_toolbar::BrowserAgentStatusGuard::start(app, target, &action_label);
+    let url_before = crate::webview_toolbar::browser_get_url(app.clone(), target.to_string())
+        .await
+        .unwrap_or_default();
     let action_result =
         crate::webview_toolbar::run_browser_action(app, target, &action, timeout_ms).await;
     let result = action_result?;
@@ -1592,6 +1595,12 @@ async fn run_browser_action_tool(
     let current_url = crate::webview_toolbar::browser_get_url(app.clone(), target.to_string())
         .await
         .unwrap_or_default();
+    // If the action navigated (e.g. clicking a product opened its detail page),
+    // give the destination extra time to load before reading, so the returned
+    // observation reflects the new page instead of a half-loaded or stale one.
+    if !current_url.is_empty() && !url_before.is_empty() && current_url != url_before {
+        tokio::time::sleep(std::time::Duration::from_millis(900)).await;
+    }
     let mut out = match result {
         Value::Object(map) => map,
         other => {

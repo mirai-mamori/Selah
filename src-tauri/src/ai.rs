@@ -18,7 +18,7 @@ static HTTP_CLIENT: LazyLock<reqwest::Client> = LazyLock::new(|| {
 #[serde(default)]
 pub struct AiConfig {
     pub ai_enabled: bool,
-    pub provider: String,    // "local" | "openai" | "gemini"
+    pub provider: String,    // "local" | "openai" | "openrouter" | "gemini"
     pub local_model: String, // model id from catalog, e.g. "qwen3.5-2b"
     pub api_key: String,
     pub model: String,
@@ -515,7 +515,7 @@ pub fn save_ai_config(app: tauri::AppHandle, mut config: AiConfig) -> Result<(),
                 return Err("ローカルモデルを選択してください".into());
             }
         }
-        "openai" | "gemini" => {
+        "openai" | "openrouter" | "gemini" => {
             config.max_tokens = config.max_tokens.clamp(8192, 32768);
             if config.model.is_empty() {
                 return Err("モデル名を入力してください".into());

@@ -473,6 +473,7 @@ pub fn run() {
             commands::get_kgc_syllabus_fields,
             commands::sync_session,
             commands::get_session_states,
+            commands::get_saved_cookie_summaries,
             luna_commands::university_open_detail_window,
             luna_commands::luna_open_detail_window,
             luna_commands::luna_fetch_page,

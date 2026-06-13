@@ -55,13 +55,23 @@
 
   const MODEL_PRESETS: Record<string, string[]> = {
     openai: ["gpt-5.4", "gpt-5.4-mini", "gpt-5.4-nano"],
+    openrouter: [
+      "moonshotai/kimi-k2.6",
+      "anthropic/claude-opus-4.8",
+      "minimax/minimax-m3",
+    ],
     gemini: ["gemini-3.5-flash", "gemini-3.1-pro-preview", "gemini-3-flash-preview"],
   };
   const PROVIDER_HINTS: Record<string, string> = {
     openai: "OpenAI API キーは platform.openai.com で取得できます。",
+    openrouter: "OpenRouter の API キーは openrouter.ai/keys で取得できます。画像認識には視覚対応モデル（例: moonshotai/kimi-k2.6、minimax/minimax-m3）を選んでください。",
     gemini: "Google AI Studio (aistudio.google.com) で API キーを取得できます。",
   };
-  const DEFAULT_URLS: Record<string, string> = { openai: "https://api.openai.com/v1", gemini: "" };
+  const DEFAULT_URLS: Record<string, string> = {
+    openai: "https://api.openai.com/v1",
+    openrouter: "https://openrouter.ai/api/v1",
+    gemini: "",
+  };
   const isWindows = navigator.userAgent.includes('Windows');
 
   const DEFAULT_STT_BACKEND_OPTIONS: SttExecutionBackendOption[] = [
@@ -362,7 +372,23 @@
   }
 
   function onProviderSwitch() {
-    if (aiProvider === "openai" && !baseUrl) baseUrl = DEFAULT_URLS.openai;
+    const def = DEFAULT_URLS[aiProvider] ?? "";
+    const autoDefaults = Object.values(DEFAULT_URLS).filter(Boolean);
+    // Swap the endpoint when it's empty or is another provider's auto-default,
+    // so e.g. OpenAI ⇄ OpenRouter switching actually replaces the API URL.
+    // A custom (non-default) URL is left untouched.
+    if (def && (!baseUrl.trim() || autoDefaults.includes(baseUrl.trim()))) {
+      baseUrl = def;
+    }
+    // Likewise swap the model when it belongs to another provider's presets —
+    // a leftover OpenAI model name is invalid on OpenRouter (needs `vendor/model`).
+    const presets = MODEL_PRESETS[aiProvider] || [];
+    const foreignPresets = Object.entries(MODEL_PRESETS)
+      .filter(([p]) => p !== aiProvider)
+      .flatMap(([, list]) => list);
+    if (presets.length && (!model.trim() || foreignPresets.includes(model.trim()))) {
+      model = presets[0];
+    }
   }
 
   async function loadModelList() {
@@ -839,6 +865,7 @@
         <select bind:value={aiProvider}>
           <option value="local">ローカルモデル</option>
           <option value="openai">OpenAI API</option>
+          <option value="openrouter">OpenRouter</option>
           <option value="gemini">Google Gemini API</option>
         </select>
         <div class="hint">

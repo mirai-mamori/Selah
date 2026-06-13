@@ -576,6 +576,22 @@ const BROWSER_BRIDGE_SCRIPT: &str = r#"
 
   function performClick(el) {
     if (!el) throw new Error('No clickable element found');
+    // A target="_blank" link clicked inside the webview opens a detached/blocked
+    // window, so the destination never appears and automation looks like it
+    // "did nothing". Force same-tab navigation so the page actually loads in the
+    // current webview (the agent keeps the same target and the user sees it).
+    // JS window.open() calls are still routed to a Copilot tab via the override.
+    try {
+      var navAnchor = (el.tagName && String(el.tagName).toLowerCase() === 'a')
+        ? el
+        : (el.closest ? el.closest('a[href]') : null);
+      if (navAnchor) {
+        var navTarget = String(navAnchor.getAttribute('target') || '').toLowerCase();
+        if (navTarget === '_blank' || navTarget === '_new') {
+          navAnchor.setAttribute('target', '_self');
+        }
+      }
+    } catch (e) {}
     try { if (typeof el.focus === 'function') el.focus(); } catch (e) {}
     var rect = el.getBoundingClientRect();
     var cx = Math.round(rect.left + rect.width / 2);
