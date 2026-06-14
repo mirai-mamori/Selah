@@ -157,12 +157,12 @@ pub async fn get_session_states(
 #[tauri::command]
 pub fn get_saved_cookie_summaries() -> Vec<client::SavedCookieSummary> {
     [
-        ("kgc", client::COOKIES_FILE),
-        ("luna", luna_client::LUNA_COOKIES_FILE),
-        ("kwic", kwic_client::KWIC_COOKIES_FILE),
+        ("kgc", client::KGC_COOKIES_KEY),
+        ("luna", luna_client::LUNA_COOKIES_KEY),
+        ("kwic", kwic_client::KWIC_COOKIES_KEY),
     ]
     .into_iter()
-    .map(|(service, filename)| client::saved_cookie_summary(service, filename))
+    .map(|(service, key)| client::saved_cookie_summary(service, key))
     .collect()
 }
 

@@ -2,10 +2,10 @@ use reqwest::Client;
 use std::sync::Arc;
 
 use crate::client::{
-    build_http_client, data_dir, load_cookie_jar, new_cookie_client, save_cookie_jar,
+    build_http_client, delete_cookie_jar, load_cookie_jar, new_cookie_client, save_cookie_jar,
 };
 
-pub(crate) const LUNA_COOKIES_FILE: &str = "luna_cookies.json";
+pub(crate) const LUNA_COOKIES_KEY: &str = "luna_cookie_jar";
 
 /// Check if Luna response body indicates session expired
 pub(crate) fn is_luna_session_expired(body: &str) -> bool {
@@ -46,14 +46,16 @@ impl LunaClient {
             log::warn!("Luna save_session skipped: not authenticated");
             return;
         }
-        save_cookie_jar(&self.cookie_store, LUNA_COOKIES_FILE);
-        log::info!("Luna cookies saved");
+        match save_cookie_jar(&self.cookie_store, LUNA_COOKIES_KEY) {
+            Ok(()) => log::info!("Luna cookies saved securely"),
+            Err(e) => log::warn!("Failed to save Luna cookies securely: {}", e),
+        }
     }
 
     /// Try to restore Luna session from disk.
     /// Returns true if cookies were loaded (session still needs server validation).
     pub fn try_restore_session(&mut self) -> bool {
-        match load_cookie_jar(LUNA_COOKIES_FILE) {
+        match load_cookie_jar(LUNA_COOKIES_KEY) {
             Some(store) => {
                 let cookie_store = Arc::new(reqwest_cookie_store::CookieStoreMutex::new(store));
                 self.http = build_http_client(cookie_store.clone());
@@ -68,11 +70,7 @@ impl LunaClient {
 
     pub fn clear(&mut self) {
         self.authenticated = false;
-        if let Err(e) = std::fs::remove_file(data_dir().join(LUNA_COOKIES_FILE)) {
-            if e.kind() != std::io::ErrorKind::NotFound {
-                log::warn!("Luna clear: failed to delete cookies file: {}", e);
-            }
-        }
+        delete_cookie_jar(LUNA_COOKIES_KEY);
         let (cookie_store, http) = new_cookie_client();
         self.http = http;
         self.cookie_store = cookie_store;

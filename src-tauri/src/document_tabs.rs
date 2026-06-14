@@ -1006,6 +1006,40 @@ fn activate_tab_inner(app: &tauri::AppHandle, owner: &str, tab_id: &str) -> Resu
     Ok(())
 }
 
+fn activate_tab_without_focus(
+    app: &tauri::AppHandle,
+    owner: &str,
+    tab_id: &str,
+) -> Result<(), String> {
+    let active_tab = {
+        let mut states = DOCUMENT_WINDOWS.lock().unwrap_or_else(|e| e.into_inner());
+        let state = states
+            .get_mut(owner)
+            .ok_or_else(|| format!("タブウィンドウが見つかりません: {}", owner))?;
+        let tab = state
+            .tabs
+            .iter()
+            .find(|tab| tab.id == tab_id || tab.target == tab_id || tab.label == tab_id)
+            .cloned()
+            .ok_or_else(|| format!("タブが見つかりません: {}", tab_id))?;
+        state.active = Some(tab.id.clone());
+        tab
+    };
+
+    crate::webview_toolbar::set_owner_active_target(
+        owner,
+        &active_tab.target,
+        &active_tab.title,
+        &active_tab.kind,
+    );
+    if let Some(window) = app.get_window(owner) {
+        let _ = window.set_title(&active_tab.title);
+    }
+    resize_current_for_owner(app, owner)?;
+    emit_tabs_changed(app, owner);
+    Ok(())
+}
+
 fn open_tab(
     app: &tauri::AppHandle,
     key: Option<String>,
@@ -1795,6 +1829,7 @@ pub fn document_tabs_close(
     app: tauri::AppHandle,
     owner: Option<String>,
     id: String,
+    focus: Option<bool>,
 ) -> Result<(), String> {
     let owner = owner.unwrap_or_else(|| OWNER_LABEL.to_string());
     let (closed, next_active) = {
@@ -1840,7 +1875,11 @@ pub fn document_tabs_close(
     }
 
     if let Some(next) = next_active {
-        activate_tab_inner(&app, &owner, &next)?;
+        if focus.unwrap_or(true) {
+            activate_tab_inner(&app, &owner, &next)?;
+        } else {
+            activate_tab_without_focus(&app, &owner, &next)?;
+        }
     } else if AGENT_PANEL_OPEN.load(Ordering::Relaxed) {
         resize_current_for_owner(&app, &owner)?;
         emit_tabs_changed(&app, &owner);

@@ -2,10 +2,10 @@ use reqwest::Client;
 use std::sync::Arc;
 
 use crate::client::{
-    build_http_client, data_dir, load_cookie_jar, new_cookie_client, save_cookie_jar,
+    build_http_client, delete_cookie_jar, load_cookie_jar, new_cookie_client, save_cookie_jar,
 };
 
-pub(crate) const KWIC_COOKIES_FILE: &str = "kwic_portal_cookies.json";
+pub(crate) const KWIC_COOKIES_KEY: &str = "kwic_cookie_jar";
 
 /// Check if KWIC Portal response indicates session expired
 pub(crate) fn is_kwic_session_expired(body: &str) -> bool {
@@ -50,13 +50,15 @@ impl KwicClient {
             log::warn!("KWIC save_session skipped: not authenticated");
             return;
         }
-        save_cookie_jar(&self.cookie_store, KWIC_COOKIES_FILE);
-        log::info!("KWIC Portal cookies saved");
+        match save_cookie_jar(&self.cookie_store, KWIC_COOKIES_KEY) {
+            Ok(()) => log::info!("KWIC Portal cookies saved securely"),
+            Err(e) => log::warn!("Failed to save KWIC Portal cookies securely: {}", e),
+        }
     }
 
     /// Try to restore session from disk
     pub fn try_restore_session(&mut self) -> bool {
-        match load_cookie_jar(KWIC_COOKIES_FILE) {
+        match load_cookie_jar(KWIC_COOKIES_KEY) {
             Some(store) => {
                 let cookie_store = Arc::new(reqwest_cookie_store::CookieStoreMutex::new(store));
                 self.http = build_http_client(cookie_store.clone());
@@ -71,11 +73,7 @@ impl KwicClient {
 
     pub fn clear(&mut self) {
         self.authenticated = false;
-        if let Err(e) = std::fs::remove_file(data_dir().join(KWIC_COOKIES_FILE)) {
-            if e.kind() != std::io::ErrorKind::NotFound {
-                log::warn!("KWIC clear: failed to delete cookies file: {}", e);
-            }
-        }
+        delete_cookie_jar(KWIC_COOKIES_KEY);
         let (cookie_store, http) = new_cookie_client();
         self.http = http;
         self.cookie_store = cookie_store;

@@ -398,7 +398,7 @@
   {#if cookieSummaryError}
     <div class="hint cookie-summary-error">Cookie の概要を読み込めませんでした。</div>
   {:else}
-    <div class="hint cookie-summary-note">Cookie の名前・値・ドメイン・パスなどの認証情報は表示しません。</div>
+    <div class="hint cookie-summary-note">Cookie はシステムの資格情報ストアに保存します。名前・値・ドメイン・パスなどの認証情報は表示しません。</div>
   {/if}
 </div>
 

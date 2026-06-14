@@ -1,5 +1,6 @@
 <script lang="ts">
   import { untrack } from "svelte";
+  import type { Snippet } from "svelte";
   import { searchSyllabus, fetchSyllabusFavorites, toggleSyllabusBookmark, openSyllabusDetail } from "../api";
   import { authState, syllabusSearchState, cachedFetch, invalidateCache } from "../stores";
   import type { SyllabusSearchParams, SyllabusSearchResult, SyllabusEntry } from "../stores";
@@ -553,7 +554,7 @@
             {value ?? ""}
           {/if}
         {/snippet}
-        <DataTable data={displayEntries} {columns} {cellSnippet} onrowclick={(row: any) => handleRowClick(row)} />
+        <DataTable data={displayEntries} {columns} cellSnippet={cellSnippet as Snippet<[any]>} onrowclick={(row: any) => handleRowClick(row)} />
         {#if result.current_page < result.total_pages}
           <div class="result-more">
             <button class="load-more-results" onclick={loadMoreResults} disabled={loadingMore}>
@@ -601,7 +602,7 @@
               {value ?? ""}
             {/if}
           {/snippet}
-          <DataTable data={displayFavorites} columns={favColumns} cellSnippet={favCellSnippet} onrowclick={(row: any) => handleRowClick(row)} />
+          <DataTable data={displayFavorites} columns={favColumns} cellSnippet={favCellSnippet as Snippet<[any]>} onrowclick={(row: any) => handleRowClick(row)} />
         {:else if favorites}
           <div class="empty-message">お気に入りはありません。</div>
         {/if}

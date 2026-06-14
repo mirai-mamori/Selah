@@ -39,7 +39,7 @@ fn is_backupable_sso_cookie(domain: &str) -> bool {
 /// Remove all university/SSO cookies from the native webview store and delete
 /// the keychain backup so startup restoration cannot silently log back in.
 pub async fn clear_university_cookies(app: &tauri::AppHandle) -> Result<usize, String> {
-    crate::keychain::delete_secret(SSO_COOKIE_BACKUP_KEY);
+    crate::keychain::delete_cookie_secret(SSO_COOKIE_BACKUP_KEY);
     let deleted = delete_university_cookies(app).await?;
     // Platform cookie deletion APIs complete asynchronously. Give the native
     // store a moment to settle before the caller opens a fresh login window.
@@ -209,7 +209,7 @@ pub async fn persist_sso_cookies(app: &tauri::AppHandle) {
     }
     match serde_json::to_string(&sso) {
         Ok(json) => {
-            if let Err(e) = crate::keychain::set_secret(SSO_COOKIE_BACKUP_KEY, &json) {
+            if let Err(e) = crate::keychain::set_cookie_secret(SSO_COOKIE_BACKUP_KEY, &json) {
                 log::warn!("persist_sso_cookies: keychain write failed: {e}");
             } else {
                 log::info!("persist_sso_cookies: backed up {} SSO cookies", sso.len());
@@ -232,7 +232,7 @@ pub async fn restore_sso_cookies(app: &tauri::AppHandle) {
 }
 
 async fn restore_sso_cookies_inner(app: &tauri::AppHandle) {
-    let Some(json) = crate::keychain::get_secret(SSO_COOKIE_BACKUP_KEY) else {
+    let Some(json) = crate::keychain::get_cookie_secret(SSO_COOKIE_BACKUP_KEY) else {
         return;
     };
     let cookies: Vec<CookieData> = match serde_json::from_str(&json) {

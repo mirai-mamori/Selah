@@ -66,6 +66,10 @@
     void run(() => invoke("document_tabs_reveal", { owner: OWNER, id }));
   }
 
+  function closeTab(id: string): void {
+    void run(() => invoke("document_tabs_close", { owner: OWNER, id, focus: false }));
+  }
+
   onMount(async () => {
     document.addEventListener("visibilitychange", onVisibility);
     await refresh();
@@ -97,25 +101,36 @@
     <div class="cd-tabs">
       {#each visibleTabs as tab (tab.id)}
         {@const fav = tab.type === "browser" ? tabFaviconUrl(tab.url) : ""}
-        <button
-          class="cd-tab"
-          class:active={tab.active}
-          type="button"
-          title={tab.title || tab.url}
-          disabled={busy}
-          onclick={() => revealTab(tab.id)}
-        >
-          {#if tab.loading}
-            <span class="cd-ico cd-spinner" aria-hidden="true"></span>
-          {:else if tab.type === "detective"}
-            <img class="cd-ico cd-img" src="/naruhodo.png" alt="" aria-hidden="true" draggable="false" />
-          {:else if fav && !faviconFailed.has(fav)}
-            <img class="cd-ico cd-img" src={fav} alt="" aria-hidden="true" draggable="false" onerror={() => onFaviconError(fav)} />
-          {:else}
-            <span class="cd-ico cd-dot" data-kind={tab.type} aria-hidden="true"></span>
-          {/if}
-          <span class="cd-tab-title">{shortTitle(tab)}</span>
-        </button>
+        <div class="cd-tab-row" class:active={tab.active}>
+          <button
+            class="cd-tab"
+            type="button"
+            title={tab.title || tab.url}
+            disabled={busy}
+            onclick={() => revealTab(tab.id)}
+          >
+            {#if tab.loading}
+              <span class="cd-ico cd-spinner" aria-hidden="true"></span>
+            {:else if tab.type === "detective"}
+              <img class="cd-ico cd-img" src="/naruhodo.png" alt="" aria-hidden="true" draggable="false" />
+            {:else if fav && !faviconFailed.has(fav)}
+              <img class="cd-ico cd-img" src={fav} alt="" aria-hidden="true" draggable="false" onerror={() => onFaviconError(fav)} />
+            {:else}
+              <span class="cd-ico cd-dot" data-kind={tab.type} aria-hidden="true"></span>
+            {/if}
+            <span class="cd-tab-title">{shortTitle(tab)}</span>
+          </button>
+          <button
+            class="cd-close"
+            type="button"
+            title="タブを閉じる"
+            aria-label={`${shortTitle(tab)}を閉じる`}
+            disabled={busy}
+            onclick={() => closeTab(tab.id)}
+          >
+            <Icon name="xmark" size={11} />
+          </button>
+        </div>
       {/each}
     </div>
   {/if}
@@ -286,39 +301,88 @@
     scrollbar-width: thin;
   }
 
-  .cd-tab {
+  .cd-tab-row {
     position: relative;
     display: flex;
     align-items: center;
-    gap: 8px;
     width: 100%;
     height: 27px;
-    padding: 0 8px 0 10px;
     border: none;
     border-radius: 7px;
     background: transparent;
     color: var(--text-secondary);
-    cursor: pointer;
-    text-align: left;
     transition: background 0.15s ease, color 0.15s ease;
   }
 
-  .cd-tab:hover:not(:disabled) {
+  .cd-tab-row:hover,
+  .cd-tab-row:focus-within {
     background: color-mix(in srgb, var(--text-primary) 6%, transparent);
     color: var(--text-primary);
   }
 
-  .cd-tab.active {
+  .cd-tab-row.active {
     background: color-mix(in srgb, var(--text-primary) 10%, transparent);
     color: var(--text-primary);
     box-shadow: inset 0 0 0 0.5px color-mix(in srgb, var(--text-primary) 18%, transparent);
   }
 
-  .cd-tab.active .cd-tab-title {
+  .cd-tab-row.active .cd-tab-title {
     font-weight: 650;
   }
 
+  .cd-tab {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    flex: 1 1 auto;
+    min-width: 0;
+    height: 100%;
+    padding: 0 30px 0 10px;
+    border: none;
+    border-radius: inherit;
+    background: transparent;
+    color: inherit;
+    cursor: pointer;
+    text-align: left;
+  }
+
   .cd-tab:disabled {
+    cursor: default;
+  }
+
+  .cd-close {
+    position: absolute;
+    right: 4px;
+    top: 50%;
+    width: 20px;
+    height: 20px;
+    display: grid;
+    place-items: center;
+    padding: 0;
+    border: none;
+    border-radius: 5px;
+    background: color-mix(in srgb, var(--bg-card) 88%, transparent);
+    color: var(--text-tertiary);
+    cursor: pointer;
+    opacity: 0;
+    pointer-events: none;
+    transform: translateY(-50%) scale(0.88);
+    transition: opacity 0.12s ease, transform 0.12s ease, background 0.12s ease, color 0.12s ease;
+  }
+
+  .cd-tab-row:hover .cd-close,
+  .cd-close:focus-visible {
+    opacity: 1;
+    pointer-events: auto;
+    transform: translateY(-50%) scale(1);
+  }
+
+  .cd-close:hover:not(:disabled) {
+    background: color-mix(in srgb, var(--text-primary) 12%, var(--bg-card));
+    color: var(--text-primary);
+  }
+
+  .cd-close:disabled {
     cursor: default;
   }
 

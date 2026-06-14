@@ -1690,7 +1690,7 @@ pub async fn debug_browser_mouse_click_selftest(app: tauri::AppHandle) -> Result
         .unwrap_or_else(|e| e.into_inner())
         .insert(request_id.clone(), tx);
     let page_url = format!(
-        "browser-mouse-selftest.html?request={}",
+        "index.html?surface=browser-mouse-selftest&request={}",
         urlencoding::encode(&request_id)
     );
 

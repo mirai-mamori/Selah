@@ -278,3 +278,29 @@
       grid-template-columns: 1fr;
     }
   }
+
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) .course-time-tag.spring {
+      color: #efa2be;
+      border-color: rgba(224, 119, 158, 0.32);
+      background: linear-gradient(120deg, rgba(126, 188, 92, 0.16) 0%, rgba(224, 119, 158, 0.16) 34%);
+    }
+
+    :root:not([data-theme="light"]) .course-time-tag.autumn {
+      color: #e7a56b;
+      border-color: rgba(218, 133, 62, 0.34);
+      background: linear-gradient(120deg, rgba(216, 80, 60, 0.16) 0%, rgba(218, 133, 62, 0.17) 34%);
+    }
+  }
+
+  [data-theme="dark"] .course-time-tag.spring {
+    color: #efa2be;
+    border-color: rgba(224, 119, 158, 0.32);
+    background: linear-gradient(120deg, rgba(126, 188, 92, 0.16) 0%, rgba(224, 119, 158, 0.16) 34%);
+  }
+
+  [data-theme="dark"] .course-time-tag.autumn {
+    color: #e7a56b;
+    border-color: rgba(218, 133, 62, 0.34);
+    background: linear-gradient(120deg, rgba(216, 80, 60, 0.16) 0%, rgba(218, 133, 62, 0.17) 34%);
+  }

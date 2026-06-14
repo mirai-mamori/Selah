@@ -87,6 +87,35 @@ fn should_run_browser_mouse_selftest() -> bool {
         .unwrap_or(false)
 }
 
+#[cfg(unix)]
+fn protect_log_storage(app: &tauri::AppHandle) -> Result<(), Box<dyn std::error::Error>> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = app.path().app_log_dir()?;
+    std::fs::create_dir_all(&dir)?;
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))?;
+
+    for entry in std::fs::read_dir(&dir)? {
+        let path = entry?.path();
+        if path.is_file() {
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+        }
+    }
+
+    let log_path = dir.join("kwic.log");
+    std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log_path)?;
+    std::fs::set_permissions(log_path, std::fs::Permissions::from_mode(0o600))?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn protect_log_storage(_app: &tauri::AppHandle) -> Result<(), Box<dyn std::error::Error>> {
+    Ok(())
+}
+
 // ── Decoupled per-service states (independent locking, zero cross-service contention) ──
 
 /// KG-Course (KGC) service state.
@@ -279,6 +308,7 @@ pub fn run() {
             app.handle()
                 .plugin(tauri_plugin_global_shortcut::Builder::new().build())?;
             app_updates::init(app.handle())?;
+            protect_log_storage(app.handle())?;
             app.handle().plugin(
                 tauri_plugin_log::Builder::default()
                     .level(if cfg!(debug_assertions) {
@@ -296,6 +326,7 @@ pub fn run() {
                     ])
                     .build(),
             )?;
+            protect_log_storage(app.handle())?;
             let mut luna = luna_client::LunaClient::new();
             luna.try_restore_session();
             let mut kwic = kwic_client::KwicClient::new();

@@ -224,6 +224,7 @@
     display: -webkit-box;
     -webkit-box-orient: vertical;
     -webkit-line-clamp: 2;
+    line-clamp: 2;
     overflow: hidden;
     font-size: 13.5px;
     line-height: 1.3;

@@ -62,23 +62,51 @@
     return match ? `${Number(match[2])}/${Number(match[3])}` : value;
   }
 
-  function courseTimeTags(value: string): string[] {
+  type Weekday = "mon" | "tue" | "wed" | "thu" | "fri" | "sat" | "sun";
+
+  type CourseTimeTag = {
+    label: string;
+    kind: "spring" | "autumn" | "default";
+    day?: Weekday;
+  };
+
+  const WEEKDAY: Record<string, Weekday> = {
+    月: "mon", 火: "tue", 水: "wed", 木: "thu", 金: "fri", 土: "sat", 日: "sun",
+  };
+
+  function courseTimeTags(value: string): CourseTimeTag[] {
     const parts = String(value || "")
+      .replace(/[０-９]/g, (c) => String.fromCharCode(c.charCodeAt(0) - 0xfee0))
       .replace(/[()（）]/g, "")
-      .split(/[\/／]/)
+      .split(/[\/／\s　]+/)
       .map((part) => part.trim())
       .filter(Boolean);
-    const tags: string[] = [];
+    const tags: CourseTimeTag[] = [];
     for (const part of parts) {
-      if (/^\d{4}$/.test(part)) continue;
-      const dayPeriod = part.match(/^([月火水木金土日])(?:曜)?\s*(\d+)$/);
-      if (dayPeriod) {
-        tags.push(`${dayPeriod[1]}曜`, `${dayPeriod[2]}限`);
+      if (/^\d{4}(?:年度?)?$/.test(part)) continue;
+      if (/^春(?:学期)?$/.test(part)) {
+        tags.push({ label: "春学期", kind: "spring" });
+        continue;
+      }
+      if (/^秋(?:学期)?$/.test(part)) {
+        tags.push({ label: "秋学期", kind: "autumn" });
+        continue;
+      }
+      // 「火2」はそのまま色付け、「月1金5」は曜日ごとに分割する
+      const segments = part.match(/[月火水木金土日](?:曜日?)?\s*\d+\s*限?/g);
+      if (segments) {
+        for (const seg of segments) {
+          const day = WEEKDAY[seg[0]];
+          const period = seg.match(/\d+/)![0];
+          tags.push({ label: `${seg[0]}${period}`, kind: "default", day });
+        }
       } else {
-        tags.push(part);
+        tags.push({ label: part, kind: "default" });
       }
     }
-    return [...new Set(tags)];
+    return tags.filter((tag, index) =>
+      tags.findIndex((candidate) => candidate.label === tag.label && candidate.kind === tag.kind) === index
+    );
   }
 
   function toolKind(name: string, url = ""): "zoom" | "panopto" | "syllabus" | "default" {
@@ -299,8 +327,15 @@
         <h1>{courseHeading.title}</h1>
         {#if course.semester || course.teachers}
           <div class="course-title-meta">
-            {#each courseTimeTags(course.semester) as tag (tag)}
-              <span class="course-time-tag">{tag}</span>
+            {#each courseTimeTags(course.semester) as tag (`${tag.kind}:${tag.label}`)}
+              <span
+                class="course-time-tag"
+                class:spring={tag.kind === "spring"}
+                class:autumn={tag.kind === "autumn"}
+                data-day={tag.day}
+              >
+                {tag.label}
+              </span>
             {/each}
             {#if course.teachers}
               <span class="course-teacher"><Icon name="person" size={13} />{course.teachers}</span>

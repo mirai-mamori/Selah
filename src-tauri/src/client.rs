@@ -37,7 +37,7 @@ pub(crate) fn ceil_char_boundary(s: &str, byte_pos: usize) -> usize {
 }
 
 const SESSION_FILE: &str = "session.json";
-pub(crate) const COOKIES_FILE: &str = "cookies.json";
+pub(crate) const KGC_COOKIES_KEY: &str = "kgc_cookie_jar";
 
 pub(crate) const USER_AGENT: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15";
 
@@ -142,56 +142,90 @@ pub(crate) fn data_dir() -> std::path::PathBuf {
         let base = dirs::data_local_dir().unwrap_or_else(|| std::path::PathBuf::from("."));
         let dir = base.join("com.kgu.selah");
         let _ = std::fs::create_dir_all(&dir);
+        #[cfg(unix)]
+        {
+            let _ =
+                std::fs::set_permissions(&dir, std::os::unix::fs::PermissionsExt::from_mode(0o700));
+        }
         dir
     })
     .clone()
 }
 
-/// Save a cookie jar to a JSON file in the data directory.
-pub(crate) fn save_cookie_jar(store: &reqwest_cookie_store::CookieStoreMutex, filename: &str) {
-    let dir = data_dir();
+#[derive(serde::Deserialize, serde::Serialize)]
+struct StoredCookieJar {
+    saved_at: i64,
+    cookie_json: String,
+}
+
+fn now_epoch_secs() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+/// Save an unexpired cookie jar through the platform credential store.
+pub(crate) fn save_cookie_jar(
+    store: &reqwest_cookie_store::CookieStoreMutex,
+    key: &str,
+) -> Result<(), String> {
     let store = store.lock().unwrap_or_else(|e| e.into_inner());
-    if let Ok(buf) = serialize_unexpired_cookie_jar(&store) {
-        let path = dir.join(filename);
-        if let Err(e) = std::fs::write(&path, &buf) {
-            log::warn!("Failed to save cookies ({}): {}", filename, e);
-        } else {
-            #[cfg(unix)]
-            {
-                let _ = std::fs::set_permissions(
-                    &path,
-                    std::os::unix::fs::PermissionsExt::from_mode(0o600),
-                );
-            }
-        }
+    if store.iter_unexpired().next().is_none() {
+        return Err(format!("cookie jar is empty ({})", key));
     }
+    store_cookie_jar_securely(&store, now_epoch_secs(), key)
 }
 
-/// Serialize unexpired persistent and session cookies. The cookie_store default
-/// serializer intentionally drops session cookies, which breaks app restart recovery.
-fn serialize_unexpired_cookie_jar(
-    store: &cookie_store::CookieStore,
-) -> Result<Vec<u8>, serde_json::Error> {
+fn serialize_cookie_json(store: &cookie_store::CookieStore) -> Result<String, serde_json::Error> {
     let cookies: Vec<_> = store.iter_unexpired().cloned().collect();
-    let mut buf = serde_json::to_vec_pretty(&cookies)?;
-    buf.push(b'\n');
-    Ok(buf)
+    serde_json::to_string(&cookies)
 }
 
-/// Load a cookie jar from a JSON file in the data directory.
-/// Returns None if the file doesn't exist or can't be parsed.
-pub(crate) fn load_cookie_jar(filename: &str) -> Option<cookie_store::CookieStore> {
-    let path = data_dir().join(filename);
-    let file = std::fs::File::open(&path).ok()?;
-    let reader = std::io::BufReader::new(file);
-    match cookie_store::serde::json::load(reader) {
-        Ok(store) if store.iter_unexpired().next().is_some() => Some(store),
-        Ok(_) => None,
+fn serialize_stored_cookie_jar(
+    store: &cookie_store::CookieStore,
+    saved_at: i64,
+) -> Result<String, serde_json::Error> {
+    serde_json::to_string(&StoredCookieJar {
+        saved_at,
+        cookie_json: serialize_cookie_json(store)?,
+    })
+}
+
+fn store_cookie_jar_securely(
+    store: &cookie_store::CookieStore,
+    saved_at: i64,
+    key: &str,
+) -> Result<(), String> {
+    let stored =
+        serialize_stored_cookie_jar(store, saved_at).map_err(|e| format!("serialize: {}", e))?;
+    crate::keychain::set_cookie_secret(key, &stored)
+}
+
+fn parse_cookie_json(cookie_json: &str) -> Option<cookie_store::CookieStore> {
+    let reader = std::io::BufReader::new(cookie_json.as_bytes());
+    cookie_store::serde::json::load(reader)
+        .ok()
+        .filter(|store| store.iter_unexpired().next().is_some())
+}
+
+fn load_saved_cookie_jar(key: &str) -> Option<(cookie_store::CookieStore, i64)> {
+    let secret = crate::keychain::get_cookie_secret(key)?;
+    match serde_json::from_str::<StoredCookieJar>(&secret) {
+        Ok(stored) => parse_cookie_json(&stored.cookie_json).map(|store| (store, stored.saved_at)),
         Err(e) => {
-            log::warn!("Failed to load cookies ({}): {}", filename, e);
+            log::warn!("Failed to parse secure cookie jar ({}): {}", key, e);
             None
         }
     }
+}
+
+pub(crate) fn load_cookie_jar(key: &str) -> Option<cookie_store::CookieStore> {
+    load_saved_cookie_jar(key).map(|(store, _)| store)
+}
+
+pub(crate) fn delete_cookie_jar(key: &str) {
+    crate::keychain::delete_cookie_secret(key);
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -206,20 +240,12 @@ pub struct SavedCookieSummary {
 
 /// Return only non-sensitive aggregate information about a persisted cookie jar.
 /// Cookie names, values, domains, and paths never leave the backend.
-pub(crate) fn saved_cookie_summary(service: &str, filename: &str) -> SavedCookieSummary {
-    let path = data_dir().join(filename);
-    let saved_at = path
-        .metadata()
-        .ok()
-        .and_then(|metadata| metadata.modified().ok())
-        .and_then(|modified| modified.duration_since(std::time::UNIX_EPOCH).ok())
-        .map(|duration| duration.as_secs() as i64);
-
-    let Some(store) = load_cookie_jar(filename) else {
+pub(crate) fn saved_cookie_summary(service: &str, key: &str) -> SavedCookieSummary {
+    let Some((store, saved_at)) = load_saved_cookie_jar(key) else {
         return SavedCookieSummary {
             service: service.to_string(),
             saved: false,
-            saved_at,
+            saved_at: None,
             active_cookie_count: 0,
             session_cookie_count: 0,
             earliest_expiry_at: None,
@@ -244,7 +270,7 @@ pub(crate) fn saved_cookie_summary(service: &str, filename: &str) -> SavedCookie
     SavedCookieSummary {
         service: service.to_string(),
         saved: active_cookie_count > 0,
-        saved_at,
+        saved_at: Some(saved_at),
         active_cookie_count,
         session_cookie_count,
         earliest_expiry_at,
@@ -253,7 +279,7 @@ pub(crate) fn saved_cookie_summary(service: &str, filename: &str) -> SavedCookie
 
 #[cfg(test)]
 mod cookie_persistence_tests {
-    use super::serialize_unexpired_cookie_jar;
+    use super::{parse_cookie_json, serialize_stored_cookie_jar, StoredCookieJar};
 
     #[test]
     fn persisted_cookie_json_keeps_session_cookies() {
@@ -268,10 +294,12 @@ mod cookie_persistence_tests {
             )
             .unwrap();
 
-        let buf = serialize_unexpired_cookie_jar(&store).unwrap();
-        let restored = cookie_store::serde::json::load(std::io::BufReader::new(buf.as_slice()))
-            .expect("session cookie JSON should load");
+        let serialized = serialize_stored_cookie_jar(&store, 123).unwrap();
+        let stored: StoredCookieJar = serde_json::from_str(&serialized).unwrap();
+        let restored =
+            parse_cookie_json(&stored.cookie_json).expect("session cookie JSON should load");
 
+        assert_eq!(stored.saved_at, 123);
         assert_eq!(restored.iter_unexpired().count(), 1);
     }
 }
@@ -451,11 +479,7 @@ impl KgcClient {
                 log::warn!("KGC clear_session: failed to delete session file: {}", e);
             }
         }
-        if let Err(e) = std::fs::remove_file(dir.join(COOKIES_FILE)) {
-            if e.kind() != std::io::ErrorKind::NotFound {
-                log::warn!("KGC clear_session: failed to delete cookies file: {}", e);
-            }
-        }
+        delete_cookie_jar(KGC_COOKIES_KEY);
         // Recreate client with fresh cookie jar
         let (cookie_store, http) = new_cookie_client();
         self.http = http;
@@ -485,7 +509,9 @@ impl KgcClient {
         }
 
         // Save cookies
-        save_cookie_jar(&self.cookie_store, COOKIES_FILE);
+        if let Err(e) = save_cookie_jar(&self.cookie_store, KGC_COOKIES_KEY) {
+            log::warn!("Failed to save KGC cookies securely: {}", e);
+        }
     }
 
     /// Try to restore session and cookies from disk.
@@ -510,7 +536,7 @@ impl KgcClient {
         };
 
         // Load cookies
-        match load_cookie_jar(COOKIES_FILE) {
+        match load_cookie_jar(KGC_COOKIES_KEY) {
             Some(store) => {
                 let cookie_store = Arc::new(reqwest_cookie_store::CookieStoreMutex::new(store));
                 self.http = build_http_client(cookie_store.clone());

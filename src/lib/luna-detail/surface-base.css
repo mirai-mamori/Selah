@@ -183,6 +183,7 @@ html,
     min-height: 22px;
     display: inline-flex;
     align-items: center;
+    gap: 5px;
     padding: 0 8px;
     border: 0.5px solid color-mix(in srgb, var(--detail-accent) 14%, var(--detail-border));
     border-radius: 999px;
@@ -192,6 +193,66 @@ html,
     font-weight: 760;
     line-height: 1;
   }
+
+  .course-time-tag.spring,
+  .course-time-tag.autumn {
+    position: relative;
+    padding-inline: 7px 11px;
+    font-weight: 800;
+    letter-spacing: 0.01em;
+  }
+
+  .course-time-tag.spring {
+    border-color: color-mix(in srgb, #d36b94 34%, var(--detail-border));
+    color: color-mix(in srgb, #9b3f67 64%, var(--detail-text));
+    background: linear-gradient(120deg,
+      color-mix(in srgb, #9ed17e 26%, var(--detail-surface)) 0%,
+      color-mix(in srgb, #f6bcd2 28%, var(--detail-surface)) 34%);
+  }
+
+  .course-time-tag.autumn {
+    border-color: color-mix(in srgb, #c66a2b 36%, var(--detail-border));
+    color: color-mix(in srgb, #93431d 64%, var(--detail-text));
+    background: linear-gradient(120deg,
+      color-mix(in srgb, #df5a47 24%, var(--detail-surface)) 0%,
+      color-mix(in srgb, #f1b15f 30%, var(--detail-surface)) 34%);
+  }
+
+  .course-time-tag.spring::before,
+  .course-time-tag.autumn::before {
+    content: "";
+    flex: 0 0 auto;
+    width: 14px;
+    height: 14px;
+    margin-inline-start: -1px;
+    background-repeat: no-repeat;
+    background-position: center;
+    background-size: contain;
+  }
+
+  .course-time-tag.spring::before {
+    background-image: url("data:image/svg+xml,%3Csvg%20xmlns='http://www.w3.org/2000/svg'%20viewBox='0%200%2016%2016'%3E%3Cg%20transform='translate(8%2013)'%3E%3Cpath%20transform='translate(0%20-0.5)%20rotate(-36)'%20d='M0%200%20C-2.4%20-0.6%20-3.2%20-3%20-2.6%20-5.5%20C-2.1%20-7.6%20-0.8%20-8.8%200%20-9.4%20C0.8%20-8.8%202.1%20-7.6%202.6%20-5.5%20C3.2%20-3%202.4%20-0.6%200%200%20Z'%20fill='%236fb84a'/%3E%3Cpath%20transform='translate(0%20-2.5)%20rotate(34)'%20d='M0%200%20C-2.4%20-0.6%20-3.2%20-3%20-2.6%20-5.5%20C-2.1%20-7.6%20-0.8%20-8.8%200%20-9.4%20C0.8%20-8.8%202.1%20-7.6%202.6%20-5.5%20C3.2%20-3%202.4%20-0.6%200%200%20Z'%20fill='%23e88bb0'/%3E%3C/g%3E%3C/svg%3E");
+  }
+
+  .course-time-tag.autumn::before {
+    background-image: url("data:image/svg+xml,%3Csvg%20xmlns='http://www.w3.org/2000/svg'%20viewBox='0%200%2016%2016'%3E%3Cg%20transform='translate(8%2013)'%3E%3Cpath%20transform='translate(0%20-0.5)%20rotate(-36)'%20d='M0%200%20C-2.4%20-0.6%20-3.2%20-3%20-2.6%20-5.5%20C-2.1%20-7.6%20-0.8%20-8.8%200%20-9.4%20C0.8%20-8.8%202.1%20-7.6%202.6%20-5.5%20C3.2%20-3%202.4%20-0.6%200%200%20Z'%20fill='%23e89a44'/%3E%3Cpath%20transform='translate(0%20-2.5)%20rotate(34)'%20d='M0%200%20C-2.4%20-0.6%20-3.2%20-3%20-2.6%20-5.5%20C-2.1%20-7.6%20-0.8%20-8.8%200%20-9.4%20C0.8%20-8.8%202.1%20-7.6%202.6%20-5.5%20C3.2%20-3%202.4%20-0.6%200%200%20Z'%20fill='%23d8503c'/%3E%3C/g%3E%3C/svg%3E");
+  }
+
+  /* 曜日カラー(五行: 火=赤 水=青 木=緑 金=金 土=土、月=月光 日=陽) */
+  .course-time-tag[data-day] {
+    border-color: color-mix(in srgb, var(--day-hue) 34%, var(--detail-border));
+    color: color-mix(in srgb, var(--day-hue) 58%, var(--detail-text));
+    background: color-mix(in srgb, var(--day-hue) 13%, var(--detail-surface));
+    font-weight: 800;
+  }
+
+  .course-time-tag[data-day="mon"] { --day-hue: #7a6fc0; }
+  .course-time-tag[data-day="tue"] { --day-hue: #d6534a; }
+  .course-time-tag[data-day="wed"] { --day-hue: #2e93c9; }
+  .course-time-tag[data-day="thu"] { --day-hue: #4fa45e; }
+  .course-time-tag[data-day="fri"] { --day-hue: #cf9a2e; }
+  .course-time-tag[data-day="sat"] { --day-hue: #a06a36; }
+  .course-time-tag[data-day="sun"] { --day-hue: #d65a6e; }
 
   .course-title-meta .course-teacher {
     min-width: 0;
