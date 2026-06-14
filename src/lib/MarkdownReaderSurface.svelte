@@ -488,7 +488,22 @@
       <div class="scroll" bind:this={scrollEl} onscroll={handleReaderScroll}>
         <article class="doc" bind:this={docEl}>
           {#if loading}
-            <div class="loading"><span class="spinner"></span>読み込み中...</div>
+            <div class="doc-skeleton" aria-busy="true" aria-label="読み込み中">
+              <div class="sk sk-title"></div>
+              <div class="sk sk-line w95"></div>
+              <div class="sk sk-line w100"></div>
+              <div class="sk sk-line w82"></div>
+              <div class="sk-gap"></div>
+              <div class="sk sk-sub"></div>
+              <div class="sk sk-line w100"></div>
+              <div class="sk sk-line w88"></div>
+              <div class="sk sk-line w93"></div>
+              <div class="sk sk-line w70"></div>
+              <div class="sk-gap"></div>
+              <div class="sk sk-line w90"></div>
+              <div class="sk sk-line w96"></div>
+              <div class="sk sk-line w60"></div>
+            </div>
           {:else if error}
             <div class="reader-error">{error}</div>
           {:else}
@@ -496,7 +511,7 @@
               {#if segment.board}
                 <MarkdownWhiteboard board={segment.board} />
               {:else}
-                <div class="markdown-segment">{@html segment.html || ""}</div>
+                <div class="markdown-segment reveal">{@html segment.html || ""}</div>
               {/if}
             {/each}
           {/if}
@@ -734,26 +749,63 @@
     user-select: text;
   }
 
-  .loading {
-    min-height: 320px;
+  /* Skeleton placeholder shaped like a document while the file loads. */
+  .doc-skeleton {
+    --sk-base: color-mix(in srgb, var(--reader-text) 8%, transparent);
+    --sk-hi: color-mix(in srgb, var(--reader-text) 15%, transparent);
     display: flex;
-    align-items: center;
-    justify-content: center;
-    gap: 10px;
-    color: var(--reader-faint);
+    flex-direction: column;
+    gap: 13px;
+    padding-top: 6px;
+    animation: sk-fade-in 0.25s ease both;
   }
 
-  .spinner {
-    width: 18px;
-    height: 18px;
-    border-radius: 50%;
-    border: 2px solid var(--reader-border);
-    border-top-color: var(--reader-accent);
-    animation: spin 0.75s linear infinite;
+  .sk {
+    height: 15px;
+    border-radius: 6px;
+    background: linear-gradient(90deg, var(--sk-base) 25%, var(--sk-hi) 37%, var(--sk-base) 63%);
+    background-size: 400% 100%;
+    animation: sk-shimmer 1.4s ease-in-out infinite;
   }
 
-  @keyframes spin {
-    to { transform: rotate(360deg); }
+  .sk-title { height: 30px; width: 62%; border-radius: 8px; margin-bottom: 4px; }
+  .sk-sub { height: 21px; width: 40%; border-radius: 7px; margin-top: 2px; }
+  .sk-gap { height: 8px; }
+
+  .w60 { width: 60%; }
+  .w70 { width: 70%; }
+  .w82 { width: 82%; }
+  .w88 { width: 88%; }
+  .w90 { width: 90%; }
+  .w93 { width: 93%; }
+  .w95 { width: 95%; }
+  .w96 { width: 96%; }
+  .w100 { width: 100%; }
+
+  @keyframes sk-shimmer {
+    0% { background-position: 100% 0; }
+    100% { background-position: 0 0; }
+  }
+
+  @keyframes sk-fade-in {
+    from { opacity: 0; }
+    to { opacity: 1; }
+  }
+
+  /* Rendered segments ease in so the skeleton → content swap isn't a hard cut. */
+  .markdown-segment.reveal {
+    animation: md-reveal 0.32s cubic-bezier(0.2, 0.8, 0.2, 1) both;
+  }
+
+  @keyframes md-reveal {
+    from { opacity: 0; transform: translateY(6px); }
+    to { opacity: 1; transform: translateY(0); }
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    .sk { animation: none; background: var(--sk-base); }
+    .doc-skeleton,
+    .markdown-segment.reveal { animation: none; }
   }
 
   .reader-error {

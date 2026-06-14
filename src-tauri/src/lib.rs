@@ -591,6 +591,7 @@ pub fn run() {
             live::live_finish_session,
             detective::detective_get_context,
             detective::detective_generate_campaign,
+            detective::detective_finalize_finale,
             detective::detective_get_chapters,
             detective::detective_generate_chapter,
             detective::detective_save_doubts,

@@ -94,7 +94,7 @@
   let themeUnlisten: (() => void) | null = null;
   let appThemeUnlisten: (() => void) | null = null;
   let loginUnlisten: (() => void) | null = null;
-  let lastToolbarTitleHint = "";
+  let lastToolbarTitleHint: string | null = null;
   let loadRunning = false;
 
   const pageTitle = $derived(
@@ -590,6 +590,7 @@
     loadRunning = true;
     loading = true;
     error = "";
+    emitToolbarTitleHint("");
     updateControls();
     try {
       if (mode === "course" || mode === "attendance") {
@@ -703,14 +704,33 @@
   <title>{pageTitle || "LUNA"}</title>
 </svelte:head>
 
-<main class="luna-detail" onclickcapture={handleRichLinkClick} onscroll={updateToolbarTitleHint}>
+<main class="luna-detail" class:loaded={!loading && !error} onclickcapture={handleRichLinkClick} onscroll={updateToolbarTitleHint}>
   {#if isChildPane}
     <button class="split-pane-close" type="button" title="このペインを閉じる" aria-label="このペインを閉じる" onclick={closeThisPane}>
       <Icon name="xmark" size={14} />
     </button>
   {/if}
   {#if loading}
-    <div class="state"><span class="spinner"></span>読み込み中...</div>
+    <div class="detail-skeleton" aria-busy="true" aria-label="読み込み中">
+      <div class="dsk-hero">
+        <div class="dsk dsk-eyebrow"></div>
+        <div class="dsk dsk-title"></div>
+        <div class="dsk dsk-line w55"></div>
+      </div>
+      <div class="dsk-section">
+        <div class="dsk dsk-heading"></div>
+        <div class="dsk-card">
+          <div class="dsk dsk-line w90"></div>
+          <div class="dsk dsk-line w100"></div>
+          <div class="dsk dsk-line w70"></div>
+        </div>
+        <div class="dsk-card">
+          <div class="dsk dsk-line w80"></div>
+          <div class="dsk dsk-line w95"></div>
+          <div class="dsk dsk-line w60"></div>
+        </div>
+      </div>
+    </div>
   {:else if error}
     <div class="state error-state">
       <Icon name="exclamationmark.triangle" size={24} />

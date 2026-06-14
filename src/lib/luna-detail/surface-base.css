@@ -82,6 +82,79 @@ html,
     to { transform: rotate(360deg); }
   }
 
+  /* ── Loading skeleton (shaped like the hero + first cards) ── */
+  .detail-skeleton {
+    --dsk-base: color-mix(in srgb, var(--detail-text) 7%, transparent);
+    --dsk-hi: color-mix(in srgb, var(--detail-text) 14%, transparent);
+    animation: dsk-fade-in 0.25s ease both;
+  }
+
+  .dsk {
+    border-radius: 7px;
+    background: linear-gradient(90deg, var(--dsk-base) 25%, var(--dsk-hi) 37%, var(--dsk-base) 63%);
+    background-size: 400% 100%;
+    animation: dsk-shimmer 1.4s ease-in-out infinite;
+  }
+
+  .dsk-hero {
+    display: grid;
+    gap: 14px;
+    margin: 0 0 28px;
+    padding: 28px clamp(24px, 3.2vw, 44px) 32px;
+    background: var(--detail-surface);
+    border-bottom: 0.5px solid var(--detail-border-soft);
+  }
+
+  .dsk-eyebrow { height: 13px; width: 130px; border-radius: 5px; }
+  .dsk-title { height: 30px; width: min(70%, 460px); border-radius: 9px; }
+  .dsk-heading { height: 17px; width: 180px; margin: 0 0 14px; }
+
+  .dsk-section {
+    display: grid;
+    gap: 14px;
+    padding: 0 clamp(24px, 3.2vw, 44px);
+  }
+
+  .dsk-card {
+    display: grid;
+    gap: 11px;
+    padding: 20px;
+    border-radius: 14px;
+    background: var(--detail-surface);
+    border: 0.5px solid var(--detail-border-soft);
+    box-shadow: var(--detail-shadow);
+  }
+
+  .dsk-line { height: 13px; }
+  .dsk.w55 { width: 55%; } .dsk.w60 { width: 60%; } .dsk.w70 { width: 70%; }
+  .dsk.w80 { width: 80%; } .dsk.w90 { width: 90%; } .dsk.w95 { width: 95%; } .dsk.w100 { width: 100%; }
+
+  @keyframes dsk-shimmer {
+    0% { background-position: 100% 0; }
+    100% { background-position: 0 0; }
+  }
+
+  @keyframes dsk-fade-in {
+    from { opacity: 0; }
+    to { opacity: 1; }
+  }
+
+  /* Loaded content eases in so the skeleton → content swap isn't a hard cut. */
+  .luna-detail.loaded {
+    animation: detail-reveal 0.34s cubic-bezier(0.2, 0.8, 0.2, 1) both;
+  }
+
+  @keyframes detail-reveal {
+    from { opacity: 0; transform: translateY(8px); }
+    to { opacity: 1; transform: translateY(0); }
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    .dsk { animation: none; background: var(--dsk-base); }
+    .detail-skeleton,
+    .luna-detail.loaded { animation: none; }
+  }
+
   .hero,
   .section,
   .detail-wrap {

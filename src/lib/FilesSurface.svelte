@@ -977,7 +977,22 @@
 
       <div class="file-list" bind:this={fileListEl}>
         {#if loading}
-          <div class="loading-state"><div class="spinner"></div></div>
+          <div class="files-skeleton" aria-busy="true" aria-label="読み込み中">
+            {#each [6, 4] as rowCount, g (g)}
+              <div class="fsk-group">
+                <div class="fsk fsk-group-header"></div>
+                {#each Array(rowCount) as _, i (i)}
+                  <div class="fsk-row">
+                    <div class="fsk fsk-icon"></div>
+                    <div class="fsk-row-text">
+                      <div class="fsk fsk-name" style={`width:${72 - ((i * 11) % 34)}%`}></div>
+                      <div class="fsk fsk-meta"></div>
+                    </div>
+                  </div>
+                {/each}
+              </div>
+            {/each}
+          </div>
         {:else if filteredRecords.length === 0}
           {#if allRecords.length === 0}
             <div class="empty-state">
@@ -1510,7 +1525,6 @@
   .empty-state svg { opacity: 0.3; }
   .empty-state-text { font-size: 13px; }
 
-  .loading-state { display: flex; align-items: center; justify-content: center; height: 100%; }
   .spinner {
     width: 24px; height: 24px;
     border: 2px solid var(--border-strong);
@@ -1518,6 +1532,39 @@
     border-radius: 50%; animation: spin 0.6s linear infinite;
   }
   @keyframes spin { from { transform: rotate(0deg); } to { transform: rotate(360deg); } }
+
+  /* ── Loading skeleton (shaped like grouped file rows) ── */
+  .files-skeleton {
+    --fsk-base: color-mix(in srgb, var(--text-primary) 7%, transparent);
+    --fsk-hi: color-mix(in srgb, var(--text-primary) 14%, transparent);
+    padding-top: 2px;
+    animation: fsk-fade-in 0.25s ease both;
+  }
+  .fsk-group { margin-bottom: 16px; }
+  .fsk {
+    background: linear-gradient(90deg, var(--fsk-base) 25%, var(--fsk-hi) 37%, var(--fsk-base) 63%);
+    background-size: 400% 100%;
+    animation: fsk-shimmer 1.4s ease-in-out infinite;
+  }
+  .fsk-group-header { height: 11px; width: 120px; border-radius: 5px; margin: 6px 8px 10px; }
+  .fsk-row { display: flex; align-items: center; gap: 10px; padding: 8px; }
+  .fsk-icon { width: 32px; height: 32px; border-radius: 8px; flex-shrink: 0; }
+  .fsk-row-text { display: flex; flex-direction: column; gap: 7px; flex: 1; min-width: 0; }
+  .fsk-name { height: 12px; border-radius: 5px; }
+  .fsk-meta { height: 9px; width: 38%; border-radius: 5px; }
+
+  @keyframes fsk-shimmer {
+    0% { background-position: 100% 0; }
+    100% { background-position: 0 0; }
+  }
+  @keyframes fsk-fade-in {
+    from { opacity: 0; }
+    to { opacity: 1; }
+  }
+  @media (prefers-reduced-motion: reduce) {
+    .fsk { animation: none; background: var(--fsk-base); }
+    .files-skeleton { animation: none; }
+  }
 
   /* ── Status bar ── */
   .status-bar {

@@ -343,6 +343,25 @@
     gap: 28px;
   }
 
+  /* Gentle staggered entrance for the new-tab content. */
+  .home-inner > :global(*) {
+    animation: home-enter 0.42s cubic-bezier(0.2, 0.8, 0.2, 1) both;
+  }
+  .home-inner > :global(:nth-child(1)) { animation-delay: 0.02s; }
+  .home-inner > :global(:nth-child(2)) { animation-delay: 0.08s; }
+  .home-inner > :global(:nth-child(3)) { animation-delay: 0.14s; }
+  .home-inner > :global(:nth-child(4)) { animation-delay: 0.2s; }
+  .home-inner > :global(:nth-child(5)) { animation-delay: 0.26s; }
+
+  @keyframes home-enter {
+    from { opacity: 0; transform: translateY(10px); }
+    to { opacity: 1; transform: translateY(0); }
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    .home-inner > :global(*) { animation: none; }
+  }
+
   .brand {
     display: inline-flex;
     flex-direction: column;

@@ -7,6 +7,7 @@
   import Icon, { type IconName } from "./Icon.svelte";
   import { listBookmarks, toggleBookmark } from "./bookmarks";
   import { tabFaviconUrl } from "./documentTabs";
+  import { normalizeEffectiveTheme } from "./themePreference";
 
   interface DocumentTabControl {
     id: string;
@@ -108,6 +109,9 @@
   const readerControls = $derived(dedupeControls(activeControls.length ? activeControls : defaultReaderControls));
   const activeTitleHint = $derived(activeTab ? titleHints[activeTab.target] || "" : "");
   const isHomeTab = $derived(activeTab?.type === "home");
+  const showFallbackDetailLabel = $derived(
+    !!activeTab && !["detail", "kwic", "kgc"].includes(activeTab.type)
+  );
 
   // ── Favicons ──
   let faviconFailed = $state<Set<string>>(new Set());
@@ -488,10 +492,6 @@
     } catch {}
   }
 
-  function normalizeTheme(value: unknown): "dark" | "light" | "" {
-    return value === "dark" || value === "light" ? value : "";
-  }
-
   function readStoredTheme(): string {
     try {
       return window.localStorage.getItem("selah-theme") || "";
@@ -501,7 +501,7 @@
   }
 
   function applyTheme(value: unknown): void {
-    const theme = normalizeTheme(value);
+    const theme = normalizeEffectiveTheme(value);
     if (theme) {
       document.documentElement.setAttribute("data-theme", theme);
       document.body.setAttribute("data-theme", theme);
@@ -515,7 +515,7 @@
     const stored = readStoredTheme();
     try {
       const appTheme = await invoke<string>("get_app_theme");
-      const normalized = normalizeTheme(appTheme);
+      const normalized = normalizeEffectiveTheme(appTheme);
       applyTheme(normalized || stored);
     } catch {
       if (stored) applyTheme(stored);
@@ -782,7 +782,7 @@
     {:else if activeTab}
       {#if activeTitleHint}
         <div class="detail-title-hint" title={activeTitleHint}>{activeTitleHint}</div>
-      {:else if !detailControls.length}
+      {:else if !detailControls.length && showFallbackDetailLabel}
         <div class="detail-label">
           <span class="kind-dot" data-kind={activeTab.type} aria-hidden="true"></span>
           <span>{kindLabel(activeTab.type)}</span>

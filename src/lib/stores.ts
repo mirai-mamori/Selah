@@ -1,6 +1,6 @@
 import { writable } from "svelte/store";
 import { invoke } from "@tauri-apps/api/core";
-import { setAppTheme } from "./system";
+import { initializeThemePreference, type ThemePreference } from "./themePreference";
 import {
   DETAIL_GENERATED_TODO_KEY,
   LIVE_GENERATED_TODO_KEY,
@@ -390,23 +390,7 @@ export async function markBatchRead(source: string, ids: string[]): Promise<void
   });
 }
 
-function initTheme(): "system" | "light" | "dark" {
-  if (typeof localStorage !== "undefined") {
-    const saved = localStorage.getItem("selah-theme");
-    if (saved === "light" || saved === "dark") {
-      document.documentElement.setAttribute("data-theme", saved);
-      // Sync initial theme to Rust so child webviews can read it
-      setAppTheme(saved).catch(() => {});
-      return saved;
-    }
-  }
-  if (typeof window !== "undefined") {
-    const effective = window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light";
-    setAppTheme(effective).catch(() => {});
-  }
-  return "system";
-}
-export const theme = writable<"system" | "light" | "dark">(initTheme());
+export const theme = writable<ThemePreference>(initializeThemePreference());
 
 // Dev mode: unlocked by 7-tap on About panel version label.
 // In-memory only — resets to false every app launch.

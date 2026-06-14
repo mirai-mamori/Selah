@@ -2,9 +2,10 @@
   import { authState, theme, cachedBackendFetch, sessionExpired, reloginInProgress, cacheStatus, activeTab, agentReady } from "./stores";
   import type { StudentInfo, RefreshItemStatus } from "./stores";
   import { logout, openSettingsWindow, openProfileEditWindow, initiateRelogin, refreshAllData, updateAiReadiness } from "./api";
-  import { emit } from "@tauri-apps/api/event";
   import { getCurrentWindow } from "@tauri-apps/api/window";
-  import { setAppTheme } from "./system";
+  import { get } from "svelte/store";
+  import { onMount } from "svelte";
+  import { applyThemePreference, resolveThemePreference, type ThemePreference } from "./themePreference";
   import { appUpdateState } from "./updater";
   import Icon from "./Icon.svelte";
   import selahLogoUrl from "../assets/logo.png";
@@ -77,19 +78,43 @@
     }
   }
 
+  const themeOrder: ThemePreference[] = ["light", "dark", "auto"];
+
   function toggleTheme() {
-    theme.update((t) => {
-      const effective = t === "system"
-        ? (window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light")
-        : t;
-      const next = effective === "dark" ? "light" : "dark";
-      document.documentElement.setAttribute("data-theme", next);
-      localStorage.setItem("selah-theme", next);
-      emit("theme-changed", next);
-      setAppTheme(next).catch(console.error);
+    theme.update((current) => {
+      const next = themeOrder[(themeOrder.indexOf(current) + 1) % themeOrder.length];
+      applyThemePreference(next);
       return next;
     });
   }
+
+  function themeLabel(preference: ThemePreference): string {
+    if (preference === "light") return "ライト";
+    if (preference === "dark") return "ダーク";
+    return "自動（07:00〜18:59はライト）";
+  }
+
+  onMount(() => {
+    let lastEffective = resolveThemePreference(get(theme));
+    const syncAutomaticTheme = () => {
+      const preference = get(theme);
+      if (preference !== "auto") {
+        lastEffective = resolveThemePreference(preference);
+        return;
+      }
+      const effective = resolveThemePreference(preference);
+      if (effective === lastEffective) return;
+      lastEffective = applyThemePreference(preference);
+    };
+    const timer = window.setInterval(syncAutomaticTheme, 60_000);
+    window.addEventListener("focus", syncAutomaticTheme);
+    document.addEventListener("visibilitychange", syncAutomaticTheme);
+    return () => {
+      window.clearInterval(timer);
+      window.removeEventListener("focus", syncAutomaticTheme);
+      document.removeEventListener("visibilitychange", syncAutomaticTheme);
+    };
+  });
 
   function toggleSettings() {
     if ($activeTab === "settings") {
@@ -163,8 +188,15 @@
     </div>
   </div>
   <div class="titlebar-right">
-    <button class="tb-btn" onclick={toggleTheme} title="テーマ切替" aria-label="テーマ切替">
-      {#if $theme === "dark" || ($theme === "system" && typeof window !== 'undefined' && window.matchMedia('(prefers-color-scheme: dark)').matches)}
+    <button
+      class="tb-btn"
+      onclick={toggleTheme}
+      title={`テーマ: ${themeLabel($theme)}（クリックで切替）`}
+      aria-label={`テーマ: ${themeLabel($theme)}。クリックで切替`}
+    >
+      {#if $theme === "auto"}
+        <Icon name="clock" size={14} />
+      {:else if $theme === "dark"}
         <Icon name="moon" size={14} />
       {:else}
         <Icon name="sun" size={14} />

@@ -8,6 +8,7 @@
     | "bell"
     | "sun"
     | "moon"
+    | "clock"
     | "xmark"
     | "book"
     | "person"
@@ -102,6 +103,9 @@
     <line x1="18.36" y1="5.64" x2="19.78" y2="4.22" />
   {:else if name === "moon"}
     <path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z" />
+  {:else if name === "clock"}
+    <circle cx="12" cy="12" r="9" />
+    <path d="M12 7v5l3 2" />
   {:else if name === "xmark"}
     <line x1="18" y1="6" x2="6" y2="18" />
     <line x1="6" y1="6" x2="18" y2="18" />

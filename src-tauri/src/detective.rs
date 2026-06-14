@@ -44,6 +44,48 @@ const ACTS_MAX: usize = 8;
 const INVESTIGATION_EV_MIN: usize = 2;
 /// Each testimony act must contain at least this many statements (still ONE lie).
 const TESTIMONY_STMT_MIN: usize = 3;
+/// Absolute floor of usable knowledge points a Live note must yield to be
+/// playable at all. Below the full `COVERAGE_MIN_POINTS` target we scale the
+/// chapter DOWN (see `gen_targets`) instead of hard-failing, so a thin lecture
+/// still produces a tight real chapter rather than an error.
+const KNOWLEDGE_FLOOR: usize = 5;
+
+/// Structure targets for one chapter, scaled to how much testable content the
+/// Live note actually yielded. A rich lecture gets the full 6–8 act / 10-point
+/// chapter; a thin one gets a smaller-but-still-real chapter rather than
+/// repeated validation failures or filler padding.
+#[derive(Debug, Clone, Copy)]
+struct GenTargets {
+    acts_min: usize,
+    acts_max: usize,
+    coverage_min: usize,
+    lies_min: usize,
+}
+
+fn gen_targets(knowledge_len: usize) -> GenTargets {
+    if knowledge_len >= COVERAGE_MIN_POINTS + 2 {
+        GenTargets {
+            acts_min: ACTS_MIN,
+            acts_max: ACTS_MAX,
+            coverage_min: COVERAGE_MIN_POINTS,
+            lies_min: SESSION_LIES_MIN,
+        }
+    } else if knowledge_len >= 8 {
+        GenTargets {
+            acts_min: 4,
+            acts_max: 6,
+            coverage_min: knowledge_len.saturating_sub(1).min(8),
+            lies_min: 2,
+        }
+    } else {
+        GenTargets {
+            acts_min: 4,
+            acts_max: 5,
+            coverage_min: knowledge_len.clamp(3, 6),
+            lies_min: 2,
+        }
+    }
+}
 
 const EXAM_KEYWORDS: &[&str] = &[
     "試験",
@@ -140,6 +182,41 @@ pub struct DetectiveCase {
     /// `evidence` is the shared Court Record pool referenced by these acts.
     #[serde(default)]
     pub acts: Vec<DetectiveAct>,
+    /// The 推理 spine of this chapter (明线): the actual truth, who's
+    /// responsible, their motive, planted red herrings, and the deduction chain
+    /// the busted contradictions reconstruct. Authored in the outline pass and
+    /// kept coherent through drafting + editing.
+    #[serde(default)]
+    pub case_logic: CaseLogic,
+    /// What this chapter contributes to the campaign's 暗线 — one concrete beat
+    /// for its position in the arc. Recorded back into the campaign canon so
+    /// later (independently generated) chapters stay mutually consistent.
+    #[serde(default)]
+    pub meta_beat: String,
+}
+
+/// The 推理 spine of a chapter — what really happened and why, separate from the
+/// surface testimony. Authored in the outline pass, held consistent through
+/// drafting + editing, and surfaced on the chapter-clear review.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CaseLogic {
+    /// 1–3 sentences: the actual truth of the case (what really happened).
+    #[serde(default)]
+    pub truth: String,
+    /// Who / what is responsible. Prefer a bible cast member by name.
+    #[serde(default)]
+    pub culprit: String,
+    /// Why they did it / why they lie — means + opportunity folded in.
+    #[serde(default)]
+    pub motive: String,
+    /// Plausible-but-wrong leads planted for fair-play misdirection.
+    #[serde(default)]
+    pub red_herrings: Vec<String>,
+    /// Ordered steps: how the busted contradictions reconstruct the truth.
+    /// The final step answers `final_question`.
+    #[serde(default)]
+    pub deduction_chain: Vec<String>,
 }
 
 /// One act (幕) of a chapter. Either an INVESTIGATION beat (the player reads
@@ -401,10 +478,61 @@ pub struct DetectiveCampaign {
     /// Chapters (live notes) already turned into cases.
     #[serde(default)]
     pub chapters: Vec<CampaignChapter>,
+    /// Web of relationships among the cast + the meta-antagonist — gives the
+    /// world social tension that chapters can draw on.
+    #[serde(default)]
+    pub relationships: Vec<CampaignRelationship>,
+    /// Living canon: facts every chapter must stay consistent with, plus the
+    /// 暗线 hooks already dropped. Fed into every chapter's outline pass so
+    /// independently generated chapters share one coherent world.
+    #[serde(default)]
+    pub canon: CampaignCanon,
     #[serde(default)]
     pub created_at: i64,
     #[serde(default)]
     pub updated_at: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CampaignRelationship {
+    /// Two parties (cast names, or the antagonist force) and how they relate.
+    pub from: String,
+    pub to: String,
+    /// e.g. 「兄弟」「師弟」「対立」「秘密の協力者」.
+    pub relation: String,
+    /// One phrase of the underlying tension / unresolved friction.
+    #[serde(default)]
+    pub tension: String,
+}
+
+/// The shared, append-only story canon for a campaign. Fed into every chapter's
+/// outline pass so independently generated chapters stay mutually consistent
+/// (weak-continuity model: any play order, but one coherent world).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CampaignCanon {
+    /// Hard facts established about the world / cast (timeline, places,
+    /// who-did-what) that no chapter may contradict.
+    #[serde(default)]
+    pub facts: Vec<String>,
+    /// 暗线 hooks already dropped, so chapters vary their hints instead of
+    /// repeating one detail.
+    #[serde(default)]
+    pub dropped_hooks: Vec<CanonHook>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CanonHook {
+    /// Which meta-arc stage this hook served (0 = unknown).
+    #[serde(default)]
+    pub stage: u8,
+    /// The hint that was dropped (kept so it isn't repeated verbatim).
+    pub hook: String,
+    /// Chapter (case id) that dropped it.
+    #[serde(default)]
+    pub chapter_id: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -450,9 +578,22 @@ pub struct CampaignRevelation {
     /// meta_progress (0–100) at which this reveal unlocks.
     pub threshold: u8,
     pub title: String,
+    /// Player-facing reveal text shown when the stage unlocks.
     pub reveal: String,
     #[serde(default)]
     pub unlocked: bool,
+    /// Authoring guidance (not shown to the player): the hook chapters at this
+    /// stage should plant to seed the 暗线.
+    #[serde(default)]
+    pub setup: String,
+    /// Authoring guidance: the false lead that misdirects from this stage's
+    /// truth, so the reveal lands as a fair-play surprise.
+    #[serde(default)]
+    pub misdirection: String,
+    /// Soft guidance for which chapters carry this stage, as a 第N回 band, e.g.
+    /// "1-3". Empty ⇒ derive from `threshold`.
+    #[serde(default)]
+    pub session_band: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -476,6 +617,7 @@ struct CampaignBibleDraft {
     meta_mystery: Option<String>,
     cast: Option<Vec<CampaignCharacterDraft>>,
     meta_arc: Option<Vec<CampaignArcDraft>>,
+    relationships: Option<Vec<CampaignRelationshipDraft>>,
     finale: Option<String>,
 }
 
@@ -484,6 +626,18 @@ struct CampaignBibleDraft {
 struct CampaignArcDraft {
     title: Option<String>,
     reveal: Option<String>,
+    setup: Option<String>,
+    misdirection: Option<String>,
+    session_band: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CampaignRelationshipDraft {
+    from: Option<String>,
+    to: Option<String>,
+    relation: Option<String>,
+    tension: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -515,6 +669,33 @@ struct DetectiveAiCaseDraft {
     /// Where each knowledge point landed. Hard-validated against the must-cover
     /// list + COVERAGE_MIN_POINTS in `apply_ai_case_draft`.
     coverage: Option<Vec<CoverageDraft>>,
+    /// The 推理 spine the draft realized (carried from the outline pass, may be
+    /// refined by the draft / editor pass).
+    case_logic: Option<CaseLogicDraft>,
+    /// What this chapter contributes to the campaign's 暗线.
+    meta_beat: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CaseLogicDraft {
+    truth: Option<String>,
+    culprit: Option<String>,
+    motive: Option<String>,
+    red_herrings: Option<Vec<String>>,
+    deduction_chain: Option<Vec<String>>,
+}
+
+/// Pass A output (the parts Rust reads back). The FULL outline — act plan,
+/// coverage plan, per-act lie targets — is carried to the draft pass verbatim
+/// as an embedded JSON string, so those fields don't need to round-trip through
+/// Rust; only the logic spine / 暗线 beat / session number are reused here.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CaseOutlineDraft {
+    session_num: Option<i32>,
+    case_logic: Option<CaseLogicDraft>,
+    meta_beat: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -763,7 +944,63 @@ pub async fn detective_generate_chapter(
         align.insert(live_id.clone(), case.session_num as i32);
         save_align(&db, &course_key, &align);
     }
+    // Fold this chapter's 暗线 beat + established truth into the campaign canon
+    // so later (independently generated) chapters share one coherent world.
+    record_chapter_canon(&db, &course_key, &case);
     Ok(case)
+}
+
+/// Fold a freshly generated chapter's 暗线 beat + truth into the campaign canon
+/// (weak-continuity: chapters are independent, but read a shared, deduped,
+/// bounded canon so they stay mutually consistent). No-op until the chapter
+/// generator actually emits `meta_beat` / `case_logic` (Phase 2).
+fn record_chapter_canon(db: &Database, course_key: &str, case: &DetectiveCase) {
+    let Some(mut campaign) = load_campaign(db, course_key) else {
+        return;
+    };
+    let mut changed = false;
+
+    let beat = case.meta_beat.trim();
+    if !beat.is_empty()
+        && !campaign
+            .canon
+            .dropped_hooks
+            .iter()
+            .any(|h| h.chapter_id == case.id || h.hook == beat)
+    {
+        campaign.canon.dropped_hooks.push(CanonHook {
+            stage: 0,
+            hook: truncate_chars(beat, 200),
+            chapter_id: case.id.clone(),
+        });
+        changed = true;
+    }
+
+    let truth = case.case_logic.truth.trim();
+    if !truth.is_empty() {
+        let fact = truncate_chars(truth, 200);
+        if !campaign.canon.facts.iter().any(|f| f == &fact) {
+            campaign.canon.facts.push(fact);
+            changed = true;
+        }
+    }
+
+    // Bound growth (keep most recent).
+    if campaign.canon.facts.len() > 40 {
+        let cut = campaign.canon.facts.len() - 40;
+        campaign.canon.facts.drain(0..cut);
+        changed = true;
+    }
+    if campaign.canon.dropped_hooks.len() > 30 {
+        let cut = campaign.canon.dropped_hooks.len() - 30;
+        campaign.canon.dropped_hooks.drain(0..cut);
+        changed = true;
+    }
+
+    if changed {
+        campaign.updated_at = crate::db::epoch_secs();
+        save_campaign(db, &campaign);
+    }
 }
 
 #[tauri::command]
@@ -1107,6 +1344,8 @@ fn build_case(course: &DetectiveCourse) -> DetectiveCase {
         knowledge_points: Vec::new(),
         coverage: Vec::new(),
         acts: Vec::new(),
+        case_logic: CaseLogic::default(),
+        meta_beat: String::new(),
     }
 }
 
@@ -1159,12 +1398,57 @@ fn looks_like_metadata(text: &str) -> bool {
         || text.starts_with("終了:")
 }
 
-/// Generate a Detective case via the configured AI provider. There is no
-/// fallback: every failure mode returns `Err`, which the frontend surfaces.
-/// Each step is logged to both `log::` and `eprintln!` so a developer can
-/// confirm in `cargo tauri dev` output that the AI was actually called.
+/// Run one AI turn that must return a single JSON object, and extract it.
+/// Shared by the three chapter-generation passes.
+async fn detective_ai_json(
+    provider: &crate::agent_provider::AgentProvider,
+    max_tokens: u32,
+    system: &str,
+    user: String,
+    temperature: f32,
+    think_budget_pct: u32,
+    tag: &str,
+) -> Result<String, String> {
+    let messages = vec![
+        crate::ai::ChatMessage {
+            role: "system".to_string(),
+            content: system.to_string(),
+            images: Vec::new(),
+        },
+        crate::ai::ChatMessage {
+            role: "user".to_string(),
+            content: user,
+            images: Vec::new(),
+        },
+    ];
+    let raw = provider
+        .plan(messages, max_tokens, temperature, "", think_budget_pct, tag)
+        .await
+        .map_err(|e| format!("AI call failed: {e}"))?;
+    eprintln!("[detective] {tag} raw BEGIN ===\n{}\n=== END", raw);
+    extract_json_object(&raw).ok_or_else(|| {
+        let preview = truncate_chars(raw.trim(), 300);
+        if raw.trim().is_empty() {
+            "AI returned an empty response (the model may have refused or been blocked)."
+                .to_string()
+        } else {
+            format!("AI did not return JSON. The response begins with: \"{preview}\"")
+        }
+    })
+}
+
+/// Generate a Detective chapter via a three-pass AI pipeline (outline → draft →
+/// editor). There is no silent fallback to a worse case: the outline + draft
+/// passes are required and surface `Err` on failure; the editor pass only ever
+/// *improves* the draft and never regresses it.
+///   Pass A — outline: the 推理 spine (truth/culprit/motive/red herrings/
+///     deduction chain) + act plan + 暗线 beat. Logic only, no prose.
+///   Pass B — draft: the full chapter written to conform to the outline.
+///   Pass C — editor: a consistency critique that may return a repaired draft.
+/// The hard structural + content + coverage gate (`apply_ai_case_draft`) runs
+/// on whichever draft we keep.
 async fn generate_case_with_ai(
-    mut case: DetectiveCase,
+    case: DetectiveCase,
     input: Vec<EvidenceInputEntry>,
     memory: DetectiveMemory,
     campaign: Option<DetectiveCampaign>,
@@ -1173,15 +1457,10 @@ async fn generate_case_with_ai(
 ) -> Result<DetectiveCase, String> {
     let cfg = crate::ai::load_ai_config();
     eprintln!(
-        "[detective] generate_case_with_ai: course={} ai_enabled={} input_sources={}",
+        "[detective] generate_case_with_ai (3-pass): course={} ai_enabled={} input_sources={}",
         case.course_name,
         cfg.ai_enabled,
         input.len()
-    );
-    log::info!(
-        "[detective] generate_case_with_ai start: course={} ai_enabled={}",
-        case.course_name,
-        cfg.ai_enabled
     );
 
     if !cfg.ai_enabled {
@@ -1190,7 +1469,6 @@ async fn generate_case_with_ai(
                 .to_string(),
         );
     }
-
     if input.is_empty() {
         return Err(
             "No Live notes or exam signals are available for this course. Capture a Live session or wait for notifications, then try again.".to_string(),
@@ -1199,112 +1477,156 @@ async fn generate_case_with_ai(
 
     let provider = crate::agent_provider::AgentProvider::resolve().map_err(|e| {
         eprintln!("[detective] provider resolve FAILED: {}", e);
-        log::warn!("[detective] provider resolve failed: {}", e);
         format!("AI provider unavailable: {e}")
     })?;
-    eprintln!("[detective] AI provider resolved");
-    log::info!("[detective] AI provider resolved");
 
-    let user_prompt = detective_ai_user_prompt(
+    // Scale the chapter's structure targets to how much testable content this
+    // Live note actually yielded — thin notes get a tighter (but real) chapter.
+    let targets = gen_targets(knowledge.len());
+    eprintln!(
+        "[detective] targets: {} knowledge pts → acts {}–{}, coverage {}, lies {}",
+        knowledge.len(),
+        targets.acts_min,
+        targets.acts_max,
+        targets.coverage_min,
+        targets.lies_min
+    );
+
+    // ── Pass A — outline (推理 & 暗线 skeleton) ─────────────────────────────
+    let outline_user = detective_outline_user_prompt(
         &case,
         &input,
         &memory,
         campaign.as_ref(),
         &syllabus,
         &knowledge,
+        &targets,
     );
-    let prompt_chars = user_prompt.chars().count();
-    eprintln!(
-        "[detective] AI prompt ready ({} chars, {} input sources)",
-        prompt_chars,
-        input.len()
-    );
-    log::info!("[detective] AI prompt ready ({} chars)", prompt_chars);
+    eprintln!("[detective] PASS A (outline) dispatching…");
+    let outline_json = detective_ai_json(
+        &provider,
+        cfg.max_tokens,
+        detective_outline_system_prompt(),
+        outline_user,
+        0.4,
+        25,
+        &format!("detective-outline:{}", case.id),
+    )
+    .await
+    .map_err(|e| format!("案件の推理プロットの生成に失敗しました（Pass A）: {e}"))?;
+    let outline: CaseOutlineDraft = serde_json::from_str(&outline_json)
+        .map_err(|e| format!("Outline JSON parse failed (Pass A): {e}"))?;
 
-    let messages = vec![
-        crate::ai::ChatMessage {
-            role: "system".to_string(),
-            content: detective_ai_system_prompt().to_string(),
-            images: Vec::new(),
-        },
-        crate::ai::ChatMessage {
-            role: "user".to_string(),
-            content: user_prompt,
-            images: Vec::new(),
-        },
-    ];
-
-    // Use the user-configured max_tokens. `0` means "let provider pick default";
-    // providers fall back to 8192 / 32768 — plenty for our JSON shape.
-    eprintln!(
-        "[detective] AI plan() call dispatching (max_tokens={})",
-        cfg.max_tokens
+    // ── Pass B — draft (full chapter prose conforming to the outline) ──────
+    let draft_user = format!(
+        "{base}\n\n═══ 承認済みプロット（このスケルトンに厳密に従う） ═══\n{outline}\n\n上のプロットが合意済みの推理スパイン＋幕構成です。本章を執筆する際は必ず: (1) 幕の数と種類が `actPlan` と一致する。(2) 各 testimony 幕で仕込む唯一の嘘は、その幕の `lieAbout` が指す“既に教えた事実”を歪める。(3) `coveragePlan` の知識点 id をすべて被覆する。(4) `caseLogic`（実際に書いた内容に合わせて微調整可）と `metaBeat` をトップレベルで返す。(5) CAMPAIGN WORLD・世界の正典・投下済みの伏線とすべて整合させる。",
+        base = detective_ai_user_prompt(&case, &input, &memory, campaign.as_ref(), &syllabus, &knowledge, &targets),
+        outline = outline_json,
     );
-    let raw = provider
-        .plan(
-            messages,
-            cfg.max_tokens,
-            0.2,
-            "",
-            20,
-            &format!("detective:{}", case.id),
-        )
+    eprintln!("[detective] PASS B (draft) dispatching ({} chars)…", draft_user.chars().count());
+    let draft_json = detective_ai_json(
+        &provider,
+        cfg.max_tokens,
+        detective_ai_system_prompt(),
+        draft_user,
+        0.2,
+        20,
+        &format!("detective:{}", case.id),
+    )
+    .await
+    .map_err(|e| format!("案件の本文生成に失敗しました（Pass B）: {e}"))?;
+
+    // Parse + apply + hard-validate a draft JSON onto a fresh case shell.
+    let parse_apply = |json: &str, base: DetectiveCase| -> Result<DetectiveCase, String> {
+        let d: DetectiveAiCaseDraft = serde_json::from_str(json)
+            .map_err(|e| format!("draft JSON parse failed: {e}"))?;
+        apply_ai_case_draft(base, d, &input, &knowledge, &targets)
+    };
+    let applied = parse_apply(&draft_json, case.clone())?;
+    eprintln!(
+        "[detective] PASS B accepted: acts={} evidence={} testimony={}",
+        applied.acts.len(),
+        applied.evidence.len(),
+        applied.testimony.len()
+    );
+
+    // ── Pass C — editor critique / repair (best-effort, never regresses) ───
+    let mut final_case = applied;
+    match detective_editor_pass(&provider, &cfg, &draft_json, campaign.as_ref(), &knowledge, &case.id)
         .await
-        .map_err(|e| {
-            eprintln!("[detective] AI plan() FAILED: {}", e);
-            log::warn!("[detective] AI plan failed: {}", e);
-            format!("AI call failed: {e}")
-        })?;
+    {
+        Ok(Some(patched_json)) => match parse_apply(&patched_json, case.clone()) {
+            Ok(better) => {
+                eprintln!("[detective] PASS C: editor repair applied + revalidated");
+                final_case = better;
+            }
+            Err(e) => eprintln!("[detective] PASS C: repair rejected ({e}); keeping Pass B draft"),
+        },
+        Ok(None) => eprintln!("[detective] PASS C: editor reports no changes needed"),
+        Err(e) => eprintln!("[detective] PASS C skipped (non-fatal): {e}"),
+    }
 
-    let raw_chars = raw.chars().count();
-    eprintln!("[detective] AI returned {} chars", raw_chars);
-    log::info!("[detective] AI raw response: {} chars", raw_chars);
-    // Always log the full raw response so the developer terminal shows exactly
-    // what the AI produced.
-    eprintln!(
-        "[detective] AI raw response BEGIN ===\n{}\n=== END raw response",
-        raw
-    );
-    log::debug!("[detective] AI raw: {}", raw);
-
-    let json = extract_json_object(&raw).ok_or_else(|| {
-        let preview = truncate_chars(raw.trim(), 300);
-        eprintln!("[detective] AI returned non-JSON output. Preview: {}", preview);
-        log::warn!("[detective] AI returned non-JSON output. Preview: {}", preview);
-        if raw.trim().is_empty() {
-            "AI returned an empty response. The model may have refused or the request may have been blocked. Check the terminal log for details.".to_string()
-        } else {
-            format!(
-                "AI did not return JSON. The response begins with: \"{preview}\". Try again, or check that the model supports JSON output."
-            )
+    // Backfill the logic spine / 暗线 beat / session number from the outline if
+    // the draft didn't echo them.
+    if final_case.case_logic.truth.trim().is_empty() {
+        if let Some(logic) = outline.case_logic {
+            final_case.case_logic = resolve_case_logic(logic);
         }
-    })?;
+    }
+    if final_case.meta_beat.trim().is_empty() {
+        if let Some(beat) = clean_ai_text(outline.meta_beat, 300)
+            .filter(|t| !looks_like_metadata_leak(t) && !looks_like_platitude(t))
+        {
+            final_case.meta_beat = beat;
+        }
+    }
+    if final_case.session_num == 0 {
+        final_case.session_num = outline.session_num.unwrap_or(0).clamp(0, 99) as u8;
+    }
 
-    let draft: DetectiveAiCaseDraft = serde_json::from_str(&json).map_err(|e| {
-        let preview = truncate_chars(json.trim(), 300);
-        eprintln!(
-            "[detective] AI JSON parse FAILED: {}. JSON preview: {}",
-            e, preview
-        );
-        log::warn!("[detective] AI JSON parse failed: {}", e);
-        format!("AI JSON parse failed: {e}. JSON begins with: \"{preview}\"")
-    })?;
-    eprintln!("[detective] AI JSON parsed OK");
-    log::info!("[detective] AI JSON parsed");
-
-    case = apply_ai_case_draft(case, draft, &input, &knowledge)?;
     eprintln!(
-        "[detective] AI case ACCEPTED: testimony={} evidence={} briefing={}chars",
-        case.testimony.len(),
-        case.evidence.len(),
-        case.briefing.chars().count()
+        "[detective] case ACCEPTED: acts={} evidence={} culprit={:?} chain={}",
+        final_case.acts.len(),
+        final_case.evidence.len(),
+        final_case.case_logic.culprit,
+        final_case.case_logic.deduction_chain.len()
     );
-    log::info!(
-        "[detective] AI case accepted: testimony={} evidence={}",
-        case.testimony.len(),
-        case.evidence.len()
-    );
-    Ok(case)
+    Ok(final_case)
+}
+
+/// Pass C: ask an editor model to critique the draft for logical consistency,
+/// motive traceability, fair-play clueing, 暗线-stage fit, and canon consistency.
+/// Returns `Ok(Some(json))` with a fully-repaired draft when it found problems,
+/// `Ok(None)` when the draft is already clean, or `Err` on AI failure.
+async fn detective_editor_pass(
+    provider: &crate::agent_provider::AgentProvider,
+    cfg: &crate::ai::AiConfig,
+    draft_json: &str,
+    campaign: Option<&DetectiveCampaign>,
+    knowledge: &[KnowledgePoint],
+    case_id: &str,
+) -> Result<Option<String>, String> {
+    let user = detective_editor_user_prompt(draft_json, campaign, knowledge);
+    let json = detective_ai_json(
+        provider,
+        cfg.max_tokens,
+        detective_editor_system_prompt(),
+        user,
+        0.1,
+        15,
+        &format!("detective-editor:{case_id}"),
+    )
+    .await?;
+    #[derive(Deserialize)]
+    struct Env {
+        ok: Option<bool>,
+    }
+    if let Ok(env) = serde_json::from_str::<Env>(&json) {
+        if env.ok == Some(true) {
+            return Ok(None);
+        }
+    }
+    Ok(Some(json))
 }
 
 /// Generate the campaign bible (世界観 layer) for one course. AI-required.
@@ -1454,8 +1776,32 @@ async fn generate_campaign_bible(
                     .collect(),
                 reveal: a.reveal.unwrap_or_default().trim().to_string(),
                 unlocked: false,
+                setup: a.setup.unwrap_or_default().trim().to_string(),
+                misdirection: a.misdirection.unwrap_or_default().trim().to_string(),
+                session_band: a.session_band.unwrap_or_default().trim().to_string(),
             }
         })
+        .collect();
+
+    let relationships: Vec<CampaignRelationship> = draft
+        .relationships
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|r| {
+            let from = r.from.unwrap_or_default().trim().to_string();
+            let to = r.to.unwrap_or_default().trim().to_string();
+            let relation = r.relation.unwrap_or_default().trim().to_string();
+            if from.is_empty() || to.is_empty() || relation.is_empty() {
+                return None;
+            }
+            Some(CampaignRelationship {
+                from,
+                to,
+                relation,
+                tension: r.tension.unwrap_or_default().trim().to_string(),
+            })
+        })
+        .take(5)
         .collect();
 
     let finale = draft.finale.unwrap_or_default().trim().to_string();
@@ -1480,6 +1826,8 @@ async fn generate_campaign_bible(
         meta_arc,
         finale,
         chapters: Vec::new(),
+        relationships,
+        canon: CampaignCanon::default(),
         created_at: now,
         updated_at: now,
     })
@@ -1499,11 +1847,132 @@ async fn ensure_campaign(
     Ok(campaign)
 }
 
+/// Rewrite a completed campaign's finale to pay off the REAL accumulated canon
+/// (chapter beats, established facts, the staged 暗线 reveals) rather than the
+/// static guess written at bible time. Only fires once a campaign hits 100%;
+/// the frontend calls this when a chapter clear pushes progress to completion.
+#[tauri::command]
+pub async fn detective_finalize_finale(
+    db: tauri::State<'_, Database>,
+    course_key: String,
+) -> Result<DetectiveCampaign, String> {
+    let Some(mut campaign) = load_campaign(&db, &course_key) else {
+        return Err("この科目の世界観がまだありません。".to_string());
+    };
+    if campaign.meta_progress < 100 {
+        return Ok(campaign);
+    }
+    let cfg = crate::ai::load_ai_config();
+    if !cfg.ai_enabled {
+        return Ok(campaign); // keep the static finale when AI is off
+    }
+    let provider = crate::agent_provider::AgentProvider::resolve()
+        .map_err(|e| format!("AI provider unavailable: {e}"))?;
+    let user = finale_user_prompt(&campaign);
+    let json = detective_ai_json(
+        &provider,
+        cfg.max_tokens,
+        finale_system_prompt(),
+        user,
+        0.5,
+        20,
+        &format!("detective-finale:{course_key}"),
+    )
+    .await?;
+    #[derive(Deserialize)]
+    struct FinaleDraft {
+        finale: Option<String>,
+    }
+    let draft: FinaleDraft =
+        serde_json::from_str(&json).map_err(|e| format!("Finale JSON parse failed: {e}"))?;
+    let finale = draft.finale.unwrap_or_default().trim().to_string();
+    if finale.is_empty() {
+        return Ok(campaign);
+    }
+    campaign.finale = finale;
+    campaign.updated_at = crate::db::epoch_secs();
+    save_campaign(&db, &campaign);
+    eprintln!("[detective] finale finalized for {course_key}");
+    Ok(campaign)
+}
+
+fn finale_system_prompt() -> &'static str {
+    "You are the lead writer closing out a long-running 逆転裁判-style study-mystery campaign. The season is complete. Write the GRAND FINALE — the epilogue shown once, when the player has cleared every chapter.\n\nThis finale must PAY OFF what actually happened, not restate the premise: resolve the 暗线 conspiracy conclusively (name the antagonist force + their motive), land the setups that were planted across the staged reveals, honour the established canon facts, and give the recurring cast a final beat consistent with their motivation/stakes. End on a strong closing image. 4–6 Japanese sentences, evocative and conclusive — no cliffhanger.\n\nOUTPUT — a single JSON object, nothing else: {\"finale\": \"…4–6文の日本語…\"}"
+}
+
+fn finale_user_prompt(c: &DetectiveCampaign) -> String {
+    let cast = if c.cast.is_empty() {
+        "(なし)".to_string()
+    } else {
+        c.cast
+            .iter()
+            .map(|m| format!("- {}（{}）動機:{} 利害:{}", m.name, m.role, m.motivation, m.stake))
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    let arc = if c.meta_arc.is_empty() {
+        "(なし)".to_string()
+    } else {
+        c.meta_arc
+            .iter()
+            .map(|r| format!("- 第{}段階「{}」: {}", r.stage, r.title, r.reveal))
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    let facts = if c.canon.facts.is_empty() {
+        "(なし)".to_string()
+    } else {
+        c.canon
+            .facts
+            .iter()
+            .map(|f| format!("- {f}"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    let chapters = if c.chapters.is_empty() {
+        "(なし)".to_string()
+    } else {
+        c.chapters
+            .iter()
+            .map(|ch| format!("- {}", ch.title))
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    format!(
+        r#"世界観: {label}
+舞台設定: {setting}
+暗线（meta-mystery）: {meta}
+
+登場人物:
+{cast}
+
+段階的に明かされた真相（metaArc — すべて解禁済み）:
+{arc}
+
+積み上がった正典（実際に起きた事実）:
+{facts}
+
+辿ってきた章:
+{chapters}
+
+═══ TASK ═══
+上のすべてを踏まえ、キャンペーンの大団円（finale）を書いてください。暗线を決定的に解決し、各段階の布石を回収し、正典と矛盾せず、登場人物に最後の一拍を与え、強い締めの画で終える。4〜6文の日本語。JSON のみで返す: {{"finale": "…"}}"#,
+        label = c.world_label,
+        setting = c.setting,
+        meta = c.meta_mystery,
+        cast = cast,
+        arc = arc,
+        facts = facts,
+        chapters = chapters,
+    )
+}
+
 /// Extract a knowledge-point checklist from one Live note (cheap AI pass).
 /// Live notes typically already contain list-like structures (「今日のポイント」/
 /// 「まとめ」/「要点」/箇条書き) — the prompt is wired to USE THEM FIRST and
-/// only then augment from prose. Returns ≥12 points so the chapter generator
-/// has slack to cover the mandatory 10.
+/// only then augment from prose. The prompt still asks for 12–20 points; the
+/// hard floor is `KNOWLEDGE_FLOOR`, and `gen_targets` scales a thinner chapter
+/// down to fit whatever the note actually yielded.
 async fn extract_knowledge_points(
     course_key: &str,
     course_name: &str,
@@ -1641,11 +2110,10 @@ async fn extract_knowledge_points(
             must_cover: d.must_cover.unwrap_or(false),
         });
     }
-    if out.len() < COVERAGE_MIN_POINTS + 2 {
+    if out.len() < KNOWLEDGE_FLOOR {
         return Err(format!(
-            "Knowledge extraction yielded only {} usable points; need at least {}",
+            "Knowledge extraction yielded only {} usable points; need at least {KNOWLEDGE_FLOOR}",
             out.len(),
-            COVERAGE_MIN_POINTS + 2
         ));
     }
     eprintln!(
@@ -1664,7 +2132,7 @@ async fn ensure_knowledge_points(
     topic_hint: &str,
 ) -> Result<Vec<KnowledgePoint>, String> {
     if let Some(existing) = load_knowledge_points(db, &course.key, live_id) {
-        if existing.len() >= COVERAGE_MIN_POINTS {
+        if existing.len() >= KNOWLEDGE_FLOOR {
             return Ok(existing);
         }
     }
@@ -1684,7 +2152,7 @@ async fn ensure_knowledge_points(
 }
 
 fn detective_ai_system_prompt() -> &'static str {
-    "You author a Japanese Ace-Attorney-style cross-examination case that helps the player STUDY THE TESTABLE LECTURE CONTENT from the supplied Live notes. The case is review study — not a slice-of-life game.\n\nOUTPUT FORMAT — MANDATORY:\n- Output a single JSON object and nothing else.\n- Start your response with `{` and end with `}`.\n- Do NOT wrap in markdown code fences (```).\n- Do NOT add prose, preamble, explanation, comments, or trailing text.\n- Do NOT use a tool call wrapper; just emit raw JSON.\n\nINPUT KINDS:\n- LIVE notes (sourceType=live): the body text is what the teacher actually taught. THIS IS THE PRIMARY SOURCE. Extract testable knowledge from here: concepts, definitions, taxonomies, examples, formulas, theorems, classifications, historical facts, named processes, instructor explanations of meaning.\n- SIGNAL notifications (sourceType=signal): use ONLY for exam-CONTEXT (exam date, exam range, format, allowed materials, number of questions, weighting). Use them to anchor the urgency, NEVER as a topic.\n- DOUBT items (sourceType=doubt): pull the player's previously-flagged knowledge gaps as priority topics.\n\nABSOLUTE FOCUS RULE — every evidence card body, every testimony statement, every press response must be about TESTABLE COURSE KNOWLEDGE. The following CONTENT IS FORBIDDEN regardless of whether it appears in the supplied notes:\n- Administrative trivia: 学籍番号 / ネームカード / レポート提出方法 / 用紙の色・サイズ / 出欠の取り方 / 教室の場所 / 持参物 (pen, USB) / 提出期限の机械的記述 / ファイル命名規則 / Word vs PDF / その他「事務連絡」\n- Class logistics: 休講連絡, 補講日程, 教員の余談, アイスブレイクの内容, 自己紹介, 出席確認のやり方\n- General-knowledge questions that don't tie back to a specific concept the teacher explained\n- Filenames (.md, _live), ISO dates (YYYY-MM-DD), course codes, instructor names, classroom numbers\n- Generic placeholder labels (ライブメモ, 授業ノート, 講義メモ, 本講義の記録)\n- Empty platitudes (重要な内容がある, 記録が残っている, 資料を確認できる)\n- Any fact, number, date, or chapter not literally present in the supplied content\n\nIf the supplied Live notes are MOSTLY administrative and contain little testable content, prefer producing FEWER evidence cards and FEWER lies — quality over quantity. Never invent topics to fill a quota.\n\nCHAPTER SCOPE — a chapter is the WHOLE lecture turned into a play. AIM HIGH: pull as many distinct testable points from the supplied Live note as it supports — definitions, examples, contrasts, numerical claims, classifications, named processes, instructor explanations. A thin chapter (few cards, few statements, single-line teaching) is a FAILURE; depth and breadth are mandatory.\n\nCHAPTER STRUCTURE — you write ONE chapter told in 6–8 ACTS (幕), like a 逆転裁判 episode. Acts ALTERNATE between two kinds:\n- INVESTIGATION act (kind=\"investigation\"): the teaching beat. A `narrative` (2–4 Japanese sentences) advances the plot, and 2–4 `evidence` cards reveal distilled facts from the content. The first act MUST be investigation.\n- TESTIMONY act (kind=\"testimony\"): the testing beat. A `narrative` brings a witness to the stand, and 3–5 `testimony` statements follow with EXACTLY ONE lie (`isFalse: true`). The TRUE statements are NOT filler — each is its own testable concept the player should learn.\n\nKEY CONSTRAINT — teaching before testing: a lie's `keyEvidenceId` MUST point at an evidence card revealed in an EARLIER investigation act. Never test a fact the player has not yet been shown. Provide at least 3 investigation acts and at least 3 testimony acts.\n\n- `scenario` (4–6 Japanese sentences): chapter prologue / hook — situation, witnesses, stakes — anchored in real concepts from the Live notes.\n- Per testimony act: `witnessName` (2–6 Japanese chars, an invented given name e.g. ミナミ/ジュン/ハル — NEVER an instructor name) and `witnessRole` (4–14 chars). Vary witnesses across testimony acts when natural.\n- All testimony in plain Japanese witness speech (〜だ / 〜である / 〜のはず), each statement under 140 characters. The true statements must reference DIFFERENT testable points (not paraphrases of each other).\n- Each evidence `body` is 2–5 sentences: state the fact, then add ONE concrete grounding element (example / counter-example / value / contrast / named instance the teacher used).\n\nFor every testimony statement, also provide:\n- `highlights`: 1–3 keywords COPIED VERBATIM from `text` — the concept name, value, or term to scrutinise.\n- `pressResponse`: 2–3 Japanese sentences. For TRUE statements, USE THIS TO TEACH — start from the concept and drill deeper (definition → concrete example → contrast / common confusion). For the FALSE statement, the witness doubles down for 2–3 sentences (deflect, change the subject, cite an unrelated 'fact'), but never reveals the lie.\n\nNARRATIVE & MOTIVATION: each act's `narrative` is a beat of the chapter's main plot, set in the campaign world's specific historical locus (era / named place / community). **Every character who speaks or acts must have a stated or inferable motive — what they want, what they protect**. The bible's cast comes with 背景/動機/利害; honour those. Witnesses you newly invent for this chapter need a one-sentence backstory + a reason for being on the stand, established in the testimony act's `narrative` before they speak. A witness whose lie has no plausible motive (cover an ally, save reputation, conceal involvement, defend a payoff) is a failure — make the motive shape their tone in `pressResponse`, without ever stating 「私は嘘をついている」. Seed the overarching hidden thread (暗线) with ONE subtle hint in a single early act (mark that act `seedsMeta: true`). Story is the vehicle that makes the testable content stick — never invent testable facts to serve story, and never invent story so thin that characters feel like quiz props."
+    "You author a Japanese Ace-Attorney-style cross-examination case that helps the player STUDY THE TESTABLE LECTURE CONTENT from the supplied Live notes. The case is review study — not a slice-of-life game.\n\nOUTPUT FORMAT — MANDATORY:\n- Output a single JSON object and nothing else.\n- Start your response with `{` and end with `}`.\n- Do NOT wrap in markdown code fences (```).\n- Do NOT add prose, preamble, explanation, comments, or trailing text.\n- Do NOT use a tool call wrapper; just emit raw JSON.\n\nINPUT KINDS:\n- LIVE notes (sourceType=live): the body text is what the teacher actually taught. THIS IS THE PRIMARY SOURCE. Extract testable knowledge from here: concepts, definitions, taxonomies, examples, formulas, theorems, classifications, historical facts, named processes, instructor explanations of meaning.\n- SIGNAL notifications (sourceType=signal): use ONLY for exam-CONTEXT (exam date, exam range, format, allowed materials, number of questions, weighting). Use them to anchor the urgency, NEVER as a topic.\n- DOUBT items (sourceType=doubt): pull the player's previously-flagged knowledge gaps as priority topics.\n\nABSOLUTE FOCUS RULE — every evidence card body, every testimony statement, every press response must be about TESTABLE COURSE KNOWLEDGE. The following CONTENT IS FORBIDDEN regardless of whether it appears in the supplied notes:\n- Administrative trivia: 学籍番号 / ネームカード / レポート提出方法 / 用紙の色・サイズ / 出欠の取り方 / 教室の場所 / 持参物 (pen, USB) / 提出期限の机械的記述 / ファイル命名規則 / Word vs PDF / その他「事務連絡」\n- Class logistics: 休講連絡, 補講日程, 教員の余談, アイスブレイクの内容, 自己紹介, 出席確認のやり方\n- General-knowledge questions that don't tie back to a specific concept the teacher explained\n- Filenames (.md, _live), ISO dates (YYYY-MM-DD), course codes, instructor names, classroom numbers\n- Generic placeholder labels (ライブメモ, 授業ノート, 講義メモ, 本講義の記録)\n- Empty platitudes (重要な内容がある, 記録が残っている, 資料を確認できる)\n- Any fact, number, date, or chapter not literally present in the supplied content\n\nIf the supplied Live notes are MOSTLY administrative and contain little testable content, prefer producing FEWER evidence cards and FEWER lies — quality over quantity. Never invent topics to fill a quota.\n\nCHAPTER SCOPE — a chapter is the WHOLE lecture turned into a play. AIM HIGH: pull as many distinct testable points from the supplied Live note as it supports — definitions, examples, contrasts, numerical claims, classifications, named processes, instructor explanations. A thin chapter (few cards, few statements, single-line teaching) is a FAILURE; depth and breadth are mandatory.\n\nCHAPTER STRUCTURE — you write ONE chapter told in 6–8 ACTS (幕), like a 逆転裁判 episode. Acts ALTERNATE between two kinds:\n- INVESTIGATION act (kind=\"investigation\"): the teaching beat. A `narrative` (2–4 Japanese sentences) advances the plot, and 2–4 `evidence` cards reveal distilled facts from the content. The first act MUST be investigation.\n- TESTIMONY act (kind=\"testimony\"): the testing beat. A `narrative` brings a witness to the stand, and 3–5 `testimony` statements follow with EXACTLY ONE lie (`isFalse: true`). The TRUE statements are NOT filler — each is its own testable concept the player should learn.\n\nKEY CONSTRAINT — teaching before testing: a lie's `keyEvidenceId` MUST point at an evidence card revealed in an EARLIER investigation act. Never test a fact the player has not yet been shown. Provide at least 3 investigation acts and at least 3 testimony acts.\n\n- `scenario` (4–6 Japanese sentences): chapter prologue / hook — situation, witnesses, stakes — anchored in real concepts from the Live notes.\n- Per testimony act: `witnessName` (2–6 Japanese chars, an invented given name e.g. ミナミ/ジュン/ハル — NEVER an instructor name) and `witnessRole` (4–14 chars). Vary witnesses across testimony acts when natural.\n- All testimony in plain Japanese witness speech (〜だ / 〜である / 〜のはず), each statement under 140 characters. The true statements must reference DIFFERENT testable points (not paraphrases of each other).\n- Each evidence `body` is 2–5 sentences: state the fact, then add ONE concrete grounding element (example / counter-example / value / contrast / named instance the teacher used).\n\nFor every testimony statement, also provide:\n- `highlights`: 1–3 keywords COPIED VERBATIM from `text` — the concept name, value, or term to scrutinise.\n- `pressResponse`: 2–3 Japanese sentences. For TRUE statements, USE THIS TO TEACH — start from the concept and drill deeper (definition → concrete example → contrast / common confusion). For the FALSE statement, the witness doubles down for 2–3 sentences (deflect, change the subject, cite an unrelated 'fact'), but never reveals the lie.\n\nNARRATIVE & MOTIVATION: each act's `narrative` is a beat of the chapter's main plot, set in the campaign world's specific historical locus (era / named place / community). **Every character who speaks or acts must have a stated or inferable motive — what they want, what they protect**. The bible's cast comes with 背景/動機/利害; honour those. Witnesses you newly invent for this chapter need a one-sentence backstory + a reason for being on the stand, established in the testimony act's `narrative` before they speak. A witness whose lie has no plausible motive (cover an ally, save reputation, conceal involvement, defend a payoff) is a failure — make the motive shape their tone in `pressResponse`, without ever stating 「私は嘘をついている」. Seed the overarching hidden thread (暗线) with ONE subtle hint in a single early act (mark that act `seedsMeta: true`). Story is the vehicle that makes the testable content stick — never invent testable facts to serve story, and never invent story so thin that characters feel like quiz props.\n\nPROFESSIONAL SCREENWRITING BAR: write at the level of a produced 逆転裁判 scenario. Scenes open in the middle of tension (in medias res), each act ends on a hook that pulls into the next, dialogue has subtext and voice (witnesses don't narrate exposition — they reveal it under pressure), and the chapter has a clear dramatic shape (掴み → 転 → 山場 → 解決). The 明线 (this chapter's case) must be self-contained and fully resolved here; the 暗线 (the season's hidden conspiracy) advances by exactly the ONE planted beat the outline specifies — no more, no less.\n\nYOU ARE GIVEN AN APPROVED OUTLINE (推理プロット): follow its act plan, its planted lie per testimony act (`lieAbout`), its coverage plan, and its caseLogic. Do not invent a different culprit, motive, or structure. Realise the outline as polished prose.\n\nALSO EMIT (top-level): `caseLogic` { truth, culprit (prefer a bible cast name), motive, redHerrings[], deductionChain[] — the ordered steps by which the busted contradictions reconstruct the truth, the last step answering finalQuestion } and `metaBeat` (one Japanese sentence: what this chapter contributed to the 暗线, matching the outline's planted beat). These must be CONSISTENT with the written acts."
 }
 
 /// Build the AI user prompt. AI reads the raw source content and distills
@@ -1698,6 +2166,7 @@ fn detective_ai_user_prompt(
     campaign: Option<&DetectiveCampaign>,
     syllabus: &[PlannedSession],
     knowledge: &[KnowledgePoint],
+    targets: &GenTargets,
 ) -> String {
     fn render(entry: &EvidenceInputEntry, max_chars: Option<usize>) -> String {
         let body = entry.raw_content.replace('\r', "");
@@ -1877,7 +2346,15 @@ Produce exactly this JSON shape (no comments, no extra fields):
     {{ "pointId": "k2", "placement": "a2t1" }},
     {{ "pointId": "k3", "placement": "e3" }}
     /* …continue until every ★ point and at least {coverage_min} total are listed */
-  ]
+  ],
+  "caseLogic": {{
+    "truth": "1〜3文。この事件の真相（実際に何が起きていたか）。",
+    "culprit": "責任者（できれば世界観の登場人物名）。",
+    "motive": "なぜそうしたか／なぜ嘘をつくか（手段・機会も織り込む）。",
+    "redHerrings": ["もっともらしいが誤った手がかり1", "…2"],
+    "deductionChain": ["突きつけた矛盾1 → 導かれること", "矛盾2 → …", "最後に finalQuestion へ答える結論"]
+  }},
+  "metaBeat": "本章が暗线に与えた一拍（プロットの planted beat と一致、既出の伏線を繰り返さず新しい角度で）"
 }}
 
 `sourceRef` MUST be one of the input aliases above (l1/l2/.../s1/.../d1/...). Every evidence `id` is unique across the whole chapter. Each lie's `keyEvidenceId` MUST be an evidence id revealed in an EARLIER investigation act. Each `highlights` entry MUST be a verbatim substring of its `text`. Every text field MUST follow the CONTENT-ONLY RULE in the system message."#,
@@ -1890,9 +2367,158 @@ Produce exactly this JSON shape (no comments, no extra fields):
         must_cover_list = must_cover_list,
         campaign = format_campaign_section(campaign),
         memory = format_memory_section(memory),
-        acts_min = ACTS_MIN,
-        acts_max = ACTS_MAX,
-        coverage_min = COVERAGE_MIN_POINTS,
+        acts_min = targets.acts_min,
+        acts_max = targets.acts_max,
+        coverage_min = targets.coverage_min,
+    )
+}
+
+// ─── Pass A: outline (推理 & 暗线 skeleton) ────────────────────────────────
+
+fn detective_outline_system_prompt() -> &'static str {
+    "You are the story architect for a 逆転裁判-style study-mystery. Your job in THIS pass is ONLY the logical skeleton of one chapter — no prose, no dialogue. A separate writer will turn your outline into the finished script, so the skeleton must be airtight.\n\nOUTPUT FORMAT — MANDATORY: a single JSON object, nothing else. Start with `{` end with `}`. No code fences, no commentary.\n\nWHAT MAKES A PROFESSIONAL MYSTERY SKELETON:\n- A real 明线 (the chapter case): a concrete TRUTH of what happened, a responsible party (culprit — PREFER a campaign bible cast member), a MOTIVE with means + opportunity, and 2–3 fair-play RED HERRINGS (plausible wrong readings that the evidence later eliminates).\n- A DEDUCTION CHAIN: the ordered steps by which busting the planted contradictions reconstructs the truth; the final step answers the chapter's question. Each step must be logically entailed by an evidence card or a busted lie — no leaps, no clue from nowhere.\n- TEACHING-BEFORE-TESTING: every testimony act's planted lie distorts a fact that an EARLIER investigation act teaches. In `actPlan`, name that fact in `lieAbout`.\n- The 暗线 (season conspiracy) advances by EXACTLY ONE planted beat — the campaign's current stage `setup`/`misdirection`. It is seeded as a passing detail in ONE act (`seedsMeta: true`), NOT resolved here, and must NOT repeat an already-dropped hook.\n\nHARD STRUCTURE (the writer pass + validator enforce these — plan for them now):\n- 6–8 acts, ALTERNATING investigation ↔ testimony, the FIRST act investigation; at least 3 investigation and 3 testimony acts.\n- Each testimony act has exactly ONE lie. The whole chapter has at least 3 lies total.\n- The chapter must cover at least the required number of knowledge points (★ must-cover ones are non-negotiable). Map them in `coveragePlan` and per-act `knowledgeIds`.\n\nCONTENT RULE: everything ties to TESTABLE lecture knowledge from the supplied Live note. No administrative trivia, no filenames/dates/codes, no invented facts. If the note is thin, build a tighter chapter rather than padding with filler — but still respect the structure targets the user prompt gives you.\n\nOUTPUT SHAPE:\n{\n  \"sessionNum\": integer (which 授業計画 第N回 this lecture matches by content; 0 if unsure),\n  \"caseType\": one of [\"Exam Signal Case\",\"Concept Web Case\",\"Doubt Repair Case\",\"Contradiction Case\",\"Missing Link Case\"],\n  \"caseLogic\": { \"truth\": \"…\", \"culprit\": \"…\", \"motive\": \"…\", \"redHerrings\": [\"…\",\"…\"], \"deductionChain\": [\"…\",\"…\",\"最後に問いへ答える結論\"] },\n  \"metaBeat\": \"この章が暗线に与える一拍（現段階の布石を、新しい角度で）\",\n  \"actPlan\": [\n    { \"index\": 1, \"kind\": \"investigation\", \"beat\": \"この幕で何を捜査し何を教えるか(1文)\", \"knowledgeIds\": [\"k1\",\"k3\"], \"seedsMeta\": false },\n    { \"index\": 2, \"kind\": \"testimony\", \"beat\": \"誰がなぜ証言台に立つか(1文)\", \"lieAbout\": \"歪める既習事実（どの知識点/捜査結果か）\", \"knowledgeIds\": [\"k2\"], \"witnessName\": \"…\", \"witnessRole\": \"…\", \"seedsMeta\": true }\n  ],\n  \"coveragePlan\": [\"k1\",\"k2\",\"k3\", \"…★を全て含み、必要数以上\"]\n}\nKeep all human-readable text in Japanese."
+}
+
+/// Build the Pass A (outline) user prompt — the same source/knowledge/world
+/// context as the draft pass, but asking only for the logical skeleton.
+fn detective_outline_user_prompt(
+    case: &DetectiveCase,
+    input: &[EvidenceInputEntry],
+    memory: &DetectiveMemory,
+    campaign: Option<&DetectiveCampaign>,
+    syllabus: &[PlannedSession],
+    knowledge: &[KnowledgePoint],
+    targets: &GenTargets,
+) -> String {
+    let live = input
+        .iter()
+        .filter(|e| e.source_type == "live")
+        .map(|e| truncate_chars(e.raw_content.replace('\r', "").trim(), 6500))
+        .collect::<Vec<_>>()
+        .join("\n---\n");
+    let live = if live.trim().is_empty() {
+        "(本文未抽出)".to_string()
+    } else {
+        live
+    };
+    let signals = input
+        .iter()
+        .filter(|e| e.source_type == "signal")
+        .map(|e| truncate_chars(e.raw_content.trim(), 200))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let signals = if signals.trim().is_empty() {
+        "(none)".to_string()
+    } else {
+        signals
+    };
+    let knowledge_section = if knowledge.is_empty() {
+        "(知識点リスト未取得)".to_string()
+    } else {
+        knowledge
+            .iter()
+            .map(|p| {
+                let star = if p.must_cover { "★" } else { " " };
+                format!("- {star} `{}` {} — {}", p.id, p.label, truncate_chars(p.gist.trim(), 80))
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    let must_cover: Vec<&str> = knowledge
+        .iter()
+        .filter(|p| p.must_cover)
+        .map(|p| p.id.as_str())
+        .collect();
+    let syllabus_section = if syllabus.is_empty() {
+        "(授業計画は未取得。sessionNum は 0)".to_string()
+    } else {
+        syllabus
+            .iter()
+            .map(|s| {
+                let mode = if s.online { "（オンライン）" } else { "" };
+                format!("- 第{}回{}: {}", s.num, mode, truncate_chars(s.topic.trim(), 80))
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    format!(
+        r#"Course: {course}
+
+═══ LIVE LECTURE NOTE (primary source — the testable content) ═══
+{live}
+
+═══ Notifications (exam-context only) ═══
+{signals}
+
+═══ 授業計画 (match this lecture to its 第N回 by content) ═══
+{syllabus}
+
+═══ KNOWLEDGE POINTS (★ = must-cover) ═══
+{knowledge}
+must-cover ids: {must_cover}
+
+═══ CAMPAIGN WORLD (this chapter is a beat inside it) ═══
+{campaign}
+
+═══ MEMORY (player history — drive continuity) ═══
+{memory}
+
+═══ TASK ═══
+Design the LOGICAL SKELETON (推理プロット) of ONE chapter for this lecture, as a {acts_min}–{acts_max}-act 逆転裁判 episode. Decide the 明线 (truth/culprit/motive/red herrings/deduction chain), lay out the act plan (alternating investigation/testimony, first act investigation, ≥3 of each, exactly one lie per testimony act, ≥3 lies total), and plan knowledge-point coverage (every ★ + at least {coverage_min} total). Advance the 暗线 by exactly the campaign's CURRENT stage beat, seeded in one act (`seedsMeta:true`) and not repeating an already-dropped hook. Output ONLY the JSON object specified in the system message."#,
+        course = case.course_name,
+        live = live,
+        signals = signals,
+        syllabus = syllabus_section,
+        knowledge = knowledge_section,
+        must_cover = if must_cover.is_empty() { "(なし)".to_string() } else { must_cover.join(", ") },
+        campaign = format_campaign_section(campaign),
+        memory = format_memory_section(memory),
+        acts_min = targets.acts_min,
+        acts_max = targets.acts_max,
+        coverage_min = targets.coverage_min,
+    )
+}
+
+// ─── Pass C: editor critique / repair ──────────────────────────────────────
+
+fn detective_editor_system_prompt() -> &'static str {
+    "You are a senior script editor for a 逆転裁判-style study-mystery. You receive ONE chapter draft as JSON and audit it against a professional checklist. Your standard is high — a produced episode, not a rough cut.\n\nCHECKLIST:\n1. Logical consistency — the planted lie in each testimony act genuinely CONTRADICTS its `keyEvidenceId` card (revealed in an earlier investigation act). No lie keyed to a not-yet-shown card. The `caseLogic.deductionChain` actually follows from the evidence + busted lies and ends by answering `finalQuestion`.\n2. Motive traceability — every witness who lies has a plausible, inferable motive (cover an ally, protect reputation, conceal involvement, protect a payoff), consistent with the campaign cast's 背景/動機/利害 when a bible character is reused. `caseLogic.culprit` + `motive` are concrete.\n3. Fair play — red herrings are plausible but eliminable from the evidence; nothing is a cheat or a leap.\n4. 明线/暗线 — the chapter case resolves fully here; the 暗线 advances by exactly ONE seeded beat (`seedsMeta:true` on one act), consistent with the campaign's current stage and NOT repeating an already-dropped hook, NOT contradicting the world canon.\n5. Craft — scenes have subtext and voice, dialogue reveals under pressure rather than narrating, each act ends on a hook. press responses teach (for true statements) / deflect without confessing (for the lie).\n6. Content rule — everything is testable lecture knowledge; no admin trivia, filenames, dates-as-codes, invented facts; every ★ knowledge point is still covered.\n\nOUTPUT — MANDATORY, a single JSON object, nothing else:\n- If the draft already passes every check, output exactly: {\"ok\": true}\n- Otherwise output the FULL corrected chapter in the SAME JSON shape as the draft (all fields: caseType, difficulty, sessionNum, briefing, scenario, finalQuestion, acts[…], coverage[…], caseLogic{…}, metaBeat). Fix only what fails the checklist; preserve everything that already works, keep the same act count/kinds and the same knowledge coverage, and NEVER turn a correct testable fact into a wrong one. Keep all human-readable text in Japanese."
+}
+
+/// Build the Pass C (editor) user prompt: the draft JSON plus the consistency
+/// anchors (must-cover points, campaign canon) the editor must respect.
+fn detective_editor_user_prompt(
+    draft_json: &str,
+    campaign: Option<&DetectiveCampaign>,
+    knowledge: &[KnowledgePoint],
+) -> String {
+    let must_cover: Vec<&str> = knowledge
+        .iter()
+        .filter(|p| p.must_cover)
+        .map(|p| p.label.as_str())
+        .collect();
+    format!(
+        r#"═══ CAMPAIGN WORLD / CANON (the chapter must stay consistent with this) ═══
+{campaign}
+
+═══ MUST-COVER knowledge points (all must remain covered) ═══
+{must_cover}
+
+═══ CHAPTER DRAFT (audit + repair this) ═══
+{draft}
+
+Run the checklist from the system message. If it all passes, return {{"ok": true}}. Otherwise return the full corrected chapter JSON (same shape)."#,
+        campaign = format_campaign_section(campaign),
+        must_cover = if must_cover.is_empty() {
+            "(なし)".to_string()
+        } else {
+            must_cover
+                .iter()
+                .map(|m| format!("- {m}"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        },
+        draft = draft_json,
     )
 }
 
@@ -1938,13 +2564,81 @@ fn format_campaign_section(campaign: Option<&DetectiveCampaign>) -> String {
             .collect::<Vec<_>>()
             .join("\n")
     };
+    let relationships = if c.relationships.is_empty() {
+        "(未設定)".to_string()
+    } else {
+        c.relationships
+            .iter()
+            .map(|r| {
+                let tension = if r.tension.trim().is_empty() {
+                    String::new()
+                } else {
+                    format!("（{}）", r.tension.trim())
+                };
+                format!("- {} ⇄ {}: {}{}", r.from, r.to, r.relation, tension)
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    // The current暗线 target = the lowest stage not yet unlocked. Chapters at
+    // this point in the arc should plant THAT stage's setup + misdirection.
+    let current_stage = c
+        .meta_arc
+        .iter()
+        .find(|r| !r.unlocked)
+        .or_else(|| c.meta_arc.last());
+    let arc_section = match current_stage {
+        Some(stage) => {
+            let mut block = format!(
+                "今、伏線を進めるべき段階: 第{}段階「{}」(進行度 {}% で解禁)",
+                stage.stage, stage.title, stage.threshold
+            );
+            if !stage.setup.trim().is_empty() {
+                block.push_str(&format!("\n    埋めるべき布石: {}", stage.setup.trim()));
+            }
+            if !stage.misdirection.trim().is_empty() {
+                block.push_str(&format!("\n    効かせる誤導: {}", stage.misdirection.trim()));
+            }
+            block
+        }
+        None => "(段階未設定 — meta-mystery を一度だけ匂わせる)".to_string(),
+    };
+    // Already-dropped hooks so chapters vary their hints instead of repeating.
+    let dropped = if c.canon.dropped_hooks.is_empty() {
+        "(まだなし)".to_string()
+    } else {
+        c.canon
+            .dropped_hooks
+            .iter()
+            .rev()
+            .take(8)
+            .map(|h| format!("- {}", h.hook))
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    let facts = if c.canon.facts.is_empty() {
+        "(まだなし)".to_string()
+    } else {
+        c.canon
+            .facts
+            .iter()
+            .rev()
+            .take(12)
+            .map(|f| format!("- {f}"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
     format!(
-        "世界観ラベル: {label}\n舞台設定: {setting}\nキャッチコピー: {tagline}\n登場人物（再登場させてよい）:\n{cast}\n\n大きな暗线（meta-mystery — 全章を貫く隠された真相。今回は早期の伏線として “匂わせる” だけ。解決しない）:\n{meta}\n進行度: {progress}/100\nこれまでの章:\n{played}",
+        "世界観ラベル: {label}\n舞台設定: {setting}\nキャッチコピー: {tagline}\n登場人物（再登場させてよい — 既定の動機/利害に従わせる）:\n{cast}\n人物相関:\n{relationships}\n\n大きな暗线（meta-mystery — 全章を貫く隠された真相。本章では解決せず、下記の“今進めるべき段階”だけを布石として織り込む）:\n{meta}\n{arc}\n\n世界の正典（これと矛盾してはならない既定事実）:\n{facts}\nすでに投下済みの伏線（繰り返さず、新しい角度で）:\n{dropped}\n\n進行度: {progress}/100\nこれまでの章:\n{played}",
         label = c.world_label,
         setting = c.setting,
         tagline = if c.tagline.trim().is_empty() { "(なし)" } else { c.tagline.trim() },
         cast = cast,
+        relationships = relationships,
         meta = c.meta_mystery,
+        arc = arc_section,
+        facts = facts,
+        dropped = dropped,
         progress = c.meta_progress,
         played = played,
     )
@@ -2032,6 +2726,18 @@ Every cast member is a person, not a label. For each, write:
 
 The 暗线 is not just "a hidden truth". Name a **concrete antagonist force** — a person, a society, a guild, an institution — and give IT its own motivation (why are they hiding the truth? what do THEY want?). This makes the conspiracy feel real and the meta-arc reveals concrete.
 
+═══ THE META-ARC IS A STORYBOARD, NOT A SUMMARY ═══
+
+The 暗线 unfolds across the whole season. Design it like a professional serialized-mystery writer: each of the 4 stages is a STORYBOARD BEAT, not a vague summary. For each stage author THREE things that future chapters will execute:
+- `setup`: the concrete hook/clue chapters at this stage should plant (a recurring object, a slip of the tongue, an inconsistent record, a name that keeps surfacing). Plantable as a passing detail inside an ordinary chapter.
+- `misdirection`: the plausible-but-wrong reading that keeps the audience from guessing the truth too early — fair-play misdirection, not a cheat.
+- `reveal`: what the audience actually learns when this stage lands (player-facing text).
+Each stage must BUILD ON the previous one: (1) faint hint → (2) deepening clue that complicates stage 1 → (3) twist that recontextualises stages 1–2 → (4) full payoff naming the antagonist's identity + motivation. The reveals must be logically entailed by the setups (no clue appears from nowhere; no reveal contradicts an earlier stage).
+
+═══ RELATIONSHIPS GIVE THE WORLD TENSION ═══
+
+Cast members are not isolated. Author a small relationship web (2–4 edges) among the cast and the antagonist force — alliances, rivalries, debts, secret collaborations — each with the underlying tension that could erupt in a chapter.
+
 ═══ OUTPUT — return ONE JSON object, nothing else ═══
 {
   "worldLabel": "8–22 char Japanese label naming the SIGNATURE LOCUS (era + place), e.g. 「1965年・ミシシッピ綿花町」「1927年・コペンハーゲン」",
@@ -2048,13 +2754,16 @@ The 暗线 is not just "a hidden truth". Name a **concrete antagonist force** �
       "stake": "1 Japanese sentence — what they LOSE if the truth comes out"
     }
   ],
+  "relationships": [
+    { "from": "人物名/黒幕勢力", "to": "人物名/黒幕勢力", "relation": "関係(兄弟/師弟/対立/秘密の協力者…)", "tension": "燻る火種を1フレーズで" }
+  ],
   "metaArc": [
-    { "title": "短い見出し(〜12字)", "reveal": "1–2 Japanese sentences — this STAGE of unveiling the 暗线" }
+    { "title": "短い見出し(〜12字)", "setup": "この段階で各章が仕込むべき具体的な布石", "misdirection": "観客を真相から逸らす“もっともらしい誤読”", "reveal": "1–2 Japanese sentences — この段階で観客が知る事実(プレイヤー向け表示文)", "sessionBand": "担当する第N回の帯(例 \"1-3\")" }
   ],
   "finale": "3–5 Japanese sentences — the grand epilogue shown when the campaign is 100% complete. The conclusive resolution of the metaMystery: who/what was behind it, what they wanted, how the detective resolves it, the closing image."
 }
 
-Provide 2–3 cast members; one of them should plausibly be the antagonist force's local agent or someone whose stake aligns with the meta-mystery. `metaArc` = EXACTLY 4 ordered entries: (1) faint hint, (2) deepening clue, (3) twist that recontextualises earlier chapters, (4) full payoff revealing the antagonist's identity + motivation. `finale` lands AFTER stage 4. Keep everything in Japanese. Names, places, dates, and references must FEEL historically grounded — avoid totally invented place names when a real locus exists. Never invent facts that contradict the discipline."#
+Provide 2–3 cast members; one of them should plausibly be the antagonist force's local agent or someone whose stake aligns with the meta-mystery. Provide 2–4 `relationships`. `metaArc` = EXACTLY 4 ordered entries with the storyboard fields above: (1) faint hint, (2) deepening clue, (3) twist that recontextualises earlier chapters, (4) full payoff revealing the antagonist's identity + motivation; distribute `sessionBand` to roughly quarter the season. `finale` lands AFTER stage 4 and must pay off the setups planted in stages 1–4. Keep everything in Japanese. Names, places, dates, and references must FEEL historically grounded — avoid totally invented place names when a real locus exists. Never invent facts that contradict the discipline."#
 }
 
 fn campaign_bible_user_prompt(course_name: &str, input: &[EvidenceInputEntry]) -> String {
@@ -2225,6 +2934,7 @@ fn apply_ai_case_draft(
     draft: DetectiveAiCaseDraft,
     input: &[EvidenceInputEntry],
     knowledge: &[KnowledgePoint],
+    targets: &GenTargets,
 ) -> Result<DetectiveCase, String> {
     let case_type = clean_ai_text(draft.case_type, 48)
         .filter(|t| is_allowed_case_type(t))
@@ -2265,10 +2975,12 @@ fn apply_ai_case_draft(
     let Some(act_drafts) = draft.acts else {
         return Err("AI did not provide any acts (幕)".to_string());
     };
-    if act_drafts.len() < ACTS_MIN || act_drafts.len() > ACTS_MAX {
+    if act_drafts.len() < targets.acts_min || act_drafts.len() > targets.acts_max {
         return Err(format!(
-            "AI produced {} acts; a chapter needs {ACTS_MIN}–{ACTS_MAX} acts",
-            act_drafts.len()
+            "AI produced {} acts; a chapter needs {}–{} acts",
+            act_drafts.len(),
+            targets.acts_min,
+            targets.acts_max
         ));
     }
 
@@ -2411,9 +3123,10 @@ fn apply_ai_case_draft(
     if testimony_count == 0 {
         return Err("chapter has no testimony act".to_string());
     }
-    if total_lies < SESSION_LIES_MIN {
+    if total_lies < targets.lies_min {
         return Err(format!(
-            "chapter has only {total_lies} lies across its testimony acts; need at least {SESSION_LIES_MIN}"
+            "chapter has only {total_lies} lies across its testimony acts; need at least {}",
+            targets.lies_min
         ));
     }
 
@@ -2486,10 +3199,11 @@ fn apply_ai_case_draft(
                 missing_must.join(" / ")
             ));
         }
-        if covered_points.len() < COVERAGE_MIN_POINTS {
+        if covered_points.len() < targets.coverage_min {
             return Err(format!(
-                "chapter covered only {} knowledge points; need at least {COVERAGE_MIN_POINTS}",
-                covered_points.len()
+                "chapter covered only {} knowledge points; need at least {}",
+                covered_points.len(),
+                targets.coverage_min
             ));
         }
         case.knowledge_points = knowledge.to_vec();
@@ -2513,8 +3227,42 @@ fn apply_ai_case_draft(
 
     case.session_num = draft.session_num.unwrap_or(0).clamp(0, 99) as u8;
 
+    if let Some(logic) = draft.case_logic {
+        case.case_logic = resolve_case_logic(logic);
+    }
+    if let Some(beat) = clean_ai_text(draft.meta_beat, 300)
+        .filter(|t| !looks_like_metadata_leak(t) && !looks_like_platitude(t))
+    {
+        case.meta_beat = beat;
+    }
+
     case.generation_mode = "ai".to_string();
     Ok(case)
+}
+
+/// Resolve an AI `CaseLogicDraft` into the stored `CaseLogic`, trimming and
+/// bounding each field. Empty / metadata-leak fragments are dropped.
+fn resolve_case_logic(draft: CaseLogicDraft) -> CaseLogic {
+    let clean_one = |s: Option<String>, max: usize| -> String {
+        clean_ai_text(s, max)
+            .filter(|t| !looks_like_metadata_leak(t))
+            .unwrap_or_default()
+    };
+    let clean_list = |v: Option<Vec<String>>, max: usize, cap: usize| -> Vec<String> {
+        v.unwrap_or_default()
+            .into_iter()
+            .filter_map(|s| clean_ai_text(Some(s), max))
+            .filter(|t| !looks_like_metadata_leak(t))
+            .take(cap)
+            .collect()
+    };
+    CaseLogic {
+        truth: clean_one(draft.truth, 300),
+        culprit: clean_one(draft.culprit, 60),
+        motive: clean_one(draft.motive, 240),
+        red_herrings: clean_list(draft.red_herrings, 160, 4),
+        deduction_chain: clean_list(draft.deduction_chain, 200, 8),
+    }
 }
 
 /// Reject text that includes metadata patterns (filenames, ISO dates) that

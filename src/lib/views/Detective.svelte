@@ -157,6 +157,16 @@
     knowledgePoints: KnowledgePoint[];
     coverage: CoverageEntry[];
     acts: DetectiveAct[];
+    caseLogic: CaseLogic;
+    metaBeat: string;
+  }
+
+  interface CaseLogic {
+    truth: string;
+    culprit: string;
+    motive: string;
+    redHerrings: string[];
+    deductionChain: string[];
   }
 
   interface DetectiveDoubt {
@@ -277,6 +287,13 @@
   let bustedLieIds = $state<Set<string>>(new Set());
   let lives = $state(MAX_LIVES);
   let shakeKey = $state(0);
+  /// Cycling label for the multi-pass (outline → draft → editor) generation.
+  let loadingStage = $state(0);
+  const LOADING_STAGES = [
+    "推理プロットを構成中…",
+    "脚本を執筆中…",
+    "校閲して仕上げ中…",
+  ];
   let lastClosedTitle = $state("");
   let resolvedOk = $state(false);
 
@@ -424,6 +441,20 @@
     appThemeUnlisten?.();
     document.documentElement.removeAttribute("data-aux-surface");
     document.body.removeAttribute("data-aux-surface");
+  });
+
+  // Advance the loading label through the three generation passes while a
+  // chapter is being built (the backend runs them sequentially, no events).
+  $effect(() => {
+    if (scene !== "loading") {
+      loadingStage = 0;
+      return;
+    }
+    loadingStage = 0;
+    const id = setInterval(() => {
+      loadingStage = Math.min(loadingStage + 1, LOADING_STAGES.length - 1);
+    }, 9000);
+    return () => clearInterval(id);
   });
 
   async function refreshContext() {
@@ -857,6 +888,16 @@
         activeCampaign.metaProgress >= 100 &&
         progressAtStart < 100 &&
         !!activeCampaign.finale.trim();
+      // On completion, rewrite the finale to pay off the real accumulated canon
+      // (best-effort; keeps the static finale on failure).
+      if (campaignJustCompleted && selectedCourse) {
+        try {
+          await invoke("detective_finalize_finale", { courseKey: selectedCourse.key });
+          await refreshContext();
+        } catch (finaleErr) {
+          console.warn("[Detective] finale finalize failed", finaleErr);
+        }
+      }
       scene = "closed";
     } catch (e) {
       error = e instanceof Error ? e.message : String(e);
@@ -1201,7 +1242,8 @@
             <div class="stage-center">
               <div class="loading-card">
                 <span class="loading-spinner" aria-hidden="true"></span>
-                <p>{activeCourses.length}科目のライブメモから事件を生成中…</p>
+                <p>{LOADING_STAGES[loadingStage]}</p>
+                <span class="loading-sub">ライブメモから事件を構成しています</span>
               </div>
             </div>
           {:else if scene === "ai_error"}
@@ -1417,6 +1459,27 @@
                 {:else}
                 <span class="closed-stamp">{resolvedOk ? "事件解決" : "事件終了"}</span>
                 <h2>{lastClosedTitle}</h2>
+                {#if currentCase?.caseLogic && (currentCase.caseLogic.truth.trim() || currentCase.caseLogic.deductionChain.length)}
+                  {@const cl = currentCase.caseLogic}
+                  <div class="logic-panel">
+                    <span class="logic-eyebrow">推理の再構成</span>
+                    {#if questionText}<p class="logic-question">{questionText}</p>{/if}
+                    {#if cl.deductionChain.length}
+                      <ol class="logic-chain">
+                        {#each cl.deductionChain as step}<li>{step}</li>{/each}
+                      </ol>
+                    {/if}
+                    {#if cl.truth.trim()}<p class="logic-truth"><strong>真相</strong>{cl.truth}</p>{/if}
+                    {#if cl.culprit.trim() || cl.motive.trim()}
+                      <p class="logic-motive">
+                        {#if cl.culprit.trim()}<strong>{cl.culprit}</strong>{/if}{#if cl.motive.trim()} — {cl.motive}{/if}
+                      </p>
+                    {/if}
+                  </div>
+                {/if}
+                {#if currentCase?.metaBeat?.trim()}
+                  <p class="meta-beat"><span>暗線</span>{currentCase.metaBeat}</p>
+                {/if}
                 {#if coveredPoints.length > 0}
                   <div class="coverage-panel">
                     <span class="cov-eyebrow">本章で扱った論点 ({coveredPoints.length})</span>
@@ -1823,6 +1886,91 @@
   .cov-mark.must { color: var(--kg-gold); font-weight: 700; }
   .cov-label { color: var(--text-primary); font-weight: 600; }
   .cov-gist { color: var(--text-tertiary); }
+
+  /* Deduction reconstruction — the 明线 payoff on chapter clear. */
+  .logic-panel {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    width: 100%;
+    padding: 14px 16px;
+    border: 0.5px solid color-mix(in srgb, var(--green) 30%, var(--border));
+    border-radius: 10px;
+    background:
+      linear-gradient(180deg, rgba(52, 199, 89, 0.05), transparent 60%),
+      var(--bg-card);
+    text-align: left;
+  }
+  .logic-eyebrow {
+    font-size: 11px;
+    font-weight: 700;
+    letter-spacing: 0.16em;
+    color: var(--green);
+  }
+  .logic-question {
+    font-size: 13.5px;
+    font-weight: 650;
+    color: var(--text-primary);
+    line-height: 1.6;
+  }
+  .logic-chain {
+    list-style: decimal;
+    margin: 0;
+    padding-left: 20px;
+    display: flex;
+    flex-direction: column;
+    gap: 5px;
+  }
+  .logic-chain li {
+    font-size: 12.5px;
+    line-height: 1.7;
+    color: var(--text-secondary);
+  }
+  .logic-truth {
+    font-size: 12.5px;
+    line-height: 1.7;
+    color: var(--text-primary);
+  }
+  .logic-truth strong {
+    display: inline-block;
+    margin-right: 8px;
+    padding: 1px 8px;
+    border-radius: 4px;
+    background: color-mix(in srgb, var(--green) 16%, transparent);
+    color: var(--green);
+    font-size: 10.5px;
+    font-weight: 700;
+    letter-spacing: 0.06em;
+    vertical-align: middle;
+  }
+  .logic-motive {
+    font-size: 12.5px;
+    line-height: 1.65;
+    color: var(--text-secondary);
+  }
+  .logic-motive strong { color: var(--text-primary); }
+
+  /* What this chapter advanced in the 暗线 — a quiet badge line. */
+  .meta-beat {
+    display: flex;
+    align-items: baseline;
+    gap: 8px;
+    width: 100%;
+    font-size: 12px;
+    line-height: 1.6;
+    color: var(--text-secondary);
+    text-align: left;
+  }
+  .meta-beat span {
+    flex-shrink: 0;
+    padding: 1px 8px;
+    border-radius: 999px;
+    background: var(--kg-gold-light);
+    color: var(--kg-gold);
+    font-size: 10px;
+    font-weight: 700;
+    letter-spacing: 0.1em;
+  }
 
   .reveal-burst {
     display: flex;
@@ -2664,6 +2812,11 @@
     align-items: center;
     gap: 6px;
     margin: 0;
+    /* Without this, the flex default min-height:auto lets each cast figure's
+       automatic minimum balloon to the full stage height, stretching .cast-row
+       (and the whole trial-panel) and pushing the testimony + actions off
+       screen. Pin it so the figures size to their content. */
+    min-height: 0;
   }
   .cast-art {
     width: 64px;
@@ -2888,7 +3041,8 @@
   @keyframes spin {
     to { transform: rotate(360deg); }
   }
-  .loading-card p { color: var(--text-secondary); font-size: 13px; line-height: 1.6; text-align: center; }
+  .loading-card p { color: var(--text-primary); font-size: 14px; font-weight: 600; line-height: 1.6; text-align: center; }
+  .loading-sub { color: var(--text-tertiary); font-size: 11.5px; letter-spacing: 0.04em; text-align: center; }
 
   /* Error */
   .error-card {

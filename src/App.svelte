@@ -170,13 +170,12 @@
   {#if AuxiliarySurface}
     <AuxiliarySurface />
   {:else}
-    <main class="auxiliary-state">
+    <main class="auxiliary-state" class:errored={!!auxiliaryError}>
       {#if auxiliaryError}
         <strong>ページを読み込めませんでした</strong>
         <span>{auxiliaryError}</span>
       {:else}
         <span class="auxiliary-spinner" aria-hidden="true"></span>
-        <span>読み込み中...</span>
       {/if}
     </main>
   {/if}
@@ -203,6 +202,19 @@
     background: #f7f8fa;
     font: 13px/1.5 -apple-system, BlinkMacSystemFont, "SF Pro Text", "Helvetica Neue", "Noto Sans JP", sans-serif;
     text-align: center;
+    /* Hold the surface blank briefly: fast module imports never flash a spinner,
+       and the surface's own skeleton takes over almost immediately. */
+    opacity: 0;
+    animation: auxiliary-appear 0.3s ease 0.16s forwards;
+  }
+
+  .auxiliary-state.errored {
+    opacity: 1;
+    animation: none;
+  }
+
+  @keyframes auxiliary-appear {
+    to { opacity: 1; }
   }
 
   .auxiliary-state strong {
