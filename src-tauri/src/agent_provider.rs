@@ -16,6 +16,7 @@ use std::collections::HashSet;
 use std::sync::{Arc, LazyLock, Mutex};
 
 const CANCELLED_MSG: &str = "推論はキャンセルされました";
+const NON_STREAMING_ATTEMPTS: usize = 2;
 
 // ─────────────────────── Cancel registry (remote) ───────────────────────
 
@@ -355,12 +356,61 @@ fn http_client() -> &'static reqwest::Client {
     // For decoupling, we build our own minimal client.
     static CLIENT: LazyLock<reqwest::Client> = LazyLock::new(|| {
         reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(120))
+            // Planning calls can return large JSON payloads. A short whole-request
+            // timeout can expire while a healthy provider is still sending them.
+            .timeout(std::time::Duration::from_secs(300))
             .connect_timeout(std::time::Duration::from_secs(10))
             .build()
             .expect("failed to build HTTP client")
     });
     &CLIENT
+}
+
+async fn send_non_streaming_request(
+    request: reqwest::RequestBuilder,
+    provider: &str,
+) -> Result<(reqwest::StatusCode, String), String> {
+    for attempt in 1..=NON_STREAMING_ATTEMPTS {
+        let request = request
+            .try_clone()
+            .ok_or_else(|| "AIリクエストを再試行用に複製できませんでした".to_string())?;
+        let resp = match request.send().await {
+            Ok(resp) => resp,
+            Err(error) if attempt < NON_STREAMING_ATTEMPTS => {
+                log::warn!(
+                    "plan({}): request transport failed on attempt {}/{}; retrying: {}",
+                    provider,
+                    attempt,
+                    NON_STREAMING_ATTEMPTS,
+                    error
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(750)).await;
+                continue;
+            }
+            Err(error) => return Err(format!("リクエスト失敗: {}", error)),
+        };
+        let status = resp.status();
+        match resp.text().await {
+            Ok(text) => return Ok((status, text)),
+            Err(error) if attempt < NON_STREAMING_ATTEMPTS => {
+                log::warn!(
+                    "plan({}): response body read failed on attempt {}/{}; retrying: {}",
+                    provider,
+                    attempt,
+                    NON_STREAMING_ATTEMPTS,
+                    error
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(750)).await;
+            }
+            Err(error) => {
+                return Err(format!(
+                    "AI応答の受信が途中で中断されました。再試行してください: {}",
+                    error
+                ));
+            }
+        }
+    }
+    Err("AI応答を受信できませんでした".to_string())
 }
 
 async fn remote_chat_completion(
@@ -453,20 +503,16 @@ async fn remote_openai_non_streaming(
             "max_tokens": if max_tokens == 0 { 8192 } else { max_tokens },
             "temperature": temperature,
         });
-        let resp = http_client()
+        let request = http_client()
             .post(&url)
             .header("Authorization", format!("Bearer {}", config.api_key))
             .header("Content-Type", "application/json")
-            .json(&body)
-            .send()
-            .await
-            .map_err(|e| format!("リクエスト失敗: {}", e))?;
-
-        let status = resp.status();
-        let text = resp
-            .text()
-            .await
-            .map_err(|e| format!("レスポンス読み取り失敗: {}", e))?;
+            // Large compressed JSON responses occasionally arrive truncated
+            // through compatible gateways, which reqwest reports as a body
+            // decoding failure. Prefer a plain response for plan calls.
+            .header("Accept-Encoding", "identity")
+            .json(&body);
+        let (status, text) = send_non_streaming_request(request, "openai").await?;
         if !status.is_success() {
             // Endpoint refused the image part → retry once text-only.
             if with_images && is_image_unsupported_error(&text) {
@@ -541,19 +587,13 @@ async fn remote_gemini_non_streaming(
         if !system_instruction.is_null() {
             body["systemInstruction"] = system_instruction.clone();
         }
-        let resp = http_client()
+        let request = http_client()
             .post(&url)
             .header("Content-Type", "application/json")
             .header("x-goog-api-key", &config.api_key)
-            .json(&body)
-            .send()
-            .await
-            .map_err(|e| format!("リクエスト失敗: {}", e))?;
-        let status = resp.status();
-        let text = resp
-            .text()
-            .await
-            .map_err(|e| format!("レスポンス読み取り失敗: {}", e))?;
+            .header("Accept-Encoding", "identity")
+            .json(&body);
+        let (status, text) = send_non_streaming_request(request, "gemini").await?;
         if !status.is_success() {
             if with_images && is_image_unsupported_error(&text) {
                 log::warn!("plan(gemini): model rejected image input, retrying text-only");
