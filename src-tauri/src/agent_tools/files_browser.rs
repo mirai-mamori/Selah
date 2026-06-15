@@ -13,6 +13,8 @@ static DOCX_TAB_RE: LazyLock<regex::Regex> =
     LazyLock::new(|| regex::Regex::new(r"<w:tab\s*/?>").unwrap());
 static DOCX_TAG_RE: LazyLock<regex::Regex> =
     LazyLock::new(|| regex::Regex::new(r"<[^>]+>").unwrap());
+static OFFICE_BLOCK_RE: LazyLock<regex::Regex> =
+    LazyLock::new(|| regex::Regex::new(r"</(?:a:p|w:p|row|si|sst|worksheet|slide)>").unwrap());
 
 fn truncate_chars(s: &str, max_chars: usize) -> String {
     if s.chars().count() <= max_chars {
@@ -139,7 +141,7 @@ fn file_extension_lower(path: &Path) -> String {
 fn supported_read_extension(ext: &str) -> bool {
     matches!(
         ext,
-        "pdf" | "docx" | "txt" | "md" | "json" | "csv" | "html" | "htm"
+        "pdf" | "docx" | "pptx" | "xlsx" | "txt" | "md" | "json" | "csv" | "html" | "htm"
     )
 }
 
@@ -186,6 +188,135 @@ fn extract_pdf_text(path: &Path) -> Result<String, String> {
     }
 }
 
+/// Maximum number of embedded page images forwarded to the vision model.
+const MAX_PDF_IMAGES: usize = 8;
+/// Skip any single embedded image larger than this (raw bytes) to bound cost.
+const MAX_PDF_IMAGE_BYTES: usize = 6 * 1024 * 1024;
+
+/// Pull embedded JPEG (DCTDecode) image XObjects out of a PDF. Scanned course
+/// PDFs have no text layer, but each page is typically a single JPEG image, so
+/// these can be sent to a vision model when `extract_pdf_text` yields nothing.
+/// Other codecs (Flate/CCITT/JBIG2/JPX) need a decoder we do not bundle and are
+/// skipped.
+pub(super) fn extract_pdf_images(path: &Path) -> Result<Vec<crate::ai::ImagePart>, String> {
+    use base64::Engine;
+    let doc = lopdf::Document::load(path).map_err(|e| format!("PDF読み込み失敗: {}", e))?;
+    let mut images = Vec::new();
+    for object in doc.objects.values() {
+        if images.len() >= MAX_PDF_IMAGES {
+            break;
+        }
+        let lopdf::Object::Stream(stream) = object else {
+            continue;
+        };
+        let is_image = stream
+            .dict
+            .get(b"Subtype")
+            .ok()
+            .and_then(|value| value.as_name().ok())
+            .is_some_and(|name| name == &b"Image"[..]);
+        if !is_image || !filter_is_dct(&stream.dict) {
+            continue;
+        }
+        if stream.content.is_empty() || stream.content.len() > MAX_PDF_IMAGE_BYTES {
+            continue;
+        }
+        images.push(crate::ai::ImagePart {
+            mime: "image/jpeg".into(),
+            data_base64: base64::engine::general_purpose::STANDARD.encode(&stream.content),
+        });
+    }
+    if images.is_empty() {
+        Err("PDFから画像も取得できませんでした".into())
+    } else {
+        Ok(images)
+    }
+}
+
+/// Locate libpdfium and bind to it. Dev uses the crate's bundled copy via the
+/// compile-time manifest path; a packaged app finds it next to the executable
+/// or in the macOS .app Resources folder. `SELAH_PDFIUM_DIR` overrides all.
+fn bind_pdfium() -> Result<pdfium_render::prelude::Pdfium, String> {
+    use pdfium_render::prelude::Pdfium;
+    let mut dirs: Vec<std::path::PathBuf> = Vec::new();
+    if let Ok(dir) = std::env::var("SELAH_PDFIUM_DIR") {
+        dirs.push(std::path::PathBuf::from(dir));
+    }
+    dirs.push(std::path::PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/lib")));
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(parent) = exe.parent() {
+            dirs.push(parent.join("../Resources"));
+            dirs.push(parent.to_path_buf());
+        }
+    }
+    for dir in &dirs {
+        let name = Pdfium::pdfium_platform_library_name_at_path(dir);
+        if let Ok(bindings) = Pdfium::bind_to_library(&name) {
+            return Ok(Pdfium::new(bindings));
+        }
+    }
+    Pdfium::bind_to_system_library()
+        .map(Pdfium::new)
+        .map_err(|error| format!("pdfium ライブラリを読み込めません: {}", error))
+}
+
+/// Rasterize the first pages of a PDF to JPEG images. Used as the last resort
+/// for a vector PDF (e.g. slide decks) that has neither a text layer nor
+/// extractable image XObjects, so a vision model can still read it.
+pub(super) fn render_pdf_to_images(path: &Path) -> Result<Vec<crate::ai::ImagePart>, String> {
+    use base64::Engine;
+    use pdfium_render::prelude::PdfRenderConfig;
+    use std::io::Cursor;
+
+    let pdfium = bind_pdfium()?;
+    let path_str = path.to_str().ok_or("PDF パスが不正です")?;
+    let document = pdfium
+        .load_pdf_from_file(path_str, None)
+        .map_err(|error| format!("PDF を開けません: {}", error))?;
+    let config = PdfRenderConfig::new()
+        .set_target_width(1500)
+        .set_maximum_height(2100);
+
+    let mut images = Vec::new();
+    for page in document.pages().iter().take(MAX_PDF_IMAGES) {
+        let bitmap = page
+            .render_with_config(&config)
+            .map_err(|error| format!("ページ描画失敗: {}", error))?;
+        let mut buffer = Vec::new();
+        image::DynamicImage::ImageRgb8(bitmap.as_image().into_rgb8())
+            .write_to(&mut Cursor::new(&mut buffer), image::ImageFormat::Jpeg)
+            .map_err(|error| format!("JPEG 変換失敗: {}", error))?;
+        if buffer.is_empty() || buffer.len() > MAX_PDF_IMAGE_BYTES {
+            continue;
+        }
+        images.push(crate::ai::ImagePart {
+            mime: "image/jpeg".into(),
+            data_base64: base64::engine::general_purpose::STANDARD.encode(&buffer),
+        });
+    }
+    if images.is_empty() {
+        Err("PDF をレンダリングできませんでした".into())
+    } else {
+        Ok(images)
+    }
+}
+
+/// True when the stream's only filter is DCTDecode, i.e. its raw bytes are a
+/// standalone JPEG that can be forwarded without decoding.
+fn filter_is_dct(dict: &lopdf::Dictionary) -> bool {
+    match dict.get(b"Filter") {
+        Ok(lopdf::Object::Name(name)) => name == &b"DCTDecode"[..],
+        Ok(lopdf::Object::Array(filters)) => {
+            filters.len() == 1
+                && matches!(
+                    filters.first(),
+                    Some(lopdf::Object::Name(name)) if name == &b"DCTDecode"[..]
+                )
+        }
+        _ => false,
+    }
+}
+
 fn extract_docx_text(path: &Path) -> Result<String, String> {
     let file = File::open(path).map_err(|e| format!("DOCX読み込み失敗: {}", e))?;
     let mut archive = zip::ZipArchive::new(file).map_err(|e| format!("DOCX展開失敗: {}", e))?;
@@ -209,11 +340,66 @@ fn extract_docx_text(path: &Path) -> Result<String, String> {
     }
 }
 
-fn read_supported_download_file(path: &Path) -> Result<String, String> {
+fn extract_zipped_office_text(
+    path: &Path,
+    prefixes: &[&str],
+    document_label: &str,
+) -> Result<String, String> {
+    let file = File::open(path).map_err(|e| format!("{}読み込み失敗: {}", document_label, e))?;
+    let mut archive =
+        zip::ZipArchive::new(file).map_err(|e| format!("{}展開失敗: {}", document_label, e))?;
+    let mut names = (0..archive.len())
+        .filter_map(|index| {
+            archive
+                .by_index(index)
+                .ok()
+                .map(|entry| entry.name().to_string())
+        })
+        .filter(|name| {
+            prefixes.iter().any(|prefix| name.starts_with(prefix)) && name.ends_with(".xml")
+        })
+        .collect::<Vec<_>>();
+    names.sort();
+
+    let mut out = String::new();
+    for name in names {
+        let mut xml = String::new();
+        let Ok(mut entry) = archive.by_name(&name) else {
+            continue;
+        };
+        if entry.read_to_string(&mut xml).is_err() {
+            continue;
+        }
+        let xml = OFFICE_BLOCK_RE.replace_all(&xml, "\n");
+        let text = DOCX_TAG_RE.replace_all(&xml, " ");
+        let text = decode_xml_entities(&text);
+        let text = normalize_extracted_text(&text);
+        if !text.is_empty() {
+            if !out.is_empty() {
+                out.push_str("\n\n");
+            }
+            out.push_str(&text);
+        }
+    }
+    if out.is_empty() {
+        Err(format!(
+            "{}からテキストを抽出できませんでした",
+            document_label
+        ))
+    } else {
+        Ok(out)
+    }
+}
+
+pub(super) fn read_supported_download_file(path: &Path) -> Result<String, String> {
     let ext = file_extension_lower(path);
     match ext.as_str() {
         "pdf" => extract_pdf_text(path),
         "docx" => extract_docx_text(path),
+        "pptx" => extract_zipped_office_text(path, &["ppt/slides/"], "PPTX"),
+        "xlsx" => {
+            extract_zipped_office_text(path, &["xl/sharedStrings.xml", "xl/worksheets/"], "XLSX")
+        }
         "txt" | "md" | "json" | "csv" | "html" | "htm" => {
             read_utf8ish_file(path, 2_000_000).map(|s| normalize_extracted_text(&s))
         }
@@ -433,6 +619,33 @@ pub(super) async fn fetch_luna_detail_html_with_age(
     detail_path: &str,
 ) -> Result<(String, i64), String> {
     fetch_luna_detail_html_inner(app, detail_path).await
+}
+
+async fn fetch_luna_detail_html_fresh(
+    app: &tauri::AppHandle,
+    detail_path: &str,
+) -> Result<String, String> {
+    let luna_state = app.state::<crate::LunaState>();
+    let http = {
+        let luna = luna_state.client.lock().await;
+        if !luna.authenticated {
+            return Err(crate::luna_client::LUNA_AUTH_REQUIRED_MSG.into());
+        }
+        luna.http.clone()
+    };
+    let url = format!("{}{}", crate::config::LUNA_BASE, detail_path);
+    let html = crate::client::fetch_with_redirect(
+        &http,
+        &url,
+        crate::config::LUNA_BASE,
+        crate::luna_client::LUNA_SESSION_EXPIRED_MSG,
+        crate::luna_client::is_luna_session_expired,
+    )
+    .await
+    .map_err(|error| format!("Luna取得失敗: {}", error))?;
+    let db = app.state::<Database>();
+    let _ = db.save_data_cache(&format!("luna_detail_html:{}", detail_path), &html);
+    Ok(html)
 }
 
 async fn fetch_luna_detail_html_inner(
@@ -708,6 +921,174 @@ async fn resolve_luna_attachment_with_lid(
     })
 }
 
+pub(super) async fn download_all_luna_activity_attachments(
+    app: &tauri::AppHandle,
+    luna_id: &str,
+    contents: &crate::luna_parser::LunaCourseContents,
+    activity_types: &[&str],
+    reusable_paths: &std::collections::HashMap<String, super::ReusableCourseDownload>,
+) -> Result<Vec<Value>, String> {
+    let db = app.state::<Database>();
+    let mut activities: Vec<(String, String, String)> = db
+        .get_all_luna_activities()
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|activity| {
+            activity.luna_id == luna_id
+                && activity_types
+                    .iter()
+                    .any(|kind| activity.activity_type == *kind)
+                && !activity.detail_path.is_empty()
+        })
+        .map(|activity| (activity.activity_type, activity.title, activity.detail_path))
+        .collect();
+    if activity_types.contains(&"announcement") {
+        activities.extend(contents.announcements.iter().map(|announcement| {
+            (
+                "announcement".to_string(),
+                announcement.title.clone(),
+                format!(
+                    "/lms/coursetop/information/listdetail?idnumber={}&informationId={}",
+                    luna_id, announcement.info_id
+                ),
+            )
+        }));
+    }
+    if activity_types.contains(&"report") {
+        activities.extend(
+            contents
+                .reports
+                .iter()
+                .filter(|report| !report.url.trim().is_empty())
+                .map(|report| {
+                    let detail_path = report
+                        .url
+                        .strip_prefix(crate::config::LUNA_BASE)
+                        .unwrap_or(&report.url)
+                        .to_string();
+                    ("report".to_string(), report.title.clone(), detail_path)
+                }),
+        );
+    }
+    let mut seen = HashSet::new();
+    activities.retain(|(_, _, path)| seen.insert(path.clone()));
+
+    let mut results = Vec::new();
+    for (activity_type, title, detail_path) in activities {
+        let html = match fetch_luna_detail_html_fresh(app, &detail_path).await {
+            Ok(html) => html,
+            Err(error) => {
+                let source_fingerprint = course_automation_source_fingerprint(&json!({
+                    "kind": &activity_type,
+                    "title": &title,
+                    "detailPath": &detail_path,
+                }))?;
+                results.push(json!({
+                    "status": "detail_error",
+                    "kind": &activity_type,
+                    "title": &title,
+                    "source_fingerprint": source_fingerprint,
+                    "error": error,
+                }));
+                continue;
+            }
+        };
+        let detail = if activity_type == "announcement" {
+            crate::luna_parser::parse_luna_announcement_detail(&html)
+        } else {
+            crate::luna_parser::parse_luna_detail_page(&html)
+        };
+        let detail_source_fingerprint = course_automation_source_fingerprint(&json!({
+            "kind": &activity_type,
+            "title": &title,
+            "detailPath": &detail_path,
+            "sections": &detail.sections,
+            "meta": &detail.meta,
+            "attachments": &detail.attachments,
+        }))?;
+        results.push(json!({
+            "status": "detail",
+            "kind": &activity_type,
+            "title": &title,
+            "source_fingerprint": detail_source_fingerprint,
+            "content": detail.sections.iter()
+                .map(|section| format!("{}\n{}", section.heading, section.body))
+                .collect::<Vec<_>>()
+                .join("\n\n"),
+            "meta": &detail.meta,
+            "attachments": detail.attachments.iter().map(|attachment| &attachment.name).collect::<Vec<_>>(),
+        }));
+        for attachment in detail.attachments {
+            let course_name = if detail.course_name.trim().is_empty() {
+                contents.course_name.clone()
+            } else {
+                detail.course_name.clone()
+            };
+            let resolved = LunaAttachmentResolved {
+                title: title.clone(),
+                course_name,
+                detail_path: detail_path.clone(),
+                detail_url: format!("{}{}", crate::config::LUNA_BASE, detail_path),
+                attachment,
+            };
+            let source_fingerprint = course_automation_source_fingerprint(&json!({
+                "kind": &activity_type,
+                "title": &resolved.title,
+                "detailPath": &resolved.detail_path,
+                "attachment": &resolved.attachment,
+            }))?;
+            let fingerprint_key = format!("fingerprint:{}", source_fingerprint);
+            let identity_key = format!("identity:{}|{}", activity_type, resolved.attachment.name);
+            if let Some(reusable) = reusable_paths
+                .get(&fingerprint_key)
+                .or_else(|| reusable_paths.get(&identity_key))
+                .filter(|item| std::path::Path::new(&item.path).is_file())
+            {
+                let persisted_source_fingerprint = if reusable.source_fingerprint.is_empty() {
+                    source_fingerprint.clone()
+                } else {
+                    reusable.source_fingerprint.clone()
+                };
+                results.push(json!({
+                    "status": "reused",
+                    "kind": &activity_type,
+                    "title": resolved.title,
+                    "filename": resolved.attachment.name,
+                    "saved_path": reusable.path,
+                    "source_fingerprint": persisted_source_fingerprint,
+                }));
+                continue;
+            }
+            match download_resolved_luna_attachment(app, &resolved).await {
+                Ok(saved) => results.push(json!({
+                    "status": "downloaded",
+                    "kind": &activity_type,
+                    "title": resolved.title,
+                    "filename": resolved.attachment.name,
+                    "saved_path": saved.saved_path,
+                    "source_fingerprint": source_fingerprint,
+                })),
+                Err(error) => results.push(json!({
+                    "status": "error",
+                    "kind": &activity_type,
+                    "title": resolved.title,
+                    "filename": resolved.attachment.name,
+                    "source_fingerprint": source_fingerprint,
+                    "error": error,
+                })),
+            }
+        }
+    }
+    Ok(results)
+}
+
+fn course_automation_source_fingerprint(value: &Value) -> Result<String, String> {
+    use sha2::{Digest, Sha256};
+
+    let raw = serde_json::to_vec(value).map_err(|error| error.to_string())?;
+    Ok(format!("{:x}", Sha256::digest(raw)))
+}
+
 pub(super) async fn open_luna_attachment(
     app: &tauri::AppHandle,
     args: &Value,
@@ -885,7 +1266,7 @@ fn cached_luna_course_contents(
         .and_then(|(json_str, _)| serde_json::from_str(&json_str).ok())
 }
 
-async fn fetch_luna_course_contents_for_download(
+pub(super) async fn fetch_luna_course_contents_for_download(
     app: &tauri::AppHandle,
     luna_id: &str,
 ) -> Result<crate::luna_parser::LunaCourseContents, String> {
@@ -959,7 +1340,7 @@ async fn find_course_material_file(
     Ok(match_material_file(&fresh, filename))
 }
 
-async fn download_course_material_from_contents(
+pub(super) async fn download_course_material_from_contents(
     app: &tauri::AppHandle,
     luna_id: &str,
     filename: &str,
@@ -2069,6 +2450,7 @@ pub(super) async fn browser_wait_for(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Write;
 
     fn material_file(display_name: &str, file_name: &str) -> crate::luna_parser::LunaMaterialFile {
         crate::luna_parser::LunaMaterialFile {
@@ -2116,6 +2498,26 @@ mod tests {
         }
     }
 
+    fn office_fixture(extension: &str, entries: &[(&str, &str)]) -> PathBuf {
+        let path = std::env::temp_dir().join(format!(
+            "selah-office-fixture-{}.{}",
+            uuid::Uuid::new_v4(),
+            extension
+        ));
+        let file = File::create(&path).expect("create fixture");
+        let mut archive = zip::ZipWriter::new(file);
+        for (name, body) in entries {
+            archive
+                .start_file(*name, zip::write::SimpleFileOptions::default())
+                .expect("start fixture file");
+            archive
+                .write_all(body.as_bytes())
+                .expect("write fixture file");
+        }
+        archive.finish().expect("finish fixture");
+        path
+    }
+
     #[test]
     fn matches_course_material_by_file_name() {
         let contents = course_contents(vec![material_file(
@@ -2139,5 +2541,33 @@ mod tests {
             effective_material_filename(&matched.file),
             "2026年度春中間試験の実施要項.pdf"
         );
+    }
+
+    #[test]
+    fn extracts_pptx_slide_text() {
+        let path = office_fixture(
+            "pptx",
+            &[(
+                "ppt/slides/slide1.xml",
+                "<p:sld><a:p><a:r><a:t>印刷して持参</a:t></a:r></a:p></p:sld>",
+            )],
+        );
+        let text = read_supported_download_file(&path).expect("extract pptx");
+        let _ = std::fs::remove_file(path);
+        assert!(text.contains("印刷して持参"));
+    }
+
+    #[test]
+    fn extracts_xlsx_shared_string_text() {
+        let path = office_fixture(
+            "xlsx",
+            &[(
+                "xl/sharedStrings.xml",
+                "<sst><si><t>学籍番号 12345678 座席 A-12</t></si></sst>",
+            )],
+        );
+        let text = read_supported_download_file(&path).expect("extract xlsx");
+        let _ = std::fs::remove_file(path);
+        assert!(text.contains("座席 A-12"));
     }
 }

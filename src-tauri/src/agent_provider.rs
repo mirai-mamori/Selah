@@ -428,7 +428,9 @@ async fn remote_chat_completion(
         "gemini" => {
             remote_gemini_non_streaming(config, messages, max_tokens, temperature, json_mode).await
         }
-        _ => remote_openai_non_streaming(config, messages, max_tokens, temperature).await,
+        _ => {
+            remote_openai_non_streaming(config, messages, max_tokens, temperature, json_mode).await
+        }
     }
 }
 
@@ -492,17 +494,22 @@ async fn remote_openai_non_streaming(
     messages: Vec<ChatMessage>,
     max_tokens: u32,
     temperature: f32,
+    json_mode: bool,
 ) -> Result<String, String> {
     let url = format!("{}/chat/completions", config.base_url.trim_end_matches('/'));
     let has_images = messages.iter().any(|m| !m.images.is_empty());
     let mut with_images = has_images;
+    let mut with_json_mode = json_mode;
     let text = loop {
-        let body = serde_json::json!({
+        let mut body = serde_json::json!({
             "model": config.model,
             "messages": openai_messages_json(&messages, with_images),
             "max_tokens": if max_tokens == 0 { 8192 } else { max_tokens },
             "temperature": temperature,
         });
+        if with_json_mode {
+            body["response_format"] = serde_json::json!({ "type": "json_object" });
+        }
         let request = http_client()
             .post(&url)
             .header("Authorization", format!("Bearer {}", config.api_key))
@@ -520,19 +527,70 @@ async fn remote_openai_non_streaming(
                 with_images = false;
                 continue;
             }
+            if with_json_mode && response_format_unsupported(&text) {
+                log::warn!("plan: model rejected JSON response format, retrying without it");
+                with_json_mode = false;
+                continue;
+            }
             return Err(format!("API error ({}): {}", status, truncate(&text, 300)));
         }
         break text;
     };
     let v: serde_json::Value =
         serde_json::from_str(&text).map_err(|e| format!("JSON解析失敗: {}", e))?;
-    v.get("choices")
+    let message = v
+        .get("choices")
         .and_then(|c| c.get(0))
-        .and_then(|c| c.get("message"))
-        .and_then(|m| m.get("content"))
-        .and_then(|c| c.as_str())
-        .map(|s| s.to_string())
-        .ok_or_else(|| "AIからの応答がありません".into())
+        .and_then(|c| c.get("message"));
+    let mut content = collect_openai_message_text(message.and_then(|m| m.get("content")));
+    // Reasoning models behind OpenRouter (e.g. minimax with json_object) return a
+    // null `content` and put the whole JSON answer in `reasoning`, with HTTP 200 and
+    // finish_reason=stop — so the error-text retry above never fires. Recover it.
+    if content.trim().is_empty() {
+        if let Some(reasoning) = message
+            .and_then(|m| m.get("reasoning"))
+            .and_then(|r| r.as_str())
+        {
+            content = reasoning.to_string();
+        }
+    }
+    if content.trim().is_empty() {
+        let finish_reason = v
+            .get("choices")
+            .and_then(|choices| choices.get(0))
+            .and_then(|choice| choice.get("finish_reason"))
+            .and_then(|reason| reason.as_str())
+            .unwrap_or("unknown");
+        Err(format!(
+            "AIからの応答がありません (finish_reason: {})",
+            finish_reason
+        ))
+    } else {
+        Ok(content)
+    }
+}
+
+fn collect_openai_message_text(content: Option<&serde_json::Value>) -> String {
+    match content {
+        Some(serde_json::Value::String(text)) => text.clone(),
+        Some(serde_json::Value::Array(parts)) => parts
+            .iter()
+            .filter_map(|part| {
+                part.get("text")
+                    .and_then(|text| text.as_str())
+                    .or_else(|| part.get("content").and_then(|text| text.as_str()))
+            })
+            .collect::<Vec<_>>()
+            .join(""),
+        _ => String::new(),
+    }
+}
+
+fn response_format_unsupported(text: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    lower.contains("response_format")
+        || lower.contains("response format")
+        || lower.contains("json_object")
 }
 
 async fn remote_gemini_non_streaming(
@@ -1349,5 +1407,30 @@ mod tests {
         assert!(AgentProvider::is_cancelled(gen_id));
         AgentProvider::clear_cancel(gen_id);
         assert!(!AgentProvider::is_cancelled(gen_id));
+    }
+
+    #[test]
+    fn collects_openai_text_from_string_and_part_arrays() {
+        assert_eq!(
+            collect_openai_message_text(Some(&serde_json::json!("plain"))),
+            "plain"
+        );
+        assert_eq!(
+            collect_openai_message_text(Some(&serde_json::json!([
+                {"type": "text", "text": "{\"summary\":"},
+                {"type": "text", "text": "\"ok\"}"}
+            ]))),
+            "{\"summary\":\"ok\"}"
+        );
+    }
+
+    #[test]
+    fn detects_response_format_rejection() {
+        assert!(response_format_unsupported(
+            r#"{"error":{"message":"response_format json_object is unsupported"}}"#
+        ));
+        assert!(!response_format_unsupported(
+            r#"{"error":{"message":"model not found"}}"#
+        ));
     }
 }

@@ -277,33 +277,6 @@ pub(crate) fn saved_cookie_summary(service: &str, key: &str) -> SavedCookieSumma
     }
 }
 
-#[cfg(test)]
-mod cookie_persistence_tests {
-    use super::{parse_cookie_json, serialize_stored_cookie_jar, StoredCookieJar};
-
-    #[test]
-    fn persisted_cookie_json_keeps_session_cookies() {
-        let mut store = cookie_store::CookieStore::default();
-        let url = url::Url::parse("https://example.com").unwrap();
-        store
-            .insert_raw(
-                &cookie_store::RawCookie::build(("session", "secret"))
-                    .path("/")
-                    .build(),
-                &url,
-            )
-            .unwrap();
-
-        let serialized = serialize_stored_cookie_jar(&store, 123).unwrap();
-        let stored: StoredCookieJar = serde_json::from_str(&serialized).unwrap();
-        let restored =
-            parse_cookie_json(&stored.cookie_json).expect("session cookie JSON should load");
-
-        assert_eq!(stored.saved_at, 123);
-        assert_eq!(restored.iter_unexpired().count(), 1);
-    }
-}
-
 /// Shared redirect-following GET fetch used by all three service clients.
 /// Follows up to 10 redirects, detects SSO redirects and expired-session body patterns.
 pub(crate) async fn fetch_with_redirect(
@@ -556,5 +529,32 @@ impl KgcClient {
     /// Returns None if there are no time-limited cookies (all SessionEnd).
     pub fn soonest_cookie_expiry_secs(&self) -> Option<i64> {
         soonest_cookie_expiry(&self.cookie_store)
+    }
+}
+
+#[cfg(test)]
+mod cookie_persistence_tests {
+    use super::{parse_cookie_json, serialize_stored_cookie_jar, StoredCookieJar};
+
+    #[test]
+    fn persisted_cookie_json_keeps_session_cookies() {
+        let mut store = cookie_store::CookieStore::default();
+        let url = url::Url::parse("https://example.com").unwrap();
+        store
+            .insert_raw(
+                &cookie_store::RawCookie::build(("session", "secret"))
+                    .path("/")
+                    .build(),
+                &url,
+            )
+            .unwrap();
+
+        let serialized = serialize_stored_cookie_jar(&store, 123).unwrap();
+        let stored: StoredCookieJar = serde_json::from_str(&serialized).unwrap();
+        let restored =
+            parse_cookie_json(&stored.cookie_json).expect("session cookie JSON should load");
+
+        assert_eq!(stored.saved_at, 123);
+        assert_eq!(restored.iter_unexpired().count(), 1);
     }
 }

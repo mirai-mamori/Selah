@@ -610,6 +610,7 @@ pub async fn kwic_fetch_cabinet_reference(
 
 /// Open a KWIC Portal notification detail in a native detail window
 #[tauri::command]
+#[allow(clippy::too_many_arguments)] // Tauri command arguments map directly to frontend invoke fields.
 pub async fn kwic_open_detail_window(
     app: tauri::AppHandle,
     webview: tauri::Webview,

@@ -2,6 +2,7 @@
   import { invoke } from "@tauri-apps/api/core";
   import { tick } from "svelte";
   import Icon, { type IconName } from "../Icon.svelte";
+  import CourseAgentDock from "./CourseAgentDock.svelte";
   import CourseSupplemental from "./CourseSupplemental.svelte";
   import { splitLunaCourseHeading } from "./courseHeading";
   import { lunaDraftKey, readDraft, writeDraft } from "./drafts";
@@ -20,6 +21,7 @@
     idnumberParam: string;
     kgcPathParam: string;
     split?: boolean;
+    agentDockOpen?: boolean;
     richText: (value: string | undefined | null) => string;
     openExternal: (url: string, title?: string) => void | Promise<void>;
     openAnnouncement: (announcement: LunaCourseAnnouncement) => void;
@@ -37,6 +39,7 @@
     idnumberParam,
     kgcPathParam,
     split = false,
+    agentDockOpen = false,
     richText,
     openExternal,
     openAnnouncement,
@@ -360,6 +363,9 @@
           </button>
         {/each}
       </div>
+    {/if}
+    {#if agentDockOpen}
+      <CourseAgentDock lunaId={idnumberParam} courseName={course.course_name} />
     {/if}
   </section>
 {/if}

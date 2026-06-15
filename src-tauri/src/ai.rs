@@ -6,13 +6,68 @@ use tauri::Emitter;
 use tauri::Manager;
 
 /// Shared HTTP client — reuses connection pool across all AI calls.
+/// Reasoning models behind OpenRouter can keep streaming a single non-streaming
+/// response well past a minute; a short whole-request timeout expires mid-flight
+/// and silently kills Live chunk summaries, so we match the planner's 300s.
 static HTTP_CLIENT: LazyLock<reqwest::Client> = LazyLock::new(|| {
     reqwest::Client::builder()
-        .timeout(Duration::from_secs(90))
+        .timeout(Duration::from_secs(300))
         .connect_timeout(Duration::from_secs(10))
         .build()
         .expect("failed to build HTTP client")
 });
+
+/// How many times a non-streaming AI request is attempted before giving up.
+/// OpenRouter occasionally returns truncated/compressed bodies that fail to
+/// parse; a single retry recovers most of them.
+const NON_STREAMING_ATTEMPTS: usize = 2;
+
+/// Send a non-streaming request, retrying the transport and body read once on
+/// failure. Mirrors `agent_provider::send_non_streaming_request` so the Live
+/// summary path gets the same robustness as the planner path.
+async fn send_non_streaming_request(
+    request: reqwest::RequestBuilder,
+    provider: &str,
+) -> Result<(reqwest::StatusCode, String), String> {
+    for attempt in 1..=NON_STREAMING_ATTEMPTS {
+        let request = request
+            .try_clone()
+            .ok_or_else(|| "AIリクエストを再試行用に複製できませんでした".to_string())?;
+        let resp = match request.send().await {
+            Ok(resp) => resp,
+            Err(error) if attempt < NON_STREAMING_ATTEMPTS => {
+                log::warn!(
+                    "ai({}): request transport failed on attempt {}/{}; retrying: {}",
+                    provider,
+                    attempt,
+                    NON_STREAMING_ATTEMPTS,
+                    error
+                );
+                tokio::time::sleep(Duration::from_millis(750)).await;
+                continue;
+            }
+            Err(error) => return Err(format!("リクエスト失敗: {}", error)),
+        };
+        let status = resp.status();
+        match resp.text().await {
+            Ok(text) => return Ok((status, text)),
+            Err(error) if attempt < NON_STREAMING_ATTEMPTS => {
+                log::warn!(
+                    "ai({}): response body read failed on attempt {}/{}; retrying: {}",
+                    provider,
+                    attempt,
+                    NON_STREAMING_ATTEMPTS,
+                    error
+                );
+                tokio::time::sleep(Duration::from_millis(750)).await;
+            }
+            Err(error) => {
+                return Err(format!("レスポンス読み取り失敗: {}", error));
+            }
+        }
+    }
+    Err("AI応答を受信できませんでした".to_string())
+}
 
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -133,11 +188,38 @@ struct OpenAiResponse {
 #[derive(Debug, Deserialize)]
 struct OpenAiChoice {
     message: OpenAiMessageResponse,
+    #[serde(default)]
+    finish_reason: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
 struct OpenAiMessageResponse {
-    content: Option<String>,
+    // Some OpenRouter-routed models (e.g. minimax) return `content` as null or as
+    // an array of `{type,text}` parts instead of a plain string, and reasoning
+    // models can leave `content` null while putting the answer in `reasoning`.
+    // Keep these as raw Values so a quirky shape never fails deserialization.
+    #[serde(default)]
+    content: Option<serde_json::Value>,
+    #[serde(default)]
+    reasoning: Option<String>,
+}
+
+/// Flatten an OpenAI-compatible `message.content` (string, array of parts, or
+/// null) into plain text. Mirrors `agent_provider::collect_openai_message_text`.
+fn collect_openai_message_text(content: Option<&serde_json::Value>) -> String {
+    match content {
+        Some(serde_json::Value::String(text)) => text.clone(),
+        Some(serde_json::Value::Array(parts)) => parts
+            .iter()
+            .filter_map(|part| {
+                part.get("text")
+                    .and_then(|text| text.as_str())
+                    .or_else(|| part.get("content").and_then(|text| text.as_str()))
+            })
+            .collect::<Vec<_>>()
+            .join(""),
+        _ => String::new(),
+    }
 }
 
 // ============ Gemini API types ============
@@ -311,20 +393,15 @@ async fn call_openai(config: &AiConfig, messages: Vec<ChatMessage>) -> Result<St
         temperature: config.temperature,
     };
 
-    let resp = HTTP_CLIENT
+    let request = HTTP_CLIENT
         .post(&url)
         .header("Authorization", format!("Bearer {}", config.api_key))
         .header("Content-Type", "application/json")
-        .json(&body)
-        .send()
-        .await
-        .map_err(|e| format!("リクエスト失敗: {}", e))?;
-
-    let status = resp.status();
-    let text = resp
-        .text()
-        .await
-        .map_err(|e| format!("レスポンス読み取り失敗: {}", e))?;
+        // Ask the gateway not to compress: OpenRouter has been observed sending
+        // truncated gzip bodies that fail to parse. Identity encoding sidesteps it.
+        .header("Accept-Encoding", "identity")
+        .json(&body);
+    let (status, text) = send_non_streaming_request(request, "openai").await?;
 
     if !status.is_success() {
         return Err(format!("API error ({}): {}", status, truncate_error(&text)));
@@ -333,12 +410,26 @@ async fn call_openai(config: &AiConfig, messages: Vec<ChatMessage>) -> Result<St
     let parsed: OpenAiResponse =
         serde_json::from_str(&text).map_err(|e| format!("レスポンス解析失敗: {}", e))?;
 
-    parsed
-        .choices
-        .as_ref()
-        .and_then(|c| c.first())
-        .and_then(|c| c.message.content.clone())
-        .ok_or_else(|| "AIからの応答がありません".into())
+    let choice = parsed.choices.as_ref().and_then(|c| c.first());
+    let mut content = collect_openai_message_text(choice.and_then(|c| c.message.content.as_ref()));
+    // Reasoning models behind OpenRouter (e.g. minimax with json_object) sometimes
+    // return the full answer in `reasoning` and leave `content` empty. Fall back to
+    // it rather than failing — sanitize_model_output strips any think wrapper later.
+    if content.trim().is_empty() {
+        if let Some(reasoning) = choice.and_then(|c| c.message.reasoning.as_deref()) {
+            content = reasoning.to_string();
+        }
+    }
+    if content.trim().is_empty() {
+        let finish_reason = choice
+            .and_then(|c| c.finish_reason.as_deref())
+            .unwrap_or("unknown");
+        return Err(format!(
+            "AIからの応答がありません (finish_reason: {})",
+            finish_reason
+        ));
+    }
+    Ok(content)
 }
 
 fn sanitize_for_gemini(text: &str) -> String {
@@ -407,20 +498,13 @@ async fn call_gemini(config: &AiConfig, messages: Vec<ChatMessage>) -> Result<St
         system_instruction,
     };
 
-    let resp = HTTP_CLIENT
+    let request = HTTP_CLIENT
         .post(&url)
         .header("Content-Type", "application/json")
         .header("x-goog-api-key", &config.api_key) // Header auth, not URL query
-        .json(&body)
-        .send()
-        .await
-        .map_err(|e| format!("リクエスト失敗: {}", e))?;
-
-    let status = resp.status();
-    let text = resp
-        .text()
-        .await
-        .map_err(|e| format!("レスポンス読み取り失敗: {}", e))?;
+        .header("Accept-Encoding", "identity")
+        .json(&body);
+    let (status, text) = send_non_streaming_request(request, "gemini").await?;
 
     if !status.is_success() {
         return Err(format!("API error ({}): {}", status, truncate_error(&text)));

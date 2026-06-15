@@ -21,6 +21,7 @@ mod commands;
 mod computer_control;
 pub(crate) mod config;
 mod cookie_bridge;
+mod course_automation;
 mod db;
 mod detective;
 mod document_tabs;
@@ -360,6 +361,7 @@ pub fn run() {
             app.manage(live::LiveState::new());
             app.manage(background_refresh::BackendRefreshState::new());
             app.manage(ai_refresh::AiRefreshState::new());
+            app.manage(course_automation::CourseAutomationState::new());
             app.manage(notifier::NotificationPollState::new());
 
             // Initialize SQLite database for timetable enrichment
@@ -384,6 +386,7 @@ pub fn run() {
                 tray::start_tray_cycle(app.handle(), tray_status);
                 background_refresh::start_background_refresh_loop(app.handle());
                 ai_refresh::start_ai_refresh_loop(app.handle());
+                course_automation::start_course_automation_loop(app.handle());
                 notifier::start_notification_loop(app.handle());
             }
             commands::migrate_uncategorized_to_other();
@@ -634,6 +637,9 @@ pub fn run() {
             background_refresh::backend_sync_session_status_now,
             ai_refresh::backend_ai_refresh_now,
             ai_refresh::get_backend_ai_refresh_status,
+            course_automation::course_automation_get,
+            course_automation::course_automation_set_enabled,
+            course_automation::course_automation_run_now,
             commands::list_downloads,
             commands::scan_download_dir,
             commands::scan_duplicate_downloads,

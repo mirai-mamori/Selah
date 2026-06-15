@@ -108,6 +108,10 @@ pub struct DocumentTabControl {
     pub tone: Option<String>,
     #[serde(default)]
     pub payload: Option<serde_json::Value>,
+    #[serde(default)]
+    pub indicator: bool,
+    #[serde(default)]
+    pub indicator_on: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1040,6 +1044,7 @@ fn activate_tab_without_focus(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)] // Tab construction keeps optional identity and restore fields explicit.
 fn open_tab(
     app: &tauri::AppHandle,
     key: Option<String>,

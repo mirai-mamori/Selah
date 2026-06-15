@@ -71,6 +71,11 @@
   // Split child panes have targets like "…-ct-s1" / "…-ct-s2".
   const isChildPane = /-s\d+$/.test(target);
   let splitMode = $state(true);
+  // The toolbar "自動検知" control is the on/off switch; the dock is shown only
+  // while enabled, so visibility tracks the enabled state directly.
+  let agentEnabled = $state(false);
+  const agentDockOpen = $derived(agentEnabled);
+  let agentSynced = false;
 
   function closeThisPane(): void {
     void invoke("document_tabs_close_pane", { owner, target }).catch(() => {});
@@ -182,6 +187,17 @@
         tone: "syllabus",
       });
     }
+    if (mode === "course" && idnumberParam) {
+      controls.push({
+        id: "course-agent",
+        label: "自動検知",
+        action: "detail.toggleAgentDock",
+        icon: "pulse",
+        indicator: true,
+        indicatorOn: agentEnabled,
+        group: "view",
+      });
+    }
     if (courseName) {
       controls.push({
         id: "materials",
@@ -213,10 +229,11 @@
     if (!isChildPane) {
       controls.push({
         id: "split",
-        label: splitMode ? "分割を終了" : "分割表示",
+        label: "分割モード",
         action: "detail.toggleSplit",
         icon: "square.grid.2x2",
-        active: splitMode,
+        indicator: true,
+        indicatorOn: splitMode,
         group: "view",
       });
     }
@@ -324,6 +341,9 @@
       if (payload?.url) void openExternal(payload.url, payload.name);
     }
     else if (action === "detail.refresh") void load();
+    else if (action === "detail.toggleAgentDock") {
+      void toggleAgentEnabled();
+    }
     else if (action === "detail.toggleSplit") toggleSplit();
   }
 
@@ -333,6 +353,22 @@
       void invoke("document_tabs_close_split", { owner }).catch(() => {});
     }
     updateControls();
+  }
+
+  // The toolbar control directly enables/disables SenseA; the dock follows.
+  async function toggleAgentEnabled(): Promise<void> {
+    const next = !agentEnabled;
+    try {
+      await invoke("course_automation_set_enabled", {
+        lunaId: idnumberParam,
+        courseName: course?.course_name || courseNameParam,
+        enabled: next,
+      });
+      agentEnabled = next;
+      updateControls();
+    } catch (cause) {
+      console.error("course_automation_set_enabled failed", cause);
+    }
   }
 
   function handleRichLinkClick(event: MouseEvent): void {
@@ -598,6 +634,16 @@
         course = await invoke<LunaCourseContents>("luna_fetch_course_detail", { idnumber: idnumberParam });
         document.title = splitLunaCourseHeading(course.course_name).title || titleParam;
         await checkDownloaded((course.materials || []).flatMap((item) => (item.files || []).map((file) => file.display_name || file.file_name)));
+        if (!agentSynced) {
+          agentSynced = true;
+          try {
+            const plus = await invoke<{ config: { enabled: boolean } }>("course_automation_get", {
+              lunaId: idnumberParam,
+              courseName: course.course_name,
+            });
+            agentEnabled = plus.config.enabled;
+          } catch { /* SenseA is optional; ignore lookup failures */ }
+        }
       } else if (mode === "material") {
         detail = {
           title: titleParam,
@@ -745,6 +791,7 @@
         {idnumberParam}
         {kgcPathParam}
         split={splitMode}
+        {agentDockOpen}
         {richText}
         {openExternal}
         {openAnnouncement}

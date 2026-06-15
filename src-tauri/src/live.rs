@@ -1567,7 +1567,7 @@ fn start_live_flush_driver(app: tauri::AppHandle, session_id: String) {
                     }
                 }
                 Err(err) => {
-                    eprintln!("[Live] backend scheduled flush failed: {err}");
+                    log::warn!("[Live] backend scheduled flush failed: {err}");
                     tokio::time::sleep(std::time::Duration::from_secs(
                         LIVE_FLUSH_DRIVER_IDLE_SLEEP_SECS,
                     ))

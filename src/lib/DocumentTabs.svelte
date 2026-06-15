@@ -21,6 +21,10 @@
     disabled?: boolean;
     tone?: string | null;
     payload?: unknown;
+    // Show an on/off status dot (theme accent when on, grey when off) instead of
+    // the filled active background.
+    indicator?: boolean;
+    indicatorOn?: boolean;
   }
 
   interface DocumentTab {
@@ -184,7 +188,7 @@
       "minus", "plus", "textformat", "pencil", "square.and.arrow.up", "folder.open", "doc",
       "save", "globe", "xmark", "book", "moon", "sparkles", "building.2", "video", "broadcast",
       "square.grid.2x2", "calendar", "arrow.triangle.swap", "arrow.down.circle",
-      "exclamationmark.triangle", "trash", "folder",
+      "exclamationmark.triangle", "trash", "folder", "pulse",
     ]);
     return allowed.has(value as IconName) ? value as IconName : "doc";
   }
@@ -802,6 +806,9 @@
         >
           <Icon name={iconName(control.icon)} size={15} />
           <span>{control.value || control.label}</span>
+          {#if control.indicator}
+            <span class="ctl-dot" class:on={control.indicatorOn} aria-hidden="true"></span>
+          {/if}
         </button>
       {/each}
     {:else}
@@ -1328,6 +1335,34 @@
     background: rgba(23,59,104,0.14);
     border-color: transparent;
     color: #173b68;
+  }
+
+  /* On/off status dot used instead of a filled active background. Off is a grey
+     dot (the button's own text colour, faded); on is green in both themes. */
+  .ctl-dot {
+    flex: none;
+    width: 5px;
+    height: 5px;
+    margin-left: 2px;
+    border-radius: 50%;
+    background: currentColor;
+    opacity: 0.4;
+    transition: background 0.15s ease, opacity 0.15s ease;
+  }
+
+  .ctl-dot.on {
+    background: #34c759;
+    opacity: 1;
+  }
+
+  :global([data-theme="dark"]) .ctl-dot.on {
+    background: #30d158;
+  }
+
+  @media (prefers-color-scheme: dark) {
+    :global(:root:not([data-theme="light"])) .ctl-dot.on {
+      background: #30d158;
+    }
   }
 
   .tool-btn.value {

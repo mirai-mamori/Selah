@@ -10,6 +10,12 @@ use tauri::Manager;
 
 use crate::db::Database;
 
+#[derive(Debug, Clone)]
+pub(crate) struct ReusableCourseDownload {
+    pub path: String,
+    pub source_fingerprint: String,
+}
+
 #[path = "agent_tools/academic.rs"]
 mod academic;
 #[path = "agent_tools/calendar.rs"]
@@ -29,6 +35,57 @@ use files_browser::*;
 use insights::*;
 use mail_lookup::*;
 use records::*;
+
+pub(crate) async fn fetch_luna_course_contents(
+    app: &tauri::AppHandle,
+    luna_id: &str,
+) -> Result<crate::luna_parser::LunaCourseContents, String> {
+    files_browser::fetch_luna_course_contents_for_download(app, luna_id).await
+}
+
+pub(crate) async fn download_luna_course_material(
+    app: &tauri::AppHandle,
+    luna_id: &str,
+    filename: &str,
+) -> Result<Option<Value>, String> {
+    files_browser::download_course_material_from_contents(app, luna_id, filename).await
+}
+
+pub(crate) fn read_downloaded_text(path: &std::path::Path) -> Result<String, String> {
+    files_browser::read_supported_download_file(path)
+}
+
+/// Embedded page images for a scanned PDF whose text layer is empty, so a
+/// vision model can still read it. Errors for non-PDF or image-free files.
+pub(crate) fn read_downloaded_images(
+    path: &std::path::Path,
+) -> Result<Vec<crate::ai::ImagePart>, String> {
+    files_browser::extract_pdf_images(path)
+}
+
+/// Last resort for a PDF with no text layer and no embedded images (e.g. a
+/// vector slide deck): rasterize its pages so a vision model can read them.
+pub(crate) fn render_pdf_images(
+    path: &std::path::Path,
+) -> Result<Vec<crate::ai::ImagePart>, String> {
+    files_browser::render_pdf_to_images(path)
+}
+
+pub(crate) async fn download_luna_activity_attachments(
+    app: &tauri::AppHandle,
+    luna_id: &str,
+    contents: &crate::luna_parser::LunaCourseContents,
+    reusable_paths: &std::collections::HashMap<String, ReusableCourseDownload>,
+) -> Result<Vec<Value>, String> {
+    files_browser::download_all_luna_activity_attachments(
+        app,
+        luna_id,
+        contents,
+        &["announcement", "report"],
+        reusable_paths,
+    )
+    .await
+}
 
 /// Maximum number of list items returned by any single tool.
 const LIST_CAP: usize = 15;

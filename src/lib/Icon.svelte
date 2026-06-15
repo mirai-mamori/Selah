@@ -46,6 +46,7 @@
     | "microphone"
     | "paperplane"
     | "copilot"
+    | "pulse"
     | "stop";
 </script>
 
@@ -240,6 +241,8 @@
   {:else if name === "paperplane"}
     <path d="M22 2 11 13" />
     <path d="m22 2-7 20-4-9-9-4Z" />
+  {:else if name === "pulse"}
+    <path d="M2 12h4.5l1.8-5 3 12 3-16 2.2 9 1.4-2H22" />
   {:else if name === "stop"}
     <rect x="6" y="6" width="12" height="12" rx="2" fill="currentColor" stroke="none" />
   {:else if name === "copilot"}

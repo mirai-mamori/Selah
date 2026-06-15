@@ -3283,6 +3283,7 @@ fn click_candidate_from_value(item: &Value, label_keys: &[&str]) -> Option<Brows
 
 // ─────────────────────── Phase 2: Answer ───────────────────────
 
+#[allow(clippy::too_many_arguments)] // Phase inputs are intentionally explicit for call-site auditability.
 async fn answer_phase(
     app: &AppHandle,
     conv_id: &str,
@@ -3307,6 +3308,7 @@ async fn answer_phase(
     .await
 }
 
+#[allow(clippy::too_many_arguments)] // Mirrors answer_phase plus the repair instruction.
 async fn answer_phase_with_repair(
     app: &AppHandle,
     conv_id: &str,
@@ -3332,6 +3334,7 @@ async fn answer_phase_with_repair(
     .await
 }
 
+#[allow(clippy::too_many_arguments)] // Shared answer pipeline boundary; grouping would obscure inputs.
 async fn answer_phase_with_note(
     app: &AppHandle,
     conv_id: &str,
@@ -3590,6 +3593,7 @@ fn classify_visible_stream_start(buffer: &str) -> VisibleStart {
     VisibleStart::Normal
 }
 
+#[allow(clippy::too_many_arguments)] // Prompt assembly keeps each independent input visible.
 fn build_answer_messages(
     app: Option<&AppHandle>,
     history: &[crate::db::AgentMessageRow],

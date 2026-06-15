@@ -1223,6 +1223,9 @@
             {#if (scene === "act_intro" || scene === "investigate" || scene === "cross_exam") && acts.length > 0}
               <span class="act-counter" aria-label="幕の進捗">第{actIndex + 1}幕 / {acts.length}</span>
             {/if}
+            {#if (scene === "investigate" || scene === "cross_exam") && currentAct?.seedsMeta}
+              <span class="meta-hint" title="この幕には暗線につながる手がかりがある" aria-label="気になる手がかり">◆ 気になる手がかり</span>
+            {/if}
             {#if scene === "cross_exam"}
               <span class="lives" aria-label="残ライフ">
                 {#each Array.from({ length: MAX_LIVES }) as _, i}
@@ -1261,6 +1264,12 @@
           {:else if scene === "act_intro" && currentAct}
             <div class="phase phase-act-intro">
               <section class="act-card">
+                {#if actIndex === 0 && currentCase?.briefing?.trim()}
+                  <div class="case-file">
+                    <span class="case-file-tag">事件ファイル</span>
+                    <p>{currentCase.briefing}</p>
+                  </div>
+                {/if}
                 {#if actIndex === 0 && scenarioText}
                   <p class="act-prologue">{scenarioText}</p>
                 {/if}
@@ -2547,6 +2556,20 @@
     box-shadow: var(--shadow-sm);
   }
 
+  /* Quiet 暗线 marker: a chapter act carrying a hidden-thread clue. */
+  .meta-hint {
+    padding: 5px 11px;
+    border-radius: 999px;
+    background: color-mix(in srgb, var(--kg-gold) 12%, var(--bg-card));
+    border: 0.5px solid color-mix(in srgb, var(--kg-gold) 34%, transparent);
+    color: var(--kg-gold);
+    font-size: 11px;
+    font-weight: 650;
+    letter-spacing: 0.04em;
+    box-shadow: var(--shadow-sm);
+    animation: pulse 2.4s ease-in-out infinite;
+  }
+
   /* ─── Act intro (story card) ──────────────────────────── */
 
   .phase-act-intro {
@@ -2564,6 +2587,32 @@
     border-radius: 14px;
     background: var(--bg-card);
     box-shadow: var(--shadow-lg);
+  }
+  /* Case-file briefing header on the first act intro. */
+  .case-file {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    padding: 12px 14px;
+    margin-bottom: 4px;
+    border: 0.5px solid color-mix(in srgb, var(--kg-gold) 32%, var(--border));
+    border-radius: 9px;
+    background: color-mix(in srgb, var(--kg-gold) 6%, var(--bg-card));
+  }
+  .case-file-tag {
+    align-self: flex-start;
+    padding: 1px 9px;
+    border-radius: 999px;
+    background: var(--kg-gold-light);
+    color: var(--kg-gold);
+    font-size: 10px;
+    font-weight: 700;
+    letter-spacing: 0.12em;
+  }
+  .case-file p {
+    color: var(--text-secondary);
+    font-size: 12.5px;
+    line-height: 1.75;
   }
   .act-prologue {
     color: var(--text-secondary);

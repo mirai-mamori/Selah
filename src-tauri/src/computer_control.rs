@@ -181,6 +181,7 @@ pub async fn mouse_click(
     }))
 }
 
+#[allow(clippy::too_many_arguments)] // Coordinates form the public computer-control operation contract.
 pub async fn mouse_drag(
     app: &tauri::AppHandle,
     target: Option<&str>,

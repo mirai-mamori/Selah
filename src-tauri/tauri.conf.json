@@ -32,6 +32,9 @@
   },
   "bundle": {
     "active": true,
+    "resources": {
+      "lib/libpdfium.dylib": "libpdfium.dylib"
+    },
     "targets": [
       "dmg",
       "app",

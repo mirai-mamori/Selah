@@ -19,6 +19,9 @@ pub struct Database {
 
 // ── Row types ──
 
+pub type PlannedSession = (i32, String, String);
+pub type PlannedSessionsByName = Vec<(String, Vec<PlannedSession>)>;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionPlanRow {
     pub session_num: i32,
@@ -564,9 +567,7 @@ impl Database {
     /// delivery_mode)])`, session-ordered. Used to align a Live note to its
     /// 真の第N回 by content, and to tell offline (Live-bearing) 回 from online
     /// ones that never produce a recording.
-    pub fn get_planned_sessions_by_name(
-        &self,
-    ) -> Result<Vec<(String, Vec<(i32, String, String)>)>, String> {
+    pub fn get_planned_sessions_by_name(&self) -> Result<PlannedSessionsByName, String> {
         let conn = self.conn.lock().map_err(|e| format!("DB lock: {}", e))?;
         let mut stmt = conn
             .prepare(
@@ -587,8 +588,7 @@ impl Database {
                 ))
             })
             .map_err(|e| format!("DB map: {}", e))?;
-        let mut map: std::collections::HashMap<String, Vec<(i32, String, String)>> =
-            Default::default();
+        let mut map: std::collections::HashMap<String, Vec<PlannedSession>> = Default::default();
         for (name, num, topic, mode) in rows.flatten() {
             map.entry(name).or_default().push((num, topic, mode));
         }
@@ -912,6 +912,34 @@ impl Database {
             Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
             Err(e) => Err(format!("DB get cache: {}", e)),
         }
+    }
+
+    /// Load all cached JSON blobs whose keys begin with `prefix`.
+    pub fn list_data_cache_prefix(
+        &self,
+        prefix: &str,
+    ) -> Result<Vec<(String, String, i64)>, String> {
+        let conn = self.conn.lock().map_err(|e| format!("DB lock: {}", e))?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT cache_key, data_json, updated_at
+                 FROM data_cache
+                 WHERE cache_key LIKE ?1
+                 ORDER BY cache_key",
+            )
+            .map_err(|e| format!("DB prepare cache prefix: {}", e))?;
+        let pattern = format!("{}%", prefix);
+        let rows = stmt
+            .query_map(params![pattern], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                ))
+            })
+            .map_err(|e| format!("DB query cache prefix: {}", e))?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|e| format!("DB read cache prefix: {}", e))
     }
 
     /// Delete a cached entry by key (used to invalidate stale HTML cache).
