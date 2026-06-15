@@ -235,7 +235,7 @@ pub(super) fn extract_pdf_images(path: &Path) -> Result<Vec<crate::ai::ImagePart
 
 /// Locate libpdfium and bind to it. Dev uses the crate's bundled copy via the
 /// compile-time manifest path; a packaged app finds it next to the executable
-/// or in the macOS .app Resources folder. `SELAH_PDFIUM_DIR` overrides all.
+/// or in the macOS .app Frameworks/Resources folder. `SELAH_PDFIUM_DIR` overrides all.
 fn bind_pdfium() -> Result<pdfium_render::prelude::Pdfium, String> {
     use pdfium_render::prelude::Pdfium;
     let mut dirs: Vec<std::path::PathBuf> = Vec::new();
@@ -245,6 +245,7 @@ fn bind_pdfium() -> Result<pdfium_render::prelude::Pdfium, String> {
     dirs.push(std::path::PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/lib")));
     if let Ok(exe) = std::env::current_exe() {
         if let Some(parent) = exe.parent() {
+            dirs.push(parent.join("../Frameworks"));
             dirs.push(parent.join("../Resources"));
             dirs.push(parent.to_path_buf());
         }

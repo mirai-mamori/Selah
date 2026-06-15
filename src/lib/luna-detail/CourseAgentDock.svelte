@@ -198,9 +198,6 @@
             </ul>
           {:else if detail === "seat" && seat}
             <strong class="sa-seat-val sa-seat-val-lg">{seat.assignment}</strong>
-            <div class="sa-meter" style={`--v:${seatConfidence}%`} title={`確度 ${seatConfidence}%`}>
-              <span></span>
-            </div>
             <span class="sa-seat-conf">確度 {seatConfidence}%</span>
             {#if seat.evidence?.length}
               <ul class="sa-list dim sa-seat-ev">
@@ -287,9 +284,6 @@
                 <Icon name="chevron.right" size={13} />
               </header>
               <strong class="sa-seat-val">{seat.assignment}</strong>
-              <div class="sa-meter" style={`--v:${seatConfidence}%`} title={`確度 ${seatConfidence}%`}>
-                <span></span>
-              </div>
               <span class="sa-seat-conf">確度 {seatConfidence}%</span>
             </button>
           {/if}
@@ -311,6 +305,9 @@
     display: grid;
     gap: 9px;
     background: transparent;
+    /* One inset for every card, so content sits the same distance from each
+       edge regardless of the card's size. */
+    --sa-pad: 13px 14px;
   }
 
   /* Back affordance shown on a facet's second page. */
@@ -340,7 +337,7 @@
     padding: 2px 2px 4px;
   }
   .sa-seat-val-lg { font-size: 22px; }
-  .sa-seat-ev { margin-top: 2px; }
+  .sa-seat-ev { margin-top: 4px; }
 
   /* The detail page is itself a card; the back row sits at its top. */
   .sa-page-card { gap: 8px; cursor: default; }
@@ -440,14 +437,11 @@
   /* ── Hero (primary) ─────────────────────────────────────────────────── */
   .sa-hero {
     display: grid;
-    gap: 7px;
-    padding: 12px 14px;
+    gap: 8px;
+    padding: var(--sa-pad);
     border-radius: 13px;
     border: 0.5px solid var(--detail-border-soft);
     background: var(--detail-card);
-  }
-  .sa-hero[data-attn="true"] {
-    border-color: color-mix(in srgb, var(--detail-warn) 32%, transparent);
   }
   .sa-hero-head {
     display: flex;
@@ -480,9 +474,9 @@
   .sa-hero-text {
     margin: 0;
     color: var(--detail-text);
-    font-size: 13.5px;
-    font-weight: 650;
-    line-height: 1.52;
+    font-size: 14px;
+    font-weight: 680;
+    line-height: 1.55;
   }
 
   /* ── Bento grid ─────────────────────────────────────────────────────── */
@@ -495,10 +489,10 @@
   .sa-cell {
     display: grid;
     align-content: start;
-    gap: 6px;
+    gap: 7px;
     width: 100%;
     margin: 0;
-    padding: 11px 12px;
+    padding: var(--sa-pad);
     border-radius: 12px;
     border: 0.5px solid var(--detail-border-soft);
     background: var(--detail-card);
@@ -506,12 +500,9 @@
     color: inherit;
     text-align: left;
     cursor: pointer;
-    transition: background 0.15s ease, border-color 0.15s ease, box-shadow 0.15s ease, transform 0.1s ease;
+    transition: background 0.15s ease, transform 0.1s ease;
   }
-  .sa-cell:hover {
-    background: var(--detail-card-hover);
-    box-shadow: 0 2px 8px rgba(0, 0, 0, 0.055);
-  }
+  .sa-cell:hover { background: var(--detail-card-hover); }
   .sa-cell:active { transform: scale(0.99); }
   .sa-wide { grid-column: span 2; }
   @media (max-width: 560px) { .sa-wide { grid-column: span 1; } }
@@ -565,31 +556,17 @@
     width: 4px;
     height: 4px;
     border-radius: 50%;
-    background: color-mix(in srgb, var(--detail-accent) 60%, transparent);
+    background: var(--detail-faint);
   }
   .sa-list.dim li { color: var(--detail-muted); font-weight: 550; font-size: 11.5px; }
-  .sa-list.dim li::before { background: var(--detail-faint); }
   .sa-more { color: var(--detail-faint); font-size: 11px; font-weight: 700; }
 
-  /* Seat cell with a confidence meter. */
+  /* Seat cell: the assignment with a plain confidence figure (no bar). */
   .sa-seat-val {
     color: var(--detail-text);
     font-size: 15.5px;
     font-weight: 820;
     line-height: 1.2;
-  }
-  .sa-meter {
-    height: 5px;
-    border-radius: 999px;
-    background: color-mix(in srgb, var(--detail-text) 9%, transparent);
-    overflow: hidden;
-  }
-  .sa-meter > span {
-    display: block;
-    width: var(--v, 0%);
-    height: 100%;
-    border-radius: inherit;
-    background: var(--detail-accent);
   }
   .sa-seat-conf {
     color: var(--detail-muted);
@@ -641,7 +618,7 @@
   /* ── Empty state ────────────────────────────────────────────────────── */
   .sa-empty {
     margin: 0;
-    padding: 13px 14px;
+    padding: var(--sa-pad);
     border-radius: 12px;
     border: 0.5px solid var(--detail-border-soft);
     background: var(--detail-card);

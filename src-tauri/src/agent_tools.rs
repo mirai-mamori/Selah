@@ -75,13 +75,14 @@ pub(crate) async fn download_luna_activity_attachments(
     app: &tauri::AppHandle,
     luna_id: &str,
     contents: &crate::luna_parser::LunaCourseContents,
+    kinds: &[&str],
     reusable_paths: &std::collections::HashMap<String, ReusableCourseDownload>,
 ) -> Result<Vec<Value>, String> {
     files_browser::download_all_luna_activity_attachments(
         app,
         luna_id,
         contents,
-        &["announcement", "report"],
+        kinds,
         reusable_paths,
     )
     .await

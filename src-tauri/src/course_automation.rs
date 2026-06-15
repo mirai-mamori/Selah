@@ -24,6 +24,10 @@ const FULL_SUMMARY_NEW_ITEM_THRESHOLD: usize = 8;
 const PRINT_CONFIDENCE_THRESHOLD: f32 = 0.8;
 const PLUS_AI_ATTEMPTS: usize = 2;
 const PLUS_AI_TIMEOUT_SECS: u64 = 180;
+/// Whole-run watchdog. A hung download / print / render must never hold the
+/// global run lock forever; incremental status saves let a timed-out run resume
+/// on the next cycle, so this can be generous without losing work.
+const RUN_TIMEOUT_SECS: u64 = 600;
 const PLUS_DOCUMENT_MAX_TOKENS: u32 = 4096;
 /// Internal sentinel placed on `AnalysisDocument.load_error` when a PDF yields
 /// neither a text layer nor extractable images: it is skipped as a terminal,
@@ -335,8 +339,27 @@ async fn run_course(
         }
     }
     let _guard = RunningGuard(&state.running);
-    let result = run_course_inner(app, luna_id, course_name_hint, trigger).await;
-    result
+    // Watchdog: if a run hangs, time it out so the lock (released by the guard
+    // when this future is dropped) never stays set permanently.
+    match tokio::time::timeout(
+        Duration::from_secs(RUN_TIMEOUT_SECS),
+        run_course_inner(app, luna_id, course_name_hint, trigger),
+    )
+    .await
+    {
+        Ok(result) => result,
+        Err(_) => {
+            let db = app.state::<Database>();
+            let mut status = load_status(&db, luna_id, course_name_hint);
+            status.running = false;
+            status.last_run = Some(epoch_secs());
+            status.last_ok = Some(false);
+            status.stage = "error".into();
+            status.last_error = "実行がタイムアウトしました・次回再試行します".into();
+            let _ = save_status_and_emit(app, &db, &status);
+            Err("実行がタイムアウトしました".into())
+        }
+    }
 }
 
 async fn run_course_inner(
@@ -379,7 +402,7 @@ async fn run_course_inner(
         let mut external_links = Vec::new();
         let mut activity_documents = Vec::new();
         let mut seen_paths = HashSet::new();
-        for material in &contents.materials {
+        for material in contents.materials.iter().filter(|_| config.monitor_materials) {
             for file in &material.files {
                 let filename = if file.file_name.trim().is_empty() {
                     file.display_name.trim()
@@ -485,13 +508,25 @@ async fn run_course_inner(
             }
         }
         let reusable_activity_paths = reusable_activity_downloads(&artifacts);
-        let activity_values = crate::agent_tools::download_luna_activity_attachments(
-            app,
-            luna_id,
-            &contents,
-            &reusable_activity_paths,
-        )
-        .await?;
+        let mut activity_kinds = Vec::new();
+        if config.monitor_announcements {
+            activity_kinds.push("announcement");
+        }
+        if config.monitor_assignments {
+            activity_kinds.push("report");
+        }
+        let activity_values = if activity_kinds.is_empty() {
+            Vec::new()
+        } else {
+            crate::agent_tools::download_luna_activity_attachments(
+                app,
+                luna_id,
+                &contents,
+                &activity_kinds,
+                &reusable_activity_paths,
+            )
+            .await?
+        };
         source_snapshot["activityDetails"] = Value::Array(
             activity_values
                 .iter()
@@ -601,6 +636,21 @@ async fn run_course_inner(
         status.stage = "analyzing".into();
         let mut documents = activity_documents;
         documents.extend(build_analysis_documents(&downloaded, &previous));
+        // analyze_all = false: only touch new or changed items. Already-done
+        // items keep their stored analysis (still in working/audit memory) and
+        // are dropped from this run's set. Default (true) keeps the full sweep.
+        if !config.analyze_all {
+            documents.retain(|document| {
+                match previous_document_analysis(&previous, document) {
+                    Some(previous_analysis) if previous_analysis.status == "done" => {
+                        document_fingerprint(document)
+                            .map(|fingerprint| fingerprint != previous_analysis.fingerprint)
+                            .unwrap_or(true)
+                    }
+                    _ => true,
+                }
+            });
+        }
         let student = load_student_profile(&db);
         status.total_documents = documents.len();
         status.processed_documents = 0;

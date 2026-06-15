@@ -32,9 +32,6 @@
   },
   "bundle": {
     "active": true,
-    "resources": {
-      "lib/libpdfium.dylib": "libpdfium.dylib"
-    },
     "targets": [
       "dmg",
       "app",
@@ -53,7 +50,10 @@
     "copyright": "Copyright 2025-2026 Selah-KGU. All rights reserved.",
     "macOS": {
       "minimumSystemVersion": "11.0",
-      "entitlements": "Entitlements.plist"
+      "entitlements": "Entitlements.plist",
+      "frameworks": [
+        "lib/libpdfium.dylib"
+      ]
     },
     "windows": {
       "digestAlgorithm": "sha256",
