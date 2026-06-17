@@ -12,8 +12,8 @@
 //     the one bundle, so there is no second service that can prompt separately.
 //
 // Identical in debug and release: both read the keychain bundle (one cached
-// read per process → at most one Touch ID prompt per launch, in dev too) and
-// fall back to the encrypted file only when the keychain is unavailable.
+// read per process) and fall back to the encrypted file only when the keychain
+// is unavailable.
 //
 // The machine-bound encrypted file uses AES-256-GCM keyed off a per-machine
 // identifier: the ciphertext is useless if copied to another machine and never
@@ -39,9 +39,9 @@ const BUNDLE_ACCOUNT: &str = "secret_bundle_v1";
 static BUNDLE: LazyLock<Mutex<Option<HashMap<String, String>>>> = LazyLock::new(|| Mutex::new(None));
 
 /// Set when the keychain bundle existed but could not be read this session
-/// (Touch ID cancelled / auth failed / biometric set changed). The in-memory
-/// bundle is then empty *but not authoritative*, so persisting it would clobber
-/// the real keychain copy — `persist_bundle` refuses to write while this is set.
+/// (e.g. the access prompt was denied). The in-memory bundle is then empty
+/// *but not authoritative*, so persisting it would clobber the real keychain
+/// copy — `persist_bundle` refuses to write while this is set.
 static BUNDLE_LOAD_FAILED: AtomicBool = AtomicBool::new(false);
 
 /// Outcome of a keychain bundle read, distinguishing "no item yet" (safe to
@@ -100,11 +100,20 @@ fn cookie_ns(key: &str) -> String {
 
 // ---- load / persist the whole bundle --------------------------------------
 
+/// User-chosen backend: store secrets only in the encrypted file, never the
+/// OS keychain. Default is keychain (see SecurityConfig).
+fn store_is_file() -> bool {
+    crate::commands::load_security_config().secret_store == "file"
+}
+
 fn load_bundle_from_store() -> HashMap<String, String> {
-    // One read covers every secret → at most one Touch ID prompt per process.
-    // Same path in debug and release: dev uses the keychain too (the single
-    // cached read makes the prompt a once-per-launch cost), falling back to the
-    // encrypted file only when the keychain is unavailable.
+    // File-only mode: read the encrypted file, never touch the keychain.
+    if store_is_file() {
+        return enc_read(&bundle_enc_path())
+            .and_then(|json| serde_json::from_str(&json).ok())
+            .unwrap_or_default();
+    }
+    // Keychain mode: read the keychain bundle once per process (cached after).
     match bundle_kc_read() {
         BundleRead::Found(json) => match serde_json::from_str::<HashMap<String, String>>(&json) {
             Ok(map) => return map,
@@ -114,59 +123,58 @@ fn load_bundle_from_store() -> HashMap<String, String> {
                 return HashMap::new();
             }
         },
-        BundleRead::NotFound => {} // no bundle yet → try the file fallback
         BundleRead::Failed => {
             BUNDLE_LOAD_FAILED.store(true, Ordering::Relaxed);
-            log::warn!(
-                "[keychain] secret bundle unlock failed/cancelled — secrets unavailable until restart"
-            );
+            log::warn!("[keychain] secret bundle read failed — secrets unavailable until restart");
             return HashMap::new();
         }
+        BundleRead::NotFound => {}
     }
+    // Keychain empty: one-time import of any leftover encrypted file into the
+    // keychain, then drop the file (keychain mode keeps no file fallback).
     if let Some(json) = enc_read(&bundle_enc_path()) {
         if let Ok(map) = serde_json::from_str::<HashMap<String, String>>(&json) {
-            // Loaded from the file fallback. If the keychain is now usable
-            // (e.g. the keychain-access-groups entitlement was added since the
-            // file was written), this upgrades the bundle into the Touch ID
-            // item and drops the weaker file; a no-op write otherwise.
             let _ = persist_bundle(&map);
             return map;
         }
     }
-    // Nothing stored yet — start empty; the first write creates the bundle.
     HashMap::new()
 }
 
 fn persist_bundle(map: &HashMap<String, String>) -> Result<(), String> {
     if BUNDLE_LOAD_FAILED.load(Ordering::Relaxed) {
-        return Err("secret store locked: biometric unlock failed this session — restart to retry".into());
+        return Err("secret store locked: keychain read failed this session — restart to retry".into());
     }
     let json = serde_json::to_string(map).map_err(|e| format!("serialize bundle: {e}"))?;
-    match bundle_kc_write(&json) {
-        Ok(()) => {
-            // When the biometric keychain item works, drop the machine-bound
-            // file copy: keeping it would let an attacker bypass Touch ID by
-            // reading the (weaker) file instead. macOS only — the keychain item
-            // there is the biometric one; elsewhere the file stays as fallback.
-            #[cfg(target_os = "macos")]
-            {
-                let _ = std::fs::remove_file(bundle_enc_path());
-            }
-            Ok(())
-        }
-        Err(err) => {
-            log::warn!("[keychain] bundle keychain write failed ({err}); encrypted file fallback in use");
-            enc_write(&bundle_enc_path(), &json)
-        }
+    if store_is_file() {
+        // File-only: write the file and make sure no copy lingers in the keychain.
+        enc_write(&bundle_enc_path(), &json)?;
+        bundle_kc_delete();
+        Ok(())
+    } else {
+        // Keychain-only: no encrypted-file fallback. Write the keychain and drop
+        // any leftover file. A keychain write failure surfaces as an error
+        // rather than silently falling back to a weaker on-disk copy.
+        bundle_kc_write(&json)?;
+        let _ = std::fs::remove_file(bundle_enc_path());
+        Ok(())
     }
 }
 
-/// Force the (possibly Touch-ID-gated) bundle read to happen now, on a
-/// background thread, so the prompt appears at a controlled moment (app launch
-/// / entering Live) rather than from an arbitrary background task mid-session.
+/// Pre-load the secret bundle once, off the main thread at app launch, so the
+/// single keychain read isn't paid lazily on the first secret access.
 pub fn prewarm() {
     std::thread::spawn(|| {
         let _ = get_secret("__prewarm__");
+    });
+}
+
+/// Re-write the current bundle so a changed storage preference (keep vs. drop
+/// the encrypted-file fallback) takes effect now, rather than on the next
+/// secret change.
+pub fn reapply_storage_policy() {
+    with_bundle(|bundle| {
+        let _ = persist_bundle(bundle);
     });
 }
 
@@ -185,39 +193,26 @@ fn kc_set(service: &str, account: &str, value: &str) -> Result<(), String> {
         .map_err(|e| format!("Credential set error: {}", e))
 }
 
-// ---- bundle item: biometric-gated on macOS --------------------------------
+// ---- bundle item: single keychain entry on macOS --------------------------
 //
-// The bundle is stored as a single keychain item protected by Touch ID
-// (BIOMETRY_CURRENT_SET) + AccessibleWhenUnlockedThisDeviceOnly. Reading it
-// presents the Touch ID sheet; with the in-memory cache that is one prompt per
-// process. If biometric enrollment changes, BIOMETRY_CURRENT_SET invalidates
-// the item and the user re-enters their secrets. On Macs without Touch ID the
-// write fails and we fall back to the machine-bound encrypted file.
+// Plain generic-password item in the login keychain. Reads are silent for a
+// matching code signature; a different signature prompts once.
+//
+// Touch ID gating was tried (data-protection keychain + SecAccessControl
+// biometry) and abandoned: it requires the keychain-access-groups entitlement,
+// which AMFI rejects at exec for a Developer ID build with no provisioning
+// profile — the app gets SIGKILLed on launch. Not viable for this distribution.
 
 const ERR_SEC_ITEM_NOT_FOUND: i32 = -25300;
-// The build can't reach the data-protection keychain (ad-hoc dev build, or no
-// keychain-access-groups entitlement). Treat like "no item" → fall back to the
-// encrypted file, rather than locking the session as if Touch ID had failed.
-const ERR_SEC_MISSING_ENTITLEMENT: i32 = -34018;
 
 #[cfg(target_os = "macos")]
 fn bundle_kc_read() -> BundleRead {
-    use security_framework::passwords::{generic_password, PasswordOptions};
-    let mut options = PasswordOptions::new_generic_password(SERVICE, BUNDLE_ACCOUNT);
-    // Biometric items live in the data-protection keychain; the read must target
-    // it too or the item won't be found. This is what triggers the Touch ID sheet.
-    options.use_protected_keychain();
-    match generic_password(options) {
+    match security_framework::passwords::get_generic_password(SERVICE, BUNDLE_ACCOUNT) {
         Ok(bytes) => match String::from_utf8(bytes) {
             Ok(json) => BundleRead::Found(json),
             Err(_) => BundleRead::Failed,
         },
-        Err(e)
-            if e.code() == ERR_SEC_ITEM_NOT_FOUND
-                || e.code() == ERR_SEC_MISSING_ENTITLEMENT =>
-        {
-            BundleRead::NotFound
-        }
+        Err(e) if e.code() == ERR_SEC_ITEM_NOT_FOUND => BundleRead::NotFound,
         Err(e) => {
             log::warn!(
                 "[keychain] bundle read failed (code {}): {}",
@@ -231,29 +226,13 @@ fn bundle_kc_read() -> BundleRead {
 
 #[cfg(target_os = "macos")]
 fn bundle_kc_write(json: &str) -> Result<(), String> {
-    use security_framework::access_control::{ProtectionMode, SecAccessControl};
-    use security_framework::passwords::{
-        delete_generic_password_options, set_generic_password_options, AccessControlOptions,
-        PasswordOptions,
-    };
-    let access = SecAccessControl::create_with_protection(
-        Some(ProtectionMode::AccessibleWhenUnlockedThisDeviceOnly),
-        AccessControlOptions::BIOMETRY_CURRENT_SET.bits(),
-    )
-    .map_err(|e| format!("access control create: {e}"))?;
+    security_framework::passwords::set_generic_password(SERVICE, BUNDLE_ACCOUNT, json.as_bytes())
+        .map_err(|e| format!("keychain set: {e}"))
+}
 
-    // Delete the existing item first so this is always an add — updating an
-    // existing biometric item would itself trigger a Touch ID prompt on write.
-    // Target the data-protection keychain (where the biometric item lives).
-    let mut delete = PasswordOptions::new_generic_password(SERVICE, BUNDLE_ACCOUNT);
-    delete.use_protected_keychain();
-    let _ = delete_generic_password_options(delete);
-
-    let mut options = PasswordOptions::new_generic_password(SERVICE, BUNDLE_ACCOUNT);
-    options.use_protected_keychain();
-    options.set_access_control(access);
-    set_generic_password_options(json.as_bytes(), options)
-        .map_err(|e| format!("biometric keychain set: {e}"))
+#[cfg(target_os = "macos")]
+fn bundle_kc_delete() {
+    let _ = security_framework::passwords::delete_generic_password(SERVICE, BUNDLE_ACCOUNT);
 }
 
 #[cfg(target_os = "windows")]
@@ -269,6 +248,13 @@ fn bundle_kc_write(json: &str) -> Result<(), String> {
     kc_set(SERVICE, BUNDLE_ACCOUNT, json)
 }
 
+#[cfg(target_os = "windows")]
+fn bundle_kc_delete() {
+    if let Ok(entry) = keyring::Entry::new(SERVICE, BUNDLE_ACCOUNT) {
+        let _ = entry.delete_credential();
+    }
+}
+
 #[cfg(not(any(target_os = "macos", target_os = "windows")))]
 fn bundle_kc_read() -> BundleRead {
     BundleRead::NotFound
@@ -278,6 +264,9 @@ fn bundle_kc_read() -> BundleRead {
 fn bundle_kc_write(_json: &str) -> Result<(), String> {
     Err("no OS keychain on this platform".into())
 }
+
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
+fn bundle_kc_delete() {}
 
 // ---- machine-bound encrypted file (fallback) ------------------------------
 

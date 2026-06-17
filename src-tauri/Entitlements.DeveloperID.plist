@@ -10,10 +10,10 @@
      (sleep prevention during live transcription) and reads gethostuuid(),
      which the App Sandbox would block.
 
-     keychain-access-groups is required to use the data-protection keychain
-     (kSecUseDataProtectionKeychain), which is what backs the Touch ID-gated
-     secret bundle. Literal team prefix (not $(AppIdentifierPrefix)) because
-     Developer ID signing has no provisioning profile to substitute it. -->
+     Do NOT add keychain-access-groups here: it is a managed entitlement that
+     AMFI rejects at exec for a Developer ID build with no provisioning profile
+     (the app gets SIGKILLed on launch). The secret bundle uses a plain login-
+     keychain item instead — no entitlement needed. -->
 <plist version="1.0">
 <dict>
     <!-- Hardened Runtime: required for Tauri WebView JIT -->
@@ -43,10 +43,5 @@
     <!-- Debug-only osascript notification fallback (ai.rs) -->
     <key>com.apple.security.automation.apple-events</key>
     <true/>
-    <!-- Data-protection keychain access group (Touch ID secret bundle) -->
-    <key>keychain-access-groups</key>
-    <array>
-        <string>4H88DC6RMN.com.kgu.selah</string>
-    </array>
 </dict>
 </plist>

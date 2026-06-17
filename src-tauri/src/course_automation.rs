@@ -20,7 +20,7 @@ const DEFAULT_INTERVAL_MINUTES: u32 = 30;
 const CHECK_INTERVAL_SECS: u64 = 5 * 60;
 const STARTUP_DELAY_SECS: u64 = 75;
 const MAX_FILE_TEXT_CHARS: usize = 16_000;
-const FULL_SUMMARY_NEW_ITEM_THRESHOLD: usize = 8;
+const FULL_SUMMARY_NEW_ITEM_THRESHOLD: usize = 4;
 const PRINT_CONFIDENCE_THRESHOLD: f32 = 0.8;
 const PLUS_AI_ATTEMPTS: usize = 2;
 const PLUS_AI_TIMEOUT_SECS: u64 = 180;
@@ -41,6 +41,7 @@ const DOC_SKIP_MARKER: &str = "__doc_skip__";
 enum JobKind {
     Cycle { force_all: bool },
     ReanalyzeDoc { document_id: String },
+    RebuildMemory,
 }
 
 struct Job {
@@ -142,6 +143,80 @@ pub struct PrintCandidate {
     pub confidence: f32,
 }
 
+/// A continuing memory item that is explicitly tied to this course and may
+/// carry an expiry date. `expires_at` is an ISO date (`YYYY-MM-DD`) after which
+/// the item is no longer relevant; an empty value means a standing rule with no
+/// fixed expiry. Items whose expiry has passed are pruned deterministically in
+/// code (see `prune_and_normalize_standing`), independent of the model.
+#[derive(Debug, Clone, Serialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct StandingMemory {
+    #[serde(default)]
+    pub text: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub expires_at: String,
+    /// True when this memory is time-critical / action-required (a near deadline,
+    /// schedule change, exam, seat change, …). Surfaced first in the UI so the
+    /// student sees what needs attention now; the kinds of change that set this
+    /// are also what make an incoming document trigger an immediate refresh.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub urgent: bool,
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
+// Accept both the legacy bare-string form and the new object so already-persisted
+// memories deserialize without migration.
+impl<'de> Deserialize<'de> for StandingMemory {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Repr {
+            Text(String),
+            Object {
+                #[serde(default)]
+                text: String,
+                #[serde(default, rename = "expiresAt")]
+                expires_at: String,
+                #[serde(default)]
+                urgent: bool,
+            },
+        }
+        Ok(match Repr::deserialize(deserializer)? {
+            Repr::Text(text) => StandingMemory {
+                text,
+                expires_at: String::new(),
+                urgent: false,
+            },
+            Repr::Object {
+                text,
+                expires_at,
+                urgent,
+            } => StandingMemory {
+                text,
+                expires_at,
+                urgent,
+            },
+        })
+    }
+}
+
+/// A consolidated cluster of past (expired) memories under one short heading,
+/// e.g. label「完了した課題」with items for each finished assignment.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct ArchivedGroup {
+    #[serde(default)]
+    pub label: String,
+    #[serde(default)]
+    pub items: Vec<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct AgentCourseAnalysis {
@@ -150,7 +225,14 @@ pub struct AgentCourseAnalysis {
     #[serde(default)]
     pub findings: Vec<String>,
     #[serde(default)]
-    pub standing_context: Vec<String>,
+    pub standing_context: Vec<StandingMemory>,
+    /// Past memory, consolidated. When a standing memory expires it is not kept
+    /// verbatim — it is folded into a short labeled group here (e.g. a finished
+    /// assignment becomes one sub-item under「完了した課題」), so old context stays
+    /// available to relate to future material without the list growing forever.
+    /// The model maintains and condenses these groups each round.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub archived_context: Vec<ArchivedGroup>,
     #[serde(default)]
     pub seat: SeatConclusion,
     #[serde(default)]
@@ -368,6 +450,20 @@ async fn process_job(app: &AppHandle, job: &Job) -> Result<CourseAutomationView,
                 Err(_) => Err("再分析がタイムアウトしました".into()),
             }
         }
+        JobKind::RebuildMemory => {
+            // Rebuilding rewrites the whole working memory from the existing
+            // per-document analyses, so it runs exclusively like a cycle.
+            let _exclusive = state.cycle_lock.write().await;
+            match tokio::time::timeout(
+                Duration::from_secs(RUN_TIMEOUT_SECS),
+                rebuild_memory(app, &job.luna_id, &job.course_name),
+            )
+            .await
+            {
+                Ok(result) => result,
+                Err(_) => Err("記憶の再構築がタイムアウトしました".into()),
+            }
+        }
     }
 }
 
@@ -442,6 +538,18 @@ pub async fn course_automation_reanalyze_all(
         return Err("このコースの SenseA を先に有効にしてください".into());
     }
     enqueue_job(&app, luna_id, course_name, "manual", JobKind::Cycle { force_all: true }).await
+}
+
+#[tauri::command]
+pub async fn course_automation_rebuild_memory(
+    app: AppHandle,
+    luna_id: String,
+    course_name: String,
+) -> Result<CourseAutomationView, String> {
+    if !load_config(&app.state::<Database>(), &luna_id, &course_name).enabled {
+        return Err("このコースの SenseA を先に有効にしてください".into());
+    }
+    enqueue_job(&app, luna_id, course_name, "manual", JobKind::RebuildMemory).await
 }
 
 #[tauri::command]
@@ -544,6 +652,55 @@ async fn reanalyze_one_document(
     if was_done && !status.pending_summary_ids.iter().any(|id| id == document_id) {
         status.pending_summary_ids.push(document_id.to_string());
     }
+    save_status_and_emit(app, &db, &status)?;
+
+    Ok(load_view(&db, luna_id, course_name))
+}
+
+/// Rebuilds the whole working memory (summary / findings / 記憶 / seat / print)
+/// from a clean slate, re-running the synthesis over every already-analysed
+/// document. Re-uses the stored per-document analyses — no re-download or
+/// per-document AI — so it only re-derives the consolidated memory. Used when
+/// the accumulated memory has drifted and the user wants it reconstructed.
+async fn rebuild_memory(
+    app: &AppHandle,
+    luna_id: &str,
+    course_name: &str,
+) -> Result<CourseAutomationView, String> {
+    let db = app.state::<Database>();
+    let status_snapshot = load_status(&db, luna_id, course_name);
+    let analysed = status_snapshot
+        .document_analyses
+        .iter()
+        .filter(|item| item.status == "done")
+        .cloned()
+        .collect::<Vec<_>>();
+    if analysed.is_empty() {
+        return Err("分析済みの資料がありません。先に確認を実行してください".into());
+    }
+
+    let student = load_student_profile(&db);
+    // Clean slate: no previous analysis, so the memory is derived purely from
+    // the documents themselves rather than carried forward.
+    let analysis = summarize_with_agent(
+        luna_id,
+        &status_snapshot.course_name,
+        &analysed,
+        &student,
+        &AgentCourseAnalysis::default(),
+    )
+    .await?;
+
+    let analysed_ids = analysed.iter().map(|item| item.id.clone()).collect();
+
+    let state = app.state::<CourseAutomationState>();
+    let _write = state.status_write.lock().await;
+    // Reload to fold the rebuilt memory onto the latest persisted status without
+    // clobbering anything a concurrent change touched.
+    let mut status = load_status(&db, luna_id, course_name);
+    status.analysis = analysis;
+    status.pending_summary_ids.clear();
+    status.last_summary_document_ids = analysed_ids;
     save_status_and_emit(app, &db, &status)?;
 
     Ok(load_view(&db, luna_id, course_name))
@@ -1703,7 +1860,8 @@ async fn summarize_with_agent(
             &label,
         )
         .await?;
-        working_memory = normalize_course_analysis(result);
+        working_memory =
+            normalize_course_analysis(result, &chrono::Local::now().format("%Y-%m-%d").to_string());
     }
     Ok(working_memory)
 }
@@ -1888,10 +2046,13 @@ fn normalize_document_agent_output(mut output: DocumentAgentOutput) -> DocumentA
     output
 }
 
-fn normalize_course_analysis(mut analysis: AgentCourseAnalysis) -> AgentCourseAnalysis {
+fn normalize_course_analysis(mut analysis: AgentCourseAnalysis, today: &str) -> AgentCourseAnalysis {
     analysis.summary = truncate_chars(analysis.summary.trim(), 240);
     analysis.findings = normalize_short_list(analysis.findings, 6, 280);
-    analysis.standing_context = normalize_short_list(analysis.standing_context, 12, 280);
+    let (active, stale) = split_active_memory(std::mem::take(&mut analysis.standing_context), today);
+    analysis.standing_context = active;
+    analysis.archived_context =
+        consolidate_archive(std::mem::take(&mut analysis.archived_context), stale);
     analysis.seat.assignment = truncate_chars(analysis.seat.assignment.trim(), 80);
     analysis.seat.evidence = normalize_short_list(analysis.seat.evidence, 6, 280);
     let mut seen_prints = HashSet::new();
@@ -1903,6 +2064,92 @@ fn normalize_course_analysis(mut analysis: AgentCourseAnalysis) -> AgentCourseAn
         candidate.reason = truncate_chars(candidate.reason.trim(), 240);
     }
     analysis
+}
+
+/// Heading used for expired memories that reached the archive without the model
+/// having grouped them yet. The model is asked to re-file them into proper
+/// groups on the next round; until then they live here so nothing is lost.
+const ARCHIVE_FALLBACK_LABEL: &str = "過去の項目";
+
+/// Splits the model's continuing memories by expiry: active items (empty or
+/// future `expires_at`) stay in the live list; items whose `expires_at` has
+/// passed are returned as `stale` text to be folded into the consolidated
+/// archive. Trims/dedupes; an unparseable expiry is treated as no expiry (kept
+/// active). No item cap.
+fn split_active_memory(
+    produced: Vec<StandingMemory>,
+    today: &str,
+) -> (Vec<StandingMemory>, Vec<String>) {
+    let today_date = chrono::NaiveDate::parse_from_str(today, "%Y-%m-%d").ok();
+    let is_expired = |item: &StandingMemory| {
+        match (
+            today_date,
+            chrono::NaiveDate::parse_from_str(item.expires_at.get(..10).unwrap_or(""), "%Y-%m-%d")
+                .ok(),
+        ) {
+            (Some(today), Some(expiry)) => expiry < today,
+            _ => false,
+        }
+    };
+
+    let mut active = Vec::new();
+    let mut stale = Vec::new();
+    let mut seen = HashSet::new();
+    for mut item in produced {
+        item.text = truncate_chars(item.text.trim(), 280);
+        item.expires_at = item.expires_at.trim().to_string();
+        if item.text.is_empty() || !seen.insert(item.text.clone()) {
+            continue;
+        }
+        if is_expired(&item) {
+            stale.push(item.text);
+        } else {
+            active.push(item);
+        }
+    }
+    (active, stale)
+}
+
+/// Normalizes the model's consolidated past-memory groups and folds in any
+/// freshly-expired `fallback_items` the model didn't group itself. Groups with
+/// the same label are merged, items are trimmed and deduped within a group, and
+/// empty groups are dropped. There is no cap — size is bounded by the model
+/// consolidating related items into compact sub-entries rather than by a limit.
+fn consolidate_archive(groups: Vec<ArchivedGroup>, fallback_items: Vec<String>) -> Vec<ArchivedGroup> {
+    fn insert(result: &mut Vec<ArchivedGroup>, label: &str, item: String) {
+        let item = truncate_chars(item.trim(), 280);
+        if item.is_empty() {
+            return;
+        }
+        if let Some(group) = result.iter_mut().find(|group| group.label == label) {
+            if !group.items.iter().any(|existing| existing == &item) {
+                group.items.push(item);
+            }
+        } else {
+            result.push(ArchivedGroup {
+                label: label.to_string(),
+                items: vec![item],
+            });
+        }
+    }
+
+    let mut result: Vec<ArchivedGroup> = Vec::new();
+    for group in groups {
+        let label = truncate_chars(group.label.trim(), 80);
+        let label = if label.is_empty() {
+            ARCHIVE_FALLBACK_LABEL.to_string()
+        } else {
+            label
+        };
+        for item in group.items {
+            insert(&mut result, &label, item);
+        }
+    }
+    for item in fallback_items {
+        insert(&mut result, ARCHIVE_FALLBACK_LABEL, item);
+    }
+    result.retain(|group| !group.items.is_empty());
+    result
 }
 
 fn normalize_short_list(values: Vec<String>, max_items: usize, max_chars: usize) -> Vec<String> {
@@ -2430,7 +2677,11 @@ mod tests {
     fn final_summary_input_uses_delta_and_excludes_ledger_metadata() {
         let previous = AgentCourseAnalysis {
             summary: "compressed working memory".into(),
-            standing_context: vec!["keep this context".into()],
+            standing_context: vec![StandingMemory {
+                text: "keep this context".into(),
+                expires_at: String::new(),
+                urgent: false,
+            }],
             ..Default::default()
         };
         let delta = DocumentAnalysis {
@@ -2460,32 +2711,113 @@ mod tests {
 
     #[test]
     fn normalizes_model_output_before_persisting_it() {
-        let analysis = normalize_course_analysis(AgentCourseAnalysis {
-            summary: "a".repeat(400),
-            findings: vec![
-                "same".into(),
-                "same".into(),
-                "b".repeat(400),
-                "third".into(),
-                "fourth".into(),
-                "fifth".into(),
-                "sixth".into(),
-                "seventh".into(),
-            ],
-            standing_context: (0..20).map(|index| format!("context-{index}")).collect(),
-            seat: SeatConclusion {
-                assignment: "s".repeat(100),
-                evidence: (0..10).map(|index| format!("evidence-{index}")).collect(),
-                confidence: 0.9,
+        let analysis = normalize_course_analysis(
+            AgentCourseAnalysis {
+                summary: "a".repeat(400),
+                findings: vec![
+                    "same".into(),
+                    "same".into(),
+                    "b".repeat(400),
+                    "third".into(),
+                    "fourth".into(),
+                    "fifth".into(),
+                    "sixth".into(),
+                    "seventh".into(),
+                ],
+                standing_context: (0..20)
+                    .map(|index| StandingMemory {
+                        text: format!("context-{index}"),
+                        expires_at: String::new(),
+                        urgent: false,
+                    })
+                    .collect(),
+                seat: SeatConclusion {
+                    assignment: "s".repeat(100),
+                    evidence: (0..10).map(|index| format!("evidence-{index}")).collect(),
+                    confidence: 0.9,
+                },
+                ..Default::default()
             },
-            ..Default::default()
-        });
+            "2026-06-17",
+        );
 
         assert_eq!(analysis.summary.chars().count(), 240);
         assert_eq!(analysis.findings.len(), 6);
-        assert_eq!(analysis.standing_context.len(), 12);
+        assert_eq!(analysis.standing_context.len(), 20);
         assert_eq!(analysis.seat.assignment.chars().count(), 80);
         assert_eq!(analysis.seat.evidence.len(), 6);
+    }
+
+    #[test]
+    fn split_active_memory_separates_expired_from_active() {
+        let (active, stale) = split_active_memory(
+            vec![
+                StandingMemory {
+                    text: "expired".into(),
+                    expires_at: "2026-06-10".into(),
+                    urgent: false,
+                },
+                StandingMemory {
+                    text: "today still valid".into(),
+                    expires_at: "2026-06-17".into(),
+                    urgent: false,
+                },
+                StandingMemory {
+                    text: "future".into(),
+                    expires_at: "2026-12-01".into(),
+                    urgent: false,
+                },
+                StandingMemory {
+                    text: "standing rule".into(),
+                    expires_at: String::new(),
+                    urgent: false,
+                },
+            ],
+            "2026-06-17",
+        );
+
+        let active_texts: Vec<&str> = active.iter().map(|item| item.text.as_str()).collect();
+        assert_eq!(active_texts, vec!["today still valid", "future", "standing rule"]);
+        assert_eq!(stale, vec!["expired"]);
+    }
+
+    #[test]
+    fn consolidate_archive_merges_labels_and_folds_stale() {
+        let groups = vec![
+            ArchivedGroup {
+                label: "完了した課題".into(),
+                items: vec!["第1回レポート".into(), "第1回レポート".into()],
+            },
+            ArchivedGroup {
+                label: "完了した課題".into(),
+                items: vec!["第2回レポート".into()],
+            },
+            ArchivedGroup {
+                label: "終了したイベント".into(),
+                items: vec![],
+            },
+        ];
+        let archive = consolidate_archive(groups, vec!["第3回レポート".into()]);
+
+        // Same-label groups merge and items dedupe; the empty group is dropped.
+        assert_eq!(archive.len(), 2);
+        let assignments = &archive[0];
+        assert_eq!(assignments.label, "完了した課題");
+        assert_eq!(assignments.items, vec!["第1回レポート", "第2回レポート"]);
+        // The freshly-expired memory lands under the fallback heading.
+        assert_eq!(archive[1].label, ARCHIVE_FALLBACK_LABEL);
+        assert_eq!(archive[1].items, vec!["第3回レポート"]);
+    }
+
+    #[test]
+    fn standing_memory_accepts_legacy_string_form() {
+        let parsed: Vec<StandingMemory> =
+            serde_json::from_str(r#"["legacy", {"text": "new", "expiresAt": "2026-09-01"}]"#)
+                .expect("deserialize mixed standing context");
+        assert_eq!(parsed[0].text, "legacy");
+        assert_eq!(parsed[0].expires_at, "");
+        assert_eq!(parsed[1].text, "new");
+        assert_eq!(parsed[1].expires_at, "2026-09-01");
     }
 
     #[test]
@@ -2653,8 +2985,8 @@ mod tests {
 
     #[test]
     fn comprehensive_summary_waits_for_enough_new_items() {
-        assert!(!should_refresh_summary("existing context", 7, false));
-        assert!(should_refresh_summary("existing context", 8, false));
+        assert!(!should_refresh_summary("existing context", 3, false));
+        assert!(should_refresh_summary("existing context", 4, false));
         assert!(should_refresh_summary("existing context", 1, true));
         assert!(should_refresh_summary("", 1, false));
     }

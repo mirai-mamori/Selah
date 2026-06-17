@@ -1,5 +1,6 @@
 <script lang="ts">
   import { onDestroy, onMount } from "svelte";
+  import { invoke } from "@tauri-apps/api/core";
   import {
     isDemoActive,
     getSavedCookieSummaries,
@@ -297,12 +298,40 @@
     }
   }
 
+  let secretStore = $state("keychain");
+  let secStatusMsg = $state("");
+  let secStatusColor = $state("");
+
+  async function loadSecurityConfig() {
+    if (isDemoActive()) return;
+    try {
+      const cfg = await invoke<{ secret_store?: string }>("get_security_config");
+      secretStore = cfg.secret_store === "file" ? "file" : "keychain";
+    } catch (e) {
+      console.error("Failed to load security config:", e);
+    }
+  }
+
+  async function saveSecurityConfig() {
+    if (isDemoActive()) return;
+    try {
+      await invoke("save_security_config", { config: { secret_store: secretStore } });
+      secStatusColor = "var(--green)";
+      secStatusMsg = "保存しました";
+    } catch (e) {
+      secStatusColor = "var(--red)";
+      secStatusMsg = "保存失敗: " + String(e);
+    }
+    setTimeout(() => { secStatusMsg = ""; }, 4000);
+  }
+
   onMount(() => {
     void (async () => {
       await loadStoredStates();
       await loadCookieSummaries();
       await checkAll(false);
     })();
+    void loadSecurityConfig();
   });
 
   onDestroy(() => {
@@ -400,6 +429,23 @@
   {:else}
     <div class="hint cookie-summary-note">Cookie はシステムの資格情報ストアに保存します。名前・値・ドメイン・パスなどの認証情報は表示しません。</div>
   {/if}
+</div>
+
+<div class="card-label">秘密情報の保存先</div>
+<div class="card">
+  <div class="row">
+    <span class="row-label">保存先</span>
+    <div class="row-input sec-store">
+      <select bind:value={secretStore} onchange={saveSecurityConfig}>
+        <option value="keychain">キーチェーン</option>
+        <option value="file">暗号化ファイル</option>
+      </select>
+      <div class="hint">APIキー・トークン・Cookie の保存先を選びます。「キーチェーン」は OS のキーチェーンにのみ保存します（既定・推奨。保存先を切り替えると中身も移行します）。「暗号化ファイル」はキーチェーンを一切使わず、端末固有キーで暗号化したファイルのみに保存します（キーチェーンの確認ダイアログを避けたい場合向け。ただしファイルは同一ユーザーのプロセスからは復号され得ます）。</div>
+      {#if secStatusMsg}
+        <div class="hint" style="color:{secStatusColor};">{secStatusMsg}</div>
+      {/if}
+    </div>
+  </div>
 </div>
 
 <div class:ready={coreReady} class:stored={!coreReady && coreStored} class="core-summary">
@@ -536,6 +582,13 @@
     display: flex;
     align-items: center;
     gap: 10px;
+  }
+  /* Secret-store row stacks select + hint + status vertically (the default
+     .row-input here is a horizontal flex used by the status rows). */
+  .sec-store {
+    flex-direction: column;
+    align-items: stretch;
+    gap: 6px;
   }
   .session-indicator {
     flex: 1;

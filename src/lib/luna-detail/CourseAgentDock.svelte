@@ -37,7 +37,8 @@
     analysis: {
       summary: string;
       findings: string[];
-      standingContext: string[];
+      standingContext: Array<{ text: string; expiresAt: string; urgent?: boolean }>;
+      archivedContext?: Array<{ label: string; items: string[] }>;
       seat: { assignment: string; evidence: string[]; confidence: number };
       printCandidates: Array<{ filename: string; reason: string; confidence: number }>;
     };
@@ -66,7 +67,7 @@
     findings: "確認事項",
     seat: "座席",
     print: "印刷",
-    standing: "メモ",
+    standing: "記憶",
     documents: "分析した資料",
   };
 
@@ -132,7 +133,39 @@
   // ── Bento content ────────────────────────────────────────────────────────
   const summary = $derived(view?.status.analysis?.summary?.trim() ?? "");
   const findings = $derived(view?.status.analysis?.findings ?? []);
-  const standingContext = $derived(view?.status.analysis?.standingContext ?? []);
+  // Memories carry an expiry date. Active ones drive the メモ pill; expired ones
+  // (the backend's archive, plus any active item whose date just rolled past)
+  // are not dropped — they stay as a dim 過去 reference, since old context can
+  // still relate to new material. Split client-side so display is correct even
+  // between backend summary runs.
+  const todayStr = $derived.by(() => {
+    const now = new Date();
+    const m = `${now.getMonth() + 1}`.padStart(2, "0");
+    const d = `${now.getDate()}`.padStart(2, "0");
+    return `${now.getFullYear()}-${m}-${d}`;
+  });
+  const isExpired = (m: { expiresAt: string }) => !!m.expiresAt && m.expiresAt.slice(0, 10) < todayStr;
+  const standingContext = $derived(
+    (view?.status.analysis?.standingContext ?? [])
+      .filter((m) => !isExpired(m))
+      // Time-critical memories (urgent) lead so the student sees them first.
+      .slice()
+      .sort((a, b) => Number(b.urgent ?? false) - Number(a.urgent ?? false)),
+  );
+  // Past memory shown grouped under headings (完了した課題, etc.). Items whose
+  // date just rolled past but the backend hasn't consolidated yet appear under
+  // a 最近終了 group so they never vanish between summary runs.
+  const standingArchive = $derived.by(() => {
+    const groups: Array<{ label: string; items: string[] }> = [];
+    const stragglers = (view?.status.analysis?.standingContext ?? [])
+      .filter(isExpired)
+      .map((m) => m.text);
+    if (stragglers.length) groups.push({ label: "最近終了", items: stragglers });
+    for (const group of view?.status.analysis?.archivedContext ?? []) {
+      if (group.items?.length) groups.push(group);
+    }
+    return groups;
+  });
   const seat = $derived(view?.status.analysis?.seat);
   const seatConfidence = $derived(Math.round(Math.max(0, Math.min(1, seat?.confidence ?? 0)) * 100));
   const printResults = $derived(view?.status.printResults ?? []);
@@ -241,6 +274,26 @@
     }
   }
 
+  // Rebuild 記憶 — re-derives the whole working memory from the existing
+  // per-document analyses (no re-download / re-analyze), clearing accumulated
+  // drift. Heavy and exclusive like a full cycle.
+  let rebuildingMemory = $state(false);
+  async function rebuildMemory(): Promise<void> {
+    if (busy || rebuildingMemory || reanalyzingAll || reanalyzingIds.length || view?.status.running) return;
+    busy = true;
+    rebuildingMemory = true;
+    error = "";
+    try {
+      view = await invoke<CourseAutomationView>("course_automation_rebuild_memory", { lunaId, courseName });
+    } catch (cause) {
+      error = String(cause);
+      await load().catch(() => {});
+    } finally {
+      busy = false;
+      rebuildingMemory = false;
+    }
+  }
+
   // One document — lightweight; several may be in flight at once. Not gated on
   // status.running: if a full cycle is active the backend queue makes this wait
   // its turn, so the click always gives feedback instead of a dead button.
@@ -299,6 +352,11 @@
               <Icon name="arrow.clockwise" size={13} />
               <span>全て再分析</span>
             </button>
+          {:else if detail === "standing"}
+            <button class="sa-detail-action" class:spin={rebuildingMemory} type="button" disabled={busy || running || reanalyzingIds.length > 0} onclick={rebuildMemory}>
+              <Icon name="arrow.clockwise" size={13} />
+              <span>記憶を再構築</span>
+            </button>
           {/if}
         </header>
 
@@ -320,12 +378,33 @@
           {:else if detail === "standing"}
             <ul class="sa-rows">
               {#each standingContext as item}
-                <li class="sa-row sa-row-dim">
+                <li class="sa-row sa-row-dim" class:sa-row-urgent={item.urgent}>
                   <span class="sa-row-dot"></span>
-                  <p class="sa-row-text">{item}</p>
+                  <p class="sa-row-text">
+                    {#if item.urgent}<span class="sa-row-flag">要対応</span>{/if}
+                    {item.text}
+                    {#if item.expiresAt}<span class="sa-row-until">〜{item.expiresAt}</span>{/if}
+                  </p>
                 </li>
               {/each}
             </ul>
+            {#if standingArchive.length}
+              <!-- Past memory, consolidated into labeled groups (完了した課題,
+                   etc.). Kept as reference — the agent still sees it when
+                   relating new material — and shown dimmer, set apart. -->
+              <p class="sa-rows-sub">過去(参考)</p>
+              {#each standingArchive as group}
+                <p class="sa-arch-label">{group.label}</p>
+                <ul class="sa-rows">
+                  {#each group.items as item}
+                    <li class="sa-row sa-row-dim sa-row-past">
+                      <span class="sa-row-dot"></span>
+                      <p class="sa-row-text">{item}</p>
+                    </li>
+                  {/each}
+                </ul>
+              {/each}
+            {/if}
           {:else if detail === "seat" && seat}
             <div class="sa-seat-grid">
               <div class="sa-seat-hero">
@@ -384,17 +463,17 @@
           </button>
         </div>
         {#if seat?.assignment}
-          <button class="sa-pill sa-pill-go" data-cat="seat" type="button" onclick={() => (detail = "seat")}>
+          <button class="sa-pill sa-pill-go" data-cat="seat" type="button" onclick={() => (detail = "seat")} title={seat.assignment}>
             <Icon name="seat" size={13} />
             <span>座席</span>
-            <b>{seat.assignment}</b>
+            <b class="sa-pill-val">{seat.assignment}</b>
             <Icon name="chevron.right" size={12} />
           </button>
         {/if}
         {#if standingContext.length}
           <button class="sa-pill sa-pill-go" data-cat="standing" type="button" onclick={() => (detail = "standing")}>
             <Icon name="note" size={13} />
-            <span>メモ</span>
+            <span>記憶</span>
             <b>{standingContext.length}</b>
             <Icon name="chevron.right" size={12} />
           </button>
@@ -648,6 +727,49 @@
     line-height: 1.5;
   }
   .sa-row-dim .sa-row-text { color: var(--detail-muted); font-weight: 550; }
+  /* Urgent (time-critical) memories: brighter text and a small leading flag. */
+  .sa-row-urgent .sa-row-text { color: var(--detail-text); font-weight: 650; }
+  .sa-row-urgent .sa-row-dot { background: var(--detail-warn); }
+  .sa-row-flag {
+    margin-right: 6px;
+    padding: 1px 7px;
+    border-radius: 999px;
+    background: color-mix(in srgb, var(--detail-warn) 18%, transparent);
+    color: var(--detail-warn);
+    font-size: 10px;
+    font-weight: 800;
+    letter-spacing: 0.02em;
+    white-space: nowrap;
+    vertical-align: 1px;
+  }
+  .sa-row-until {
+    margin-left: 6px;
+    font-size: 12px;
+    font-weight: 600;
+    font-variant-numeric: tabular-nums;
+    color: var(--detail-muted);
+    opacity: 0.8;
+    white-space: nowrap;
+  }
+  /* Label introducing the expired/past-reference memories. */
+  .sa-rows-sub {
+    margin: 6px 0 0;
+    color: var(--detail-faint);
+    font-size: 11px;
+    font-weight: 800;
+    font-style: italic;
+    letter-spacing: 0.02em;
+  }
+  /* Expired memories sit quieter than active ones — still legible, clearly past. */
+  .sa-row-past { opacity: 0.62; }
+  /* Heading for each consolidated past group (完了した課題, etc.). */
+  .sa-arch-label {
+    margin: 4px 0 0;
+    color: var(--detail-muted);
+    font-size: 12px;
+    font-weight: 800;
+    letter-spacing: 0.01em;
+  }
 
   /* Seat detail: two columns — the prominent value block beside its 根拠
      list — collapsing to one column on a narrow surface. */
@@ -818,7 +940,9 @@
     align-items: center;
     gap: 6px;
     min-height: 28px;
-    max-width: 100%;
+    /* Cap every pill so a long value can't stretch the row; the variable part
+       inside (status text / seat value) ellipsis-truncates within this width. */
+    max-width: 480px;
     margin: 0;
     padding: 0 12px;
     border: 0;
@@ -828,6 +952,7 @@
     font: inherit;
   }
   .sa-pill > span {
+    flex: none;
     font-size: 11.5px;
     font-weight: 700;
   }
@@ -836,6 +961,14 @@
     font-size: 11px;
     font-weight: 800;
     font-variant-numeric: tabular-nums;
+  }
+  /* A pill's variable value (e.g. the seat assignment) shrinks and truncates
+     rather than widening the pill past its cap. */
+  .sa-pill-val {
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
   }
   .sa-pill-text {
     min-width: 0;
@@ -890,6 +1023,7 @@
   .sa-pill-go { cursor: pointer; transition: background 0.14s ease, transform 0.1s ease; }
   .sa-pill-go:hover { background: color-mix(in srgb, var(--detail-text) 9%, transparent); }
   .sa-pill-go:active { transform: scale(0.97); }
+  .sa-pill :global(.icon) { flex: none; }
   .sa-pill-go :global(.icon:first-child) { color: var(--detail-muted); }
   .sa-pill-go :global(.icon:last-child) { color: var(--detail-faint); }
 
