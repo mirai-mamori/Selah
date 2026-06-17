@@ -8,7 +8,7 @@ use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Mutex;
 use std::time::Duration;
 use tauri::{AppHandle, Emitter, Manager, State};
 
@@ -34,16 +34,57 @@ const PLUS_DOCUMENT_MAX_TOKENS: u32 = 4096;
 /// non-retryable outcome rather than counted as a failure.
 const DOC_SKIP_MARKER: &str = "__doc_skip__";
 
-#[derive(Default)]
+/// One unit of SenseA work. Every operation that issues SenseA AI requests —
+/// the scheduled/manual full cycle, "re-analyze all", and single-document
+/// re-analysis — is expressed as a Job and processed through the one queue, so
+/// there is a single serialised mechanism rather than per-operation locks.
+enum JobKind {
+    Cycle { force_all: bool },
+    ReanalyzeDoc { document_id: String },
+}
+
+struct Job {
+    luna_id: String,
+    course_name: String,
+    trigger: String,
+    kind: JobKind,
+    /// Present for command-triggered jobs that await the result; absent for the
+    /// scheduler's fire-and-forget cycles.
+    respond: Option<tokio::sync::oneshot::Sender<Result<CourseAutomationView, String>>>,
+}
+
+/// How many queued jobs may run at once (queue + bounded parallelism).
+const JOB_PARALLELISM: usize = 3;
+
 pub struct CourseAutomationState {
-    running: AtomicBool,
+    /// Sender into the unified job queue. All SenseA AI work goes through here.
+    job_tx: tokio::sync::mpsc::UnboundedSender<Job>,
+    /// Receiver, taken once by the dispatcher in `start_course_automation_loop`.
+    job_rx: Mutex<Option<tokio::sync::mpsc::UnboundedReceiver<Job>>>,
+    /// Coordinates the parallel jobs safely: a full cycle takes the write side
+    /// (exclusive — it rewrites the whole status), single-document jobs take the
+    /// read side (they run their AI in parallel with each other).
+    cycle_lock: tokio::sync::RwLock<()>,
+    /// Serialises the brief status read-modify-write of concurrent document
+    /// jobs so their upserts merge instead of clobbering.
+    status_write: tokio::sync::Mutex<()>,
 }
 
 impl CourseAutomationState {
     pub fn new() -> Self {
+        let (job_tx, job_rx) = tokio::sync::mpsc::unbounded_channel();
         Self {
-            running: AtomicBool::new(false),
+            job_tx,
+            job_rx: Mutex::new(Some(job_rx)),
+            cycle_lock: tokio::sync::RwLock::new(()),
+            status_write: tokio::sync::Mutex::new(()),
         }
+    }
+}
+
+impl Default for CourseAutomationState {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -128,6 +169,11 @@ pub struct DocumentAnalysis {
     pub filename: String,
     pub path: String,
     pub status: String,
+    /// The text that was analysed, kept only for fileless documents
+    /// (announcements have no downloaded file to re-read), so a later
+    /// single-document re-analysis can run without re-fetching.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub content: String,
     #[serde(default)]
     pub summary: String,
     #[serde(default)]
@@ -241,6 +287,48 @@ struct AnalysisDocument {
 
 pub fn start_course_automation_loop(app: &AppHandle) {
     let app = app.clone();
+
+    // Crash/restart recovery: a status left with running=true (e.g. the app
+    // quit mid-run) would otherwise wedge the UI with every button disabled.
+    reset_stale_running_flags(&app);
+
+    // The unified queue dispatcher. It pulls every Job (and therefore every
+    // SenseA AI request) and runs it on a bounded pool, so up to
+    // JOB_PARALLELISM jobs proceed at once while the rest queue. Per-job safety
+    // (cycle exclusivity, document upsert serialisation) is handled in
+    // process_job via the state's locks.
+    if let Some(mut rx) = app
+        .state::<CourseAutomationState>()
+        .job_rx
+        .lock()
+        .ok()
+        .and_then(|mut slot| slot.take())
+    {
+        let dispatch_app = app.clone();
+        let permits = std::sync::Arc::new(tokio::sync::Semaphore::new(JOB_PARALLELISM));
+        tauri::async_runtime::spawn(async move {
+            while let Some(job) = rx.recv().await {
+                let Ok(permit) = permits.clone().acquire_owned().await else {
+                    break;
+                };
+                let job_app = dispatch_app.clone();
+                tauri::async_runtime::spawn(async move {
+                    let _permit = permit;
+                    let result = process_job(&job_app, &job).await;
+                    if let Some(tx) = job.respond {
+                        let _ = tx.send(result);
+                    } else if let Err(error) = result {
+                        log::warn!(
+                            "[course_automation] course '{}' failed: {}",
+                            job.course_name,
+                            error
+                        );
+                    }
+                });
+            }
+        });
+    }
+
     tauri::async_runtime::spawn(async move {
         tokio::time::sleep(Duration::from_secs(STARTUP_DELAY_SECS)).await;
         loop {
@@ -250,6 +338,61 @@ pub fn start_course_automation_loop(app: &AppHandle) {
             tokio::time::sleep(Duration::from_secs(CHECK_INTERVAL_SECS)).await;
         }
     });
+}
+
+/// Runs one queued Job to completion. Each branch carries a watchdog so a hung
+/// AI request can never tie up a worker slot (and thus stall the queue).
+async fn process_job(app: &AppHandle, job: &Job) -> Result<CourseAutomationView, String> {
+    let state = app.state::<CourseAutomationState>();
+    let db = app.state::<Database>();
+    match &job.kind {
+        JobKind::Cycle { force_all } => {
+            // A full cycle rewrites the whole status from a snapshot, so it runs
+            // exclusively (write side): no document job writes underneath it.
+            let _exclusive = state.cycle_lock.write().await;
+            // run_course has its own timeout + status cleanup.
+            run_course(app, &job.luna_id, &job.course_name, &job.trigger, *force_all).await?;
+            Ok(load_view(&db, &job.luna_id, &job.course_name))
+        }
+        JobKind::ReanalyzeDoc { document_id } => {
+            // Document jobs share the read side, so several re-analyse in
+            // parallel, but none overlaps a full cycle.
+            let _shared = state.cycle_lock.read().await;
+            match tokio::time::timeout(
+                Duration::from_secs(RUN_TIMEOUT_SECS),
+                reanalyze_one_document(app, &job.luna_id, &job.course_name, document_id),
+            )
+            .await
+            {
+                Ok(result) => result,
+                Err(_) => Err("再分析がタイムアウトしました".into()),
+            }
+        }
+    }
+}
+
+/// Enqueues a job and awaits its result — used by the user-triggered commands.
+async fn enqueue_job(
+    app: &AppHandle,
+    luna_id: String,
+    course_name: String,
+    trigger: &str,
+    kind: JobKind,
+) -> Result<CourseAutomationView, String> {
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let job = Job {
+        luna_id,
+        course_name,
+        trigger: trigger.to_string(),
+        kind,
+        respond: Some(tx),
+    };
+    app.state::<CourseAutomationState>()
+        .job_tx
+        .send(job)
+        .map_err(|_| "処理キューに送信できません".to_string())?;
+    rx.await
+        .map_err(|_| "処理が中断されました".to_string())?
 }
 
 #[tauri::command]
@@ -283,12 +426,146 @@ pub async fn course_automation_run_now(
     luna_id: String,
     course_name: String,
 ) -> Result<CourseAutomationView, String> {
-    let db = app.state::<Database>();
-    if !load_config(&db, &luna_id, &course_name).enabled {
+    if !load_config(&app.state::<Database>(), &luna_id, &course_name).enabled {
         return Err("このコースの SenseA を先に有効にしてください".into());
     }
-    run_course(&app, &luna_id, &course_name, "manual").await?;
-    Ok(load_view(&db, &luna_id, &course_name))
+    enqueue_job(&app, luna_id, course_name, "manual", JobKind::Cycle { force_all: false }).await
+}
+
+#[tauri::command]
+pub async fn course_automation_reanalyze_all(
+    app: AppHandle,
+    luna_id: String,
+    course_name: String,
+) -> Result<CourseAutomationView, String> {
+    if !load_config(&app.state::<Database>(), &luna_id, &course_name).enabled {
+        return Err("このコースの SenseA を先に有効にしてください".into());
+    }
+    enqueue_job(&app, luna_id, course_name, "manual", JobKind::Cycle { force_all: true }).await
+}
+
+#[tauri::command]
+pub async fn course_automation_reanalyze_document(
+    app: AppHandle,
+    luna_id: String,
+    course_name: String,
+    document_id: String,
+) -> Result<CourseAutomationView, String> {
+    if !load_config(&app.state::<Database>(), &luna_id, &course_name).enabled {
+        return Err("このコースの SenseA を先に有効にしてください".into());
+    }
+    enqueue_job(
+        &app,
+        luna_id,
+        course_name,
+        "manual",
+        JobKind::ReanalyzeDoc { document_id },
+    )
+    .await
+}
+
+/// Re-analyses a single already-downloaded document. Runs as a queue Job, so it
+/// is naturally serialised with every other SenseA operation — no extra locks.
+async fn reanalyze_one_document(
+    app: &AppHandle,
+    luna_id: &str,
+    course_name: &str,
+    document_id: &str,
+) -> Result<CourseAutomationView, String> {
+    let db = app.state::<Database>();
+    let status_snapshot = load_status(&db, luna_id, course_name);
+    let existing = status_snapshot
+        .document_analyses
+        .iter()
+        .find(|item| item.id == document_id)
+        .cloned()
+        .ok_or_else(|| "対象の資料が見つかりません".to_string())?;
+
+    // Rebuild the document for re-analysis. File-backed documents are re-read
+    // from disk (picking up any change); fileless ones (announcements) reuse
+    // the text captured when they were first analysed.
+    let mut document = AnalysisDocument {
+        kind: existing.kind.clone(),
+        title: existing.title.clone(),
+        filename: existing.filename.clone(),
+        path: existing.path.clone(),
+        content: String::new(),
+        source_fingerprint: existing.source_fingerprint.clone(),
+        load_error: String::new(),
+        images: Vec::new(),
+    };
+    if existing.path.is_empty() {
+        if existing.content.is_empty() {
+            return Err("この資料は本文が保存されていないため、「全て再分析」で再取得してください".into());
+        }
+        document.content = existing.content.clone();
+    } else {
+        let path = PathBuf::from(&existing.path);
+        match crate::agent_tools::read_downloaded_text(&path) {
+            Ok(text) => document.content = truncate_chars(&text, MAX_FILE_TEXT_CHARS),
+            Err(error) => load_document_images_or_error(&path, &mut document, &error),
+        }
+    }
+
+    let fingerprint = document_fingerprint(&document)?;
+    let mut analysis = if document.load_error == DOC_SKIP_MARKER {
+        DocumentAnalysis {
+            id: document_id.to_string(),
+            fingerprint,
+            source_fingerprint: document.source_fingerprint.clone(),
+            kind: document.kind.clone(),
+            title: document.title.clone(),
+            filename: document.filename.clone(),
+            path: document.path.clone(),
+            status: "skipped".into(),
+            error: "本文・画像とも抽出できないためスキップしました".into(),
+            ..Default::default()
+        }
+    } else if !document.load_error.is_empty() {
+        return Err(document.load_error);
+    } else {
+        let student = load_student_profile(&db);
+        analyze_document_with_agent(luna_id, course_name, &document, &student).await?
+    };
+    // Preserve the text on the record so fileless docs stay re-analysable.
+    if existing.path.is_empty() && !document.content.is_empty() {
+        analysis.content = document.content.clone();
+    }
+    let was_done = analysis.status == "done";
+
+    // Brief critical section (serialised across concurrent document jobs):
+    // reload the latest status, upsert this one document, queue it for the next
+    // synthesis. The 分析 card reflects the new per-document summary at once;
+    // the overall synthesis refreshes on the next cycle.
+    let state = app.state::<CourseAutomationState>();
+    let _write = state.status_write.lock().await;
+    let mut status = load_status(&db, luna_id, course_name);
+    upsert_document_analysis(&mut status.document_analyses, analysis);
+    if was_done && !status.pending_summary_ids.iter().any(|id| id == document_id) {
+        status.pending_summary_ids.push(document_id.to_string());
+    }
+    save_status_and_emit(app, &db, &status)?;
+
+    Ok(load_view(&db, luna_id, course_name))
+}
+
+/// Clears any persisted `running` flag at startup. A run can only be active
+/// after this point via the live queue, so a stored `true` is always stale.
+fn reset_stale_running_flags(app: &AppHandle) {
+    let db = app.state::<Database>();
+    let Ok(rows) = db.list_data_cache_prefix(STATUS_PREFIX) else {
+        return;
+    };
+    for (_, raw, _) in rows {
+        let Ok(mut status) = serde_json::from_str::<CourseAutomationStatus>(&raw) else {
+            continue;
+        };
+        if status.running {
+            status.running = false;
+            status.stage = String::new();
+            let _ = save_status_and_emit(app, &db, &status);
+        }
+    }
 }
 
 async fn run_due_courses(app: &AppHandle) -> Result<(), String> {
@@ -310,14 +587,14 @@ async fn run_due_courses(app: &AppHandle) -> Result<(), String> {
         {
             continue;
         }
-        if let Err(error) = run_course(app, &config.luna_id, &config.course_name, "scheduled").await
-        {
-            log::warn!(
-                "[course_automation] course '{}' failed: {}",
-                config.course_name,
-                error
-            );
-        }
+        // Hand the due course to the unified queue; the worker logs failures.
+        let _ = app.state::<CourseAutomationState>().job_tx.send(Job {
+            luna_id: config.luna_id,
+            course_name: config.course_name,
+            trigger: "scheduled".to_string(),
+            kind: JobKind::Cycle { force_all: false },
+            respond: None,
+        });
     }
     Ok(())
 }
@@ -327,39 +604,33 @@ async fn run_course(
     luna_id: &str,
     course_name_hint: &str,
     trigger: &str,
+    force_all: bool,
 ) -> Result<(), String> {
-    let state = app.state::<CourseAutomationState>();
-    if state.running.swap(true, Ordering::SeqCst) {
-        return Err("別のコースを Agent が処理中です".into());
-    }
-    struct RunningGuard<'a>(&'a AtomicBool);
-    impl Drop for RunningGuard<'_> {
-        fn drop(&mut self) {
-            self.0.store(false, Ordering::SeqCst);
-        }
-    }
-    let _guard = RunningGuard(&state.running);
-    // Watchdog: if a run hangs, time it out so the lock (released by the guard
-    // when this future is dropped) never stays set permanently.
-    match tokio::time::timeout(
+    // Exclusivity is provided by the single queue worker; here we only keep a
+    // watchdog so a hung run can't wedge the queue.
+    let outcome = match tokio::time::timeout(
         Duration::from_secs(RUN_TIMEOUT_SECS),
-        run_course_inner(app, luna_id, course_name_hint, trigger),
+        run_course_inner(app, luna_id, course_name_hint, trigger, force_all),
     )
     .await
     {
         Ok(result) => result,
-        Err(_) => {
-            let db = app.state::<Database>();
-            let mut status = load_status(&db, luna_id, course_name_hint);
-            status.running = false;
-            status.last_run = Some(epoch_secs());
-            status.last_ok = Some(false);
-            status.stage = "error".into();
-            status.last_error = "実行がタイムアウトしました・次回再試行します".into();
-            let _ = save_status_and_emit(app, &db, &status);
-            Err("実行がタイムアウトしました".into())
-        }
+        Err(_) => Err("実行がタイムアウトしました・次回再試行します".to_string()),
+    };
+    // Any failure (timeout OR an early error return from the inner run) must
+    // clear the running flag — otherwise the persisted status stays running and
+    // the UI wedges with every button disabled.
+    if let Err(error) = &outcome {
+        let db = app.state::<Database>();
+        let mut status = load_status(&db, luna_id, course_name_hint);
+        status.running = false;
+        status.last_run = Some(epoch_secs());
+        status.last_ok = Some(false);
+        status.stage = "error".into();
+        status.last_error = error.clone();
+        let _ = save_status_and_emit(app, &db, &status);
     }
+    outcome
 }
 
 async fn run_course_inner(
@@ -367,6 +638,7 @@ async fn run_course_inner(
     luna_id: &str,
     course_name_hint: &str,
     trigger: &str,
+    force_all: bool,
 ) -> Result<(), String> {
     let db = app.state::<Database>();
     let config = load_config(&db, luna_id, course_name_hint);
@@ -639,7 +911,8 @@ async fn run_course_inner(
         // analyze_all = false: only touch new or changed items. Already-done
         // items keep their stored analysis (still in working/audit memory) and
         // are dropped from this run's set. Default (true) keeps the full sweep.
-        if !config.analyze_all {
+        // A manual "re-analyze all" overrides this and re-analyses everything.
+        if !(config.analyze_all || force_all) {
             documents.retain(|document| {
                 match previous_document_analysis(&previous, document) {
                     Some(previous_analysis) if previous_analysis.status == "done" => {
@@ -664,7 +937,7 @@ async fn run_course_inner(
             save_status_and_emit(app, &db, &status)?;
             let fingerprint = document_fingerprint(document)?;
             let previous_document = previous_document_analysis(&previous, document);
-            let analysis = if document.load_error == DOC_SKIP_MARKER {
+            let mut analysis = if document.load_error == DOC_SKIP_MARKER {
                 DocumentAnalysis {
                     id: document_id(document),
                     fingerprint,
@@ -715,6 +988,11 @@ async fn run_course_inner(
                     },
                 }
             };
+            // Fileless documents (announcements) have no file to re-read later,
+            // so keep the analysed text on the record for single re-analysis.
+            if document.path.is_empty() && !document.content.is_empty() {
+                analysis.content = document.content.clone();
+            }
             if analysis.status == "done"
                 && previous_document.is_none_or(|item| item.status != "done")
             {
@@ -1377,6 +1655,7 @@ async fn analyze_document_with_agent(
         filename: document.filename.clone(),
         path: document.path.clone(),
         status: "done".into(),
+        content: String::new(),
         summary: output.summary,
         findings: output.findings,
         seat_evidence: output.seat_evidence,

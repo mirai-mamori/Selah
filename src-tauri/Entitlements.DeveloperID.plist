@@ -1,9 +1,16 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<!-- Developer ID (direct distribution) entitlements.
-     NOTE: tauri.conf.json currently points to Entitlements.plist (sandboxed).
-     To use Developer ID non-sandboxed signing, change bundle.macOS.entitlements
-     to "Entitlements.DeveloperID.plist" in tauri.conf.json. -->
+<!-- Developer ID direct-distribution entitlements: non-sandboxed, Hardened
+     Runtime. Selected by .github/workflows/{release,build}.yml via an inline
+     `bundle.macOS.entitlements` override; it does NOT use the base
+     tauri.conf.json (which stays on the sandboxed Entitlements.plist for the
+     App Store build). The two files are independent on purpose — keep both.
+
+     Non-sandboxed is intentional: the app shells out to /usr/bin/caffeinate
+     (sleep prevention during live transcription) and reads gethostuuid(),
+     which the App Sandbox would block. Keychain access here is ACL-bound to
+     this Developer ID signing identity (stable across releases → no repeated
+     prompts once an item is created by a signed build). -->
 <plist version="1.0">
 <dict>
     <!-- Hardened Runtime: required for Tauri WebView JIT -->

@@ -1,6 +1,12 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
+<!-- App Store entitlements: sandboxed, Hardened Runtime. This is the base
+     `tauri.conf.json > bundle.macOS.entitlements`; tauri.appstore.conf.json
+     inherits it, and .github/workflows/appstore.yml also re-signs the final
+     .app with this file explicitly. The Developer ID direct-distribution build
+     uses Entitlements.DeveloperID.plist (non-sandboxed) instead — see that
+     file. Keep both. -->
 <dict>
     <key>com.apple.security.app-sandbox</key>
     <true/>

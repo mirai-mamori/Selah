@@ -640,6 +640,8 @@ pub fn run() {
             course_automation::course_automation_get,
             course_automation::course_automation_set_enabled,
             course_automation::course_automation_run_now,
+            course_automation::course_automation_reanalyze_all,
+            course_automation::course_automation_reanalyze_document,
             commands::list_downloads,
             commands::scan_download_dir,
             commands::scan_duplicate_downloads,

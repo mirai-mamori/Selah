@@ -47,6 +47,12 @@
     | "paperplane"
     | "copilot"
     | "pulse"
+    | "printer"
+    | "note"
+    | "seat"
+    | "doc.search"
+    | "star"
+    | "list.checks"
     | "stop";
 </script>
 
@@ -243,6 +249,31 @@
     <path d="m22 2-7 20-4-9-9-4Z" />
   {:else if name === "pulse"}
     <path d="M2 12h4.5l1.8-5 3 12 3-16 2.2 9 1.4-2H22" />
+  {:else if name === "printer"}
+    <polyline points="6 9 6 3 18 3 18 9" />
+    <path d="M6 18H5a2 2 0 0 1-2-2v-4a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2v4a2 2 0 0 1-2 2h-1" />
+    <rect x="6" y="14" width="12" height="7" rx="1" />
+  {:else if name === "note"}
+    <path d="M4 5a2 2 0 0 1 2-2h12a2 2 0 0 1 2 2v8.5L14.5 20H6a2 2 0 0 1-2-2z" />
+    <path d="M20 13.5h-4a2 2 0 0 0-2 2V20" />
+    <line x1="8" y1="8" x2="16" y2="8" />
+    <line x1="8" y1="11.5" x2="12.5" y2="11.5" />
+  {:else if name === "seat"}
+    <path d="M6 10V6a2 2 0 0 1 2-2h8a2 2 0 0 1 2 2v4" />
+    <path d="M5 10a2 2 0 0 1 2 2v2h10v-2a2 2 0 0 1 4 0v5a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-5a2 2 0 0 1 2-2z" />
+    <path d="M6 21v-2M18 21v-2" />
+  {:else if name === "doc.search"}
+    <path d="M14 3v5h5" />
+    <path d="M19 11V8l-5-5H6a2 2 0 0 0-2 2v15a2 2 0 0 0 2 2h6" />
+    <circle cx="16.5" cy="16.5" r="2.5" />
+    <line x1="21" y1="21" x2="18.3" y2="18.3" />
+  {:else if name === "star"}
+    <path d="M12 3.5l2.6 5.27 5.82.85-4.21 4.1.99 5.79L12 16.77 6.8 19.5l.99-5.79-4.21-4.1 5.82-.85z" />
+  {:else if name === "list.checks"}
+    <path d="m3 7 1.8 1.8L8 5.5" />
+    <path d="m3 16.5 1.8 1.8L8 15" />
+    <line x1="12" y1="7" x2="21" y2="7" />
+    <line x1="12" y1="17" x2="21" y2="17" />
   {:else if name === "stop"}
     <rect x="6" y="6" width="12" height="12" rx="2" fill="currentColor" stroke="none" />
   {:else if name === "copilot"}

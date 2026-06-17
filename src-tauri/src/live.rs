@@ -248,6 +248,16 @@ fn live_ai_config() -> Result<crate::ai::AiConfig, String> {
         if !crate::local_ai::is_model_downloaded(&model.file_name) {
             return Err("Live要約用のローカルモデルを先にダウンロードしてください".into());
         }
+    } else if cfg.api_key.is_empty() {
+        // Surfaces the real cause instead of letting the request 401 silently.
+        // Most common in packaged builds when the keychain item is unreadable.
+        log::warn!(
+            "[Live] AI summarization aborted: api_key empty for provider '{}' (secret store unreadable?)",
+            cfg.provider
+        );
+        return Err(
+            "AI APIキーを読み込めませんでした。設定でAPIキーを保存し直してください".into(),
+        );
     }
     Ok(cfg)
 }
