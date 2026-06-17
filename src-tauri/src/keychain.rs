@@ -7,8 +7,7 @@
 // per process into memory and reused, so:
 //
 //   * "一次全取": one SecItemCopyMatching returns all secrets → at most ONE
-//     keychain authorization prompt for the entire app, ever (vs. one prompt
-//     per item per access in the old per-key layout).
+//     keychain authorization prompt for the entire app, ever.
 //   * complete coverage: secrets + cookies (namespaced "cookie.<key>") share
 //     the one bundle, so there is no second service that can prompt separately.
 //
@@ -28,7 +27,6 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{LazyLock, Mutex};
 
 const SERVICE: &str = "com.kgu.selah";
-const COOKIE_SERVICE: &str = "com.kgu.selah.cookies";
 // Dev and release share one data dir + login keychain, so the bundle slot is
 // namespaced by build: a dev (ad-hoc-signed) run never reads, overwrites, or
 // hits an ACL conflict with the installed Developer ID build's secrets.
@@ -36,22 +34,6 @@ const COOKIE_SERVICE: &str = "com.kgu.selah.cookies";
 const BUNDLE_ACCOUNT: &str = "secret_bundle_v1_dev";
 #[cfg(not(debug_assertions))]
 const BUNDLE_ACCOUNT: &str = "secret_bundle_v1";
-
-/// Secrets that lived as their own keychain item / file in earlier versions;
-/// folded into the bundle on first launch. Keep complete — anything missing
-/// here is silently lost on upgrade.
-const LEGACY_SECRET_KEYS: [&str; 4] = [
-    "ai_api_key",
-    "gcal_client_secret",
-    "gcal_token",
-    "ms_mail_token",
-];
-const LEGACY_COOKIE_KEYS: [&str; 4] = [
-    "sso_cookie_backup",
-    "luna_cookie_jar",
-    "kwic_cookie_jar",
-    "kgc_cookie_jar",
-];
 
 /// In-memory copy of the whole secret bundle. None = not loaded yet.
 static BUNDLE: LazyLock<Mutex<Option<HashMap<String, String>>>> = LazyLock::new(|| Mutex::new(None));
@@ -132,7 +114,7 @@ fn load_bundle_from_store() -> HashMap<String, String> {
                 return HashMap::new();
             }
         },
-        BundleRead::NotFound => {} // no bundle yet → file fallback / migrate
+        BundleRead::NotFound => {} // no bundle yet → try the file fallback
         BundleRead::Failed => {
             BUNDLE_LOAD_FAILED.store(true, Ordering::Relaxed);
             log::warn!(
@@ -151,10 +133,8 @@ fn load_bundle_from_store() -> HashMap<String, String> {
             return map;
         }
     }
-    // First launch on this layout: fold any legacy per-item secrets in, once.
-    let map = migrate_legacy();
-    let _ = persist_bundle(&map);
-    map
+    // Nothing stored yet — start empty; the first write creates the bundle.
+    HashMap::new()
 }
 
 fn persist_bundle(map: &HashMap<String, String>) -> Result<(), String> {
@@ -190,64 +170,7 @@ pub fn prewarm() {
     });
 }
 
-/// Fold pre-bundle secrets (separate keychain items / per-key .enc files) into
-/// one map. Read-only on the legacy items: leaving them avoids extra prompts,
-/// and nothing reads them once the bundle exists.
-fn migrate_legacy() -> HashMap<String, String> {
-    let mut map = HashMap::new();
-
-    // Interim per-key encrypted files from a previous iteration.
-    for key in LEGACY_SECRET_KEYS {
-        if let Some(value) = enc_read(&per_key_enc_path(key)) {
-            map.insert(key.to_string(), value);
-        }
-    }
-    for ck in LEGACY_COOKIE_KEYS {
-        let ns = cookie_ns(ck);
-        if let Some(value) = enc_read(&per_key_enc_path(&ns)) {
-            map.insert(ns, value);
-        }
-    }
-
-    // Legacy per-account OS keychain items.
-    for key in LEGACY_SECRET_KEYS {
-        if !map.contains_key(key) {
-            if let Some(value) = kc_get(SERVICE, key) {
-                map.insert(key.to_string(), value);
-            }
-        }
-    }
-    for ck in LEGACY_COOKIE_KEYS {
-        let ns = cookie_ns(ck);
-        if !map.contains_key(&ns) {
-            if let Some(value) = kc_get(COOKIE_SERVICE, ck) {
-                map.insert(ns, value);
-            }
-        }
-    }
-
-    // Remove the now-folded interim files (local, no prompt).
-    for key in LEGACY_SECRET_KEYS {
-        let _ = std::fs::remove_file(per_key_enc_path(key));
-    }
-    for ck in LEGACY_COOKIE_KEYS {
-        let _ = std::fs::remove_file(per_key_enc_path(&cookie_ns(ck)));
-    }
-
-    if !map.is_empty() {
-        log::info!("[keychain] migrated {} legacy secret(s) into the bundle", map.len());
-    }
-    map
-}
-
-// ---- OS keychain (single generic-password item per service+account) -------
-
-#[cfg(target_os = "macos")]
-fn kc_get(service: &str, account: &str) -> Option<String> {
-    security_framework::passwords::get_generic_password(service, account)
-        .ok()
-        .and_then(|bytes| String::from_utf8(bytes).ok())
-}
+// ---- Windows credential store (plain; no biometric equivalent wired) ------
 
 #[cfg(target_os = "windows")]
 fn kc_get(service: &str, account: &str) -> Option<String> {
@@ -262,11 +185,6 @@ fn kc_set(service: &str, account: &str, value: &str) -> Result<(), String> {
         .map_err(|e| format!("Credential set error: {}", e))
 }
 
-#[cfg(not(any(target_os = "macos", target_os = "windows")))]
-fn kc_get(_service: &str, _account: &str) -> Option<String> {
-    None
-}
-
 // ---- bundle item: biometric-gated on macOS --------------------------------
 //
 // The bundle is stored as a single keychain item protected by Touch ID
@@ -277,6 +195,10 @@ fn kc_get(_service: &str, _account: &str) -> Option<String> {
 // write fails and we fall back to the machine-bound encrypted file.
 
 const ERR_SEC_ITEM_NOT_FOUND: i32 = -25300;
+// The build can't reach the data-protection keychain (ad-hoc dev build, or no
+// keychain-access-groups entitlement). Treat like "no item" → fall back to the
+// encrypted file, rather than locking the session as if Touch ID had failed.
+const ERR_SEC_MISSING_ENTITLEMENT: i32 = -34018;
 
 #[cfg(target_os = "macos")]
 fn bundle_kc_read() -> BundleRead {
@@ -290,7 +212,12 @@ fn bundle_kc_read() -> BundleRead {
             Ok(json) => BundleRead::Found(json),
             Err(_) => BundleRead::Failed,
         },
-        Err(e) if e.code() == ERR_SEC_ITEM_NOT_FOUND => BundleRead::NotFound,
+        Err(e)
+            if e.code() == ERR_SEC_ITEM_NOT_FOUND
+                || e.code() == ERR_SEC_MISSING_ENTITLEMENT =>
+        {
+            BundleRead::NotFound
+        }
         Err(e) => {
             log::warn!(
                 "[keychain] bundle read failed (code {}): {}",
@@ -372,10 +299,6 @@ fn bundle_enc_path() -> std::path::PathBuf {
     #[cfg(not(debug_assertions))]
     let name = "bundle.v1.enc";
     secrets_dir().join(name)
-}
-
-fn per_key_enc_path(key: &str) -> std::path::PathBuf {
-    secrets_dir().join(format!("{key}.enc"))
 }
 
 /// 32-byte AES key derived from a stable per-machine identifier plus a static
