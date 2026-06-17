@@ -328,6 +328,10 @@ pub fn run() {
                     .build(),
             )?;
             protect_log_storage(app.handle())?;
+            // Unlock the secret bundle once now (Touch ID on macOS) so the
+            // prompt fires at launch rather than from a background task later;
+            // the session restores below then read from the in-memory copy.
+            keychain::prewarm();
             let mut luna = luna_client::LunaClient::new();
             luna.try_restore_session();
             let mut kwic = kwic_client::KwicClient::new();

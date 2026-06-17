@@ -300,26 +300,13 @@ fn load_config() -> AiConfig {
             let _ = save_config_to_disk(&cfg);
             cfg.api_key = key; // keep in memory for this session
         }
-    } else {
-        match crate::keychain::get_secret("ai_api_key") {
-            Some(key) => cfg.api_key = key,
-            None => log::warn!(
-                "[ai] no ai_api_key in secret store (keychain/file returned nothing) — \
-                 requests to provider '{}' will be unauthenticated",
-                cfg.provider
-            ),
-        }
+    } else if let Some(key) = crate::keychain::get_secret("ai_api_key") {
+        // Backed by the in-memory secret bundle (one keychain read per process),
+        // so calling this on every AI op no longer re-hits the keychain.
+        cfg.api_key = key;
     }
 
     normalize_ai_config(&mut cfg);
-
-    if cfg.ai_enabled && cfg.provider != "local" && cfg.api_key.is_empty() {
-        log::warn!(
-            "[ai] provider '{}' enabled but api_key is empty after load — AI calls will 401",
-            cfg.provider
-        );
-    }
-
     cfg
 }
 

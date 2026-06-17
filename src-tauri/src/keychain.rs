@@ -1,113 +1,356 @@
 // ---------------------------------------------------------------------------
-// App secrets (API keys, OAuth tokens). One strategy for *both* debug and
-// release so a value written by a dev build is readable by the packaged build
-// and vice versa:
+// Secret store — ONE bundle, fetched in one shot.
 //
-//   1. OS keychain  — primary. Properly signed builds bind the ACL to the
-//      signing identity (SecItem on macOS, Credential Manager on Windows) and
-//      never re-prompt.
-//   2. machine-bound encrypted file — fallback when the keychain is
-//      unavailable (unsigned/ad-hoc dev builds, sandbox prompt denied, Linux).
-//      AES-256-GCM with a key derived from a per-machine identifier, so the
-//      ciphertext is useless if copied to another machine and never readable
-//      in plaintext. NOTE: a process running as this user can re-derive the
-//      key from the binary — this tier is theft/leak resistance, not secrecy
-//      against local malware. Use the keychain for that.
+// Every app secret (AI key, OAuth tokens) and every cookie blob lives in a
+// single JSON map stored as a SINGLE keychain item (account = BUNDLE_ACCOUNT)
+// with a SINGLE machine-bound encrypted-file fallback. The bundle is read once
+// per process into memory and reused, so:
+//
+//   * "一次全取": one SecItemCopyMatching returns all secrets → at most ONE
+//     keychain authorization prompt for the entire app, ever (vs. one prompt
+//     per item per access in the old per-key layout).
+//   * complete coverage: secrets + cookies (namespaced "cookie.<key>") share
+//     the one bundle, so there is no second service that can prompt separately.
+//
+// Identical in debug and release: both read the keychain bundle (one cached
+// read per process → at most one Touch ID prompt per launch, in dev too) and
+// fall back to the encrypted file only when the keychain is unavailable.
+//
+// The machine-bound encrypted file uses AES-256-GCM keyed off a per-machine
+// identifier: the ciphertext is useless if copied to another machine and never
+// readable in plaintext. A process running as this user can re-derive the key
+// from the binary, so that tier is theft/leak resistance, not secrecy against
+// local malware — the keychain is for that.
 // ---------------------------------------------------------------------------
 
-const SERVICE: &str = "com.kgu.selah";
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{LazyLock, Mutex};
 
-pub fn set_secret(key: &str, value: &str) -> Result<(), String> {
-    // Dev builds never touch the OS keychain (avoids prompts and polluting the
-    // developer's login keychain); they live entirely in the encrypted file.
-    if cfg!(debug_assertions) {
-        return encrypted_secret_set(key, value);
-    }
-    // Release: keychain is primary, but always keep a current encrypted-file
-    // copy as a fallback (kept, never deleted, so reads survive a keychain that
-    // later becomes unavailable).
-    let encrypted = encrypted_secret_set(key, value);
-    match keychain_set(key, value) {
-        Ok(()) => Ok(()),
-        Err(err) => {
-            log::warn!("[keychain] '{key}' keychain write failed, encrypted file fallback in use: {err}");
-            encrypted
-        }
-    }
+const SERVICE: &str = "com.kgu.selah";
+const COOKIE_SERVICE: &str = "com.kgu.selah.cookies";
+// Dev and release share one data dir + login keychain, so the bundle slot is
+// namespaced by build: a dev (ad-hoc-signed) run never reads, overwrites, or
+// hits an ACL conflict with the installed Developer ID build's secrets.
+#[cfg(debug_assertions)]
+const BUNDLE_ACCOUNT: &str = "secret_bundle_v1_dev";
+#[cfg(not(debug_assertions))]
+const BUNDLE_ACCOUNT: &str = "secret_bundle_v1";
+
+/// Secrets that lived as their own keychain item / file in earlier versions;
+/// folded into the bundle on first launch. Keep complete — anything missing
+/// here is silently lost on upgrade.
+const LEGACY_SECRET_KEYS: [&str; 4] = [
+    "ai_api_key",
+    "gcal_client_secret",
+    "gcal_token",
+    "ms_mail_token",
+];
+const LEGACY_COOKIE_KEYS: [&str; 4] = [
+    "sso_cookie_backup",
+    "luna_cookie_jar",
+    "kwic_cookie_jar",
+    "kgc_cookie_jar",
+];
+
+/// In-memory copy of the whole secret bundle. None = not loaded yet.
+static BUNDLE: LazyLock<Mutex<Option<HashMap<String, String>>>> = LazyLock::new(|| Mutex::new(None));
+
+/// Set when the keychain bundle existed but could not be read this session
+/// (Touch ID cancelled / auth failed / biometric set changed). The in-memory
+/// bundle is then empty *but not authoritative*, so persisting it would clobber
+/// the real keychain copy — `persist_bundle` refuses to write while this is set.
+static BUNDLE_LOAD_FAILED: AtomicBool = AtomicBool::new(false);
+
+/// Outcome of a keychain bundle read, distinguishing "no item yet" (safe to
+/// create a fresh bundle) from "item exists but unlock failed" (must not
+/// overwrite it).
+enum BundleRead {
+    Found(String),
+    NotFound,
+    Failed,
 }
 
-pub fn get_secret(key: &str) -> Option<String> {
-    if !cfg!(debug_assertions) {
-        if let Some(value) = keychain_get(key) {
-            return Some(value);
-        }
+fn with_bundle<R>(f: impl FnOnce(&mut HashMap<String, String>) -> R) -> R {
+    let mut guard = BUNDLE.lock().unwrap_or_else(|e| e.into_inner());
+    if guard.is_none() {
+        *guard = Some(load_bundle_from_store());
     }
-    encrypted_secret_get(key)
+    f(guard.as_mut().expect("bundle loaded"))
+}
+
+// ---- public API -----------------------------------------------------------
+
+pub fn get_secret(key: &str) -> Option<String> {
+    with_bundle(|bundle| bundle.get(key).cloned())
+}
+
+pub fn set_secret(key: &str, value: &str) -> Result<(), String> {
+    with_bundle(|bundle| {
+        bundle.insert(key.to_string(), value.to_string());
+        persist_bundle(bundle)
+    })
 }
 
 pub fn delete_secret(key: &str) {
-    if !cfg!(debug_assertions) {
-        keychain_delete(key);
+    with_bundle(|bundle| {
+        if bundle.remove(key).is_some() {
+            let _ = persist_bundle(bundle);
+        }
+    });
+}
+
+pub fn get_cookie_secret(key: &str) -> Option<String> {
+    get_secret(&cookie_ns(key))
+}
+
+pub fn set_cookie_secret(key: &str, value: &str) -> Result<(), String> {
+    set_secret(&cookie_ns(key), value)
+}
+
+pub fn delete_cookie_secret(key: &str) {
+    delete_secret(&cookie_ns(key));
+}
+
+fn cookie_ns(key: &str) -> String {
+    format!("cookie.{key}")
+}
+
+// ---- load / persist the whole bundle --------------------------------------
+
+fn load_bundle_from_store() -> HashMap<String, String> {
+    // One read covers every secret → at most one Touch ID prompt per process.
+    // Same path in debug and release: dev uses the keychain too (the single
+    // cached read makes the prompt a once-per-launch cost), falling back to the
+    // encrypted file only when the keychain is unavailable.
+    match bundle_kc_read() {
+        BundleRead::Found(json) => match serde_json::from_str::<HashMap<String, String>>(&json) {
+            Ok(map) => return map,
+            Err(_) => {
+                // Corrupt payload: don't let an empty map overwrite it.
+                BUNDLE_LOAD_FAILED.store(true, Ordering::Relaxed);
+                return HashMap::new();
+            }
+        },
+        BundleRead::NotFound => {} // no bundle yet → file fallback / migrate
+        BundleRead::Failed => {
+            BUNDLE_LOAD_FAILED.store(true, Ordering::Relaxed);
+            log::warn!(
+                "[keychain] secret bundle unlock failed/cancelled — secrets unavailable until restart"
+            );
+            return HashMap::new();
+        }
     }
-    let _ = std::fs::remove_file(encrypted_secret_path(key));
+    if let Some(json) = enc_read(&bundle_enc_path()) {
+        if let Ok(map) = serde_json::from_str::<HashMap<String, String>>(&json) {
+            // Loaded from the file fallback. If the keychain is now usable
+            // (e.g. the keychain-access-groups entitlement was added since the
+            // file was written), this upgrades the bundle into the Touch ID
+            // item and drops the weaker file; a no-op write otherwise.
+            let _ = persist_bundle(&map);
+            return map;
+        }
+    }
+    // First launch on this layout: fold any legacy per-item secrets in, once.
+    let map = migrate_legacy();
+    let _ = persist_bundle(&map);
+    map
 }
 
-// ---- OS keychain (primary) -----------------------------------------------
-
-#[cfg(target_os = "macos")]
-fn keychain_set(key: &str, value: &str) -> Result<(), String> {
-    security_framework::passwords::set_generic_password(SERVICE, key, value.as_bytes())
-        .map_err(|e| format!("Keychain set error: {}", e))
+fn persist_bundle(map: &HashMap<String, String>) -> Result<(), String> {
+    if BUNDLE_LOAD_FAILED.load(Ordering::Relaxed) {
+        return Err("secret store locked: biometric unlock failed this session — restart to retry".into());
+    }
+    let json = serde_json::to_string(map).map_err(|e| format!("serialize bundle: {e}"))?;
+    match bundle_kc_write(&json) {
+        Ok(()) => {
+            // When the biometric keychain item works, drop the machine-bound
+            // file copy: keeping it would let an attacker bypass Touch ID by
+            // reading the (weaker) file instead. macOS only — the keychain item
+            // there is the biometric one; elsewhere the file stays as fallback.
+            #[cfg(target_os = "macos")]
+            {
+                let _ = std::fs::remove_file(bundle_enc_path());
+            }
+            Ok(())
+        }
+        Err(err) => {
+            log::warn!("[keychain] bundle keychain write failed ({err}); encrypted file fallback in use");
+            enc_write(&bundle_enc_path(), &json)
+        }
+    }
 }
 
+/// Force the (possibly Touch-ID-gated) bundle read to happen now, on a
+/// background thread, so the prompt appears at a controlled moment (app launch
+/// / entering Live) rather than from an arbitrary background task mid-session.
+pub fn prewarm() {
+    std::thread::spawn(|| {
+        let _ = get_secret("__prewarm__");
+    });
+}
+
+/// Fold pre-bundle secrets (separate keychain items / per-key .enc files) into
+/// one map. Read-only on the legacy items: leaving them avoids extra prompts,
+/// and nothing reads them once the bundle exists.
+fn migrate_legacy() -> HashMap<String, String> {
+    let mut map = HashMap::new();
+
+    // Interim per-key encrypted files from a previous iteration.
+    for key in LEGACY_SECRET_KEYS {
+        if let Some(value) = enc_read(&per_key_enc_path(key)) {
+            map.insert(key.to_string(), value);
+        }
+    }
+    for ck in LEGACY_COOKIE_KEYS {
+        let ns = cookie_ns(ck);
+        if let Some(value) = enc_read(&per_key_enc_path(&ns)) {
+            map.insert(ns, value);
+        }
+    }
+
+    // Legacy per-account OS keychain items.
+    for key in LEGACY_SECRET_KEYS {
+        if !map.contains_key(key) {
+            if let Some(value) = kc_get(SERVICE, key) {
+                map.insert(key.to_string(), value);
+            }
+        }
+    }
+    for ck in LEGACY_COOKIE_KEYS {
+        let ns = cookie_ns(ck);
+        if !map.contains_key(&ns) {
+            if let Some(value) = kc_get(COOKIE_SERVICE, ck) {
+                map.insert(ns, value);
+            }
+        }
+    }
+
+    // Remove the now-folded interim files (local, no prompt).
+    for key in LEGACY_SECRET_KEYS {
+        let _ = std::fs::remove_file(per_key_enc_path(key));
+    }
+    for ck in LEGACY_COOKIE_KEYS {
+        let _ = std::fs::remove_file(per_key_enc_path(&cookie_ns(ck)));
+    }
+
+    if !map.is_empty() {
+        log::info!("[keychain] migrated {} legacy secret(s) into the bundle", map.len());
+    }
+    map
+}
+
+// ---- OS keychain (single generic-password item per service+account) -------
+
 #[cfg(target_os = "macos")]
-fn keychain_get(key: &str) -> Option<String> {
-    security_framework::passwords::get_generic_password(SERVICE, key)
+fn kc_get(service: &str, account: &str) -> Option<String> {
+    security_framework::passwords::get_generic_password(service, account)
         .ok()
         .and_then(|bytes| String::from_utf8(bytes).ok())
 }
 
-#[cfg(target_os = "macos")]
-fn keychain_delete(key: &str) {
-    let _ = security_framework::passwords::delete_generic_password(SERVICE, key);
+#[cfg(target_os = "windows")]
+fn kc_get(service: &str, account: &str) -> Option<String> {
+    keyring::Entry::new(service, account).ok()?.get_password().ok()
 }
 
 #[cfg(target_os = "windows")]
-fn keychain_entry(key: &str) -> Result<keyring::Entry, String> {
-    keyring::Entry::new(SERVICE, key).map_err(|e| format!("Keychain entry error: {}", e))
-}
-
-#[cfg(target_os = "windows")]
-fn keychain_set(key: &str, value: &str) -> Result<(), String> {
-    keychain_entry(key)?
+fn kc_set(service: &str, account: &str, value: &str) -> Result<(), String> {
+    keyring::Entry::new(service, account)
+        .map_err(|e| format!("Keychain entry error: {}", e))?
         .set_password(value)
         .map_err(|e| format!("Credential set error: {}", e))
 }
 
-#[cfg(target_os = "windows")]
-fn keychain_get(key: &str) -> Option<String> {
-    keychain_entry(key).ok()?.get_password().ok()
-}
-
-#[cfg(target_os = "windows")]
-fn keychain_delete(key: &str) {
-    if let Ok(entry) = keychain_entry(key) {
-        let _ = entry.delete_credential();
-    }
-}
-
 #[cfg(not(any(target_os = "macos", target_os = "windows")))]
-fn keychain_set(_key: &str, _value: &str) -> Result<(), String> {
-    Err("no OS keychain on this platform".into())
-}
-
-#[cfg(not(any(target_os = "macos", target_os = "windows")))]
-fn keychain_get(_key: &str) -> Option<String> {
+fn kc_get(_service: &str, _account: &str) -> Option<String> {
     None
 }
 
+// ---- bundle item: biometric-gated on macOS --------------------------------
+//
+// The bundle is stored as a single keychain item protected by Touch ID
+// (BIOMETRY_CURRENT_SET) + AccessibleWhenUnlockedThisDeviceOnly. Reading it
+// presents the Touch ID sheet; with the in-memory cache that is one prompt per
+// process. If biometric enrollment changes, BIOMETRY_CURRENT_SET invalidates
+// the item and the user re-enters their secrets. On Macs without Touch ID the
+// write fails and we fall back to the machine-bound encrypted file.
+
+const ERR_SEC_ITEM_NOT_FOUND: i32 = -25300;
+
+#[cfg(target_os = "macos")]
+fn bundle_kc_read() -> BundleRead {
+    use security_framework::passwords::{generic_password, PasswordOptions};
+    let mut options = PasswordOptions::new_generic_password(SERVICE, BUNDLE_ACCOUNT);
+    // Biometric items live in the data-protection keychain; the read must target
+    // it too or the item won't be found. This is what triggers the Touch ID sheet.
+    options.use_protected_keychain();
+    match generic_password(options) {
+        Ok(bytes) => match String::from_utf8(bytes) {
+            Ok(json) => BundleRead::Found(json),
+            Err(_) => BundleRead::Failed,
+        },
+        Err(e) if e.code() == ERR_SEC_ITEM_NOT_FOUND => BundleRead::NotFound,
+        Err(e) => {
+            log::warn!(
+                "[keychain] bundle read failed (code {}): {}",
+                e.code(),
+                e.message().unwrap_or_default()
+            );
+            BundleRead::Failed
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn bundle_kc_write(json: &str) -> Result<(), String> {
+    use security_framework::access_control::{ProtectionMode, SecAccessControl};
+    use security_framework::passwords::{
+        delete_generic_password_options, set_generic_password_options, AccessControlOptions,
+        PasswordOptions,
+    };
+    let access = SecAccessControl::create_with_protection(
+        Some(ProtectionMode::AccessibleWhenUnlockedThisDeviceOnly),
+        AccessControlOptions::BIOMETRY_CURRENT_SET.bits(),
+    )
+    .map_err(|e| format!("access control create: {e}"))?;
+
+    // Delete the existing item first so this is always an add — updating an
+    // existing biometric item would itself trigger a Touch ID prompt on write.
+    // Target the data-protection keychain (where the biometric item lives).
+    let mut delete = PasswordOptions::new_generic_password(SERVICE, BUNDLE_ACCOUNT);
+    delete.use_protected_keychain();
+    let _ = delete_generic_password_options(delete);
+
+    let mut options = PasswordOptions::new_generic_password(SERVICE, BUNDLE_ACCOUNT);
+    options.use_protected_keychain();
+    options.set_access_control(access);
+    set_generic_password_options(json.as_bytes(), options)
+        .map_err(|e| format!("biometric keychain set: {e}"))
+}
+
+#[cfg(target_os = "windows")]
+fn bundle_kc_read() -> BundleRead {
+    match kc_get(SERVICE, BUNDLE_ACCOUNT) {
+        Some(json) => BundleRead::Found(json),
+        None => BundleRead::NotFound,
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn bundle_kc_write(json: &str) -> Result<(), String> {
+    kc_set(SERVICE, BUNDLE_ACCOUNT, json)
+}
+
 #[cfg(not(any(target_os = "macos", target_os = "windows")))]
-fn keychain_delete(_key: &str) {}
+fn bundle_kc_read() -> BundleRead {
+    BundleRead::NotFound
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
+fn bundle_kc_write(_json: &str) -> Result<(), String> {
+    Err("no OS keychain on this platform".into())
+}
 
 // ---- machine-bound encrypted file (fallback) ------------------------------
 
@@ -121,7 +364,17 @@ fn secrets_dir() -> std::path::PathBuf {
     dir
 }
 
-fn encrypted_secret_path(key: &str) -> std::path::PathBuf {
+fn bundle_enc_path() -> std::path::PathBuf {
+    // Namespaced by build for the same reason as BUNDLE_ACCOUNT — dev and
+    // release share the data dir, so the file fallback must not clobber either.
+    #[cfg(debug_assertions)]
+    let name = "bundle.v1.dev.enc";
+    #[cfg(not(debug_assertions))]
+    let name = "bundle.v1.enc";
+    secrets_dir().join(name)
+}
+
+fn per_key_enc_path(key: &str) -> std::path::PathBuf {
     secrets_dir().join(format!("{key}.enc"))
 }
 
@@ -173,12 +426,12 @@ fn machine_entropy() -> Vec<u8> {
         .into_bytes()
 }
 
-fn encrypted_secret_set(key: &str, value: &str) -> Result<(), String> {
+fn enc_write(path: &std::path::Path, value: &str) -> Result<(), String> {
     use aes_gcm::{aead::Aead, Aes256Gcm, KeyInit, Nonce};
     use rand::RngCore;
 
-    let cipher = Aes256Gcm::new_from_slice(&machine_key())
-        .map_err(|e| format!("cipher init failed: {e}"))?;
+    let cipher =
+        Aes256Gcm::new_from_slice(&machine_key()).map_err(|e| format!("cipher init failed: {e}"))?;
     let mut nonce_bytes = [0u8; 12];
     rand::thread_rng().fill_bytes(&mut nonce_bytes);
     let ciphertext = cipher
@@ -190,20 +443,19 @@ fn encrypted_secret_set(key: &str, value: &str) -> Result<(), String> {
     blob.extend_from_slice(&nonce_bytes);
     blob.extend_from_slice(&ciphertext);
 
-    let path = encrypted_secret_path(key);
-    std::fs::write(&path, &blob).map_err(|e| format!("Failed to write secret file: {}", e))?;
+    std::fs::write(path, &blob).map_err(|e| format!("Failed to write secret file: {}", e))?;
     #[cfg(unix)]
     {
-        std::fs::set_permissions(&path, std::os::unix::fs::PermissionsExt::from_mode(0o600))
+        std::fs::set_permissions(path, std::os::unix::fs::PermissionsExt::from_mode(0o600))
             .map_err(|e| format!("Failed to protect secret file: {}", e))?;
     }
     Ok(())
 }
 
-fn encrypted_secret_get(key: &str) -> Option<String> {
+fn enc_read(path: &std::path::Path) -> Option<String> {
     use aes_gcm::{aead::Aead, Aes256Gcm, KeyInit, Nonce};
 
-    let blob = std::fs::read(encrypted_secret_path(key)).ok()?;
+    let blob = std::fs::read(path).ok()?;
     if blob.len() < 12 {
         return None;
     }
@@ -213,105 +465,4 @@ fn encrypted_secret_get(key: &str) -> Option<String> {
         .decrypt(Nonce::from_slice(nonce_bytes), ciphertext)
         .ok()?;
     String::from_utf8(plaintext).ok()
-}
-
-// ---------------------------------------------------------------------------
-// Cookie credentials: same strategy as app secrets above — OS keychain in
-// release (separate COOKIE_SERVICE), machine-bound encrypted file as fallback.
-// Dev builds stay off the keychain so development never triggers a keychain
-// authorization prompt; the encrypted file is the shared store both builds
-// read. Cookie blobs are namespaced in the file store to avoid colliding with
-// secret keys.
-// ---------------------------------------------------------------------------
-
-#[cfg(any(target_os = "macos", target_os = "windows"))]
-const COOKIE_SERVICE: &str = "com.kgu.selah.cookies";
-
-#[cfg(target_os = "macos")]
-fn cookie_keychain_set(key: &str, value: &str) -> Result<(), String> {
-    security_framework::passwords::set_generic_password(COOKIE_SERVICE, key, value.as_bytes())
-        .map_err(|e| format!("Cookie Keychain set error: {}", e))
-}
-
-#[cfg(target_os = "macos")]
-fn cookie_keychain_get(key: &str) -> Option<String> {
-    security_framework::passwords::get_generic_password(COOKIE_SERVICE, key)
-        .ok()
-        .and_then(|bytes| String::from_utf8(bytes).ok())
-}
-
-#[cfg(target_os = "macos")]
-fn cookie_keychain_delete(key: &str) {
-    let _ = security_framework::passwords::delete_generic_password(COOKIE_SERVICE, key);
-}
-
-#[cfg(target_os = "windows")]
-fn cookie_entry(key: &str) -> Result<keyring::Entry, String> {
-    keyring::Entry::new(COOKIE_SERVICE, key).map_err(|e| format!("Cookie credential error: {}", e))
-}
-
-#[cfg(target_os = "windows")]
-fn cookie_keychain_set(key: &str, value: &str) -> Result<(), String> {
-    cookie_entry(key)?
-        .set_password(value)
-        .map_err(|e| format!("Cookie credential set error: {}", e))
-}
-
-#[cfg(target_os = "windows")]
-fn cookie_keychain_get(key: &str) -> Option<String> {
-    cookie_entry(key).ok()?.get_password().ok()
-}
-
-#[cfg(target_os = "windows")]
-fn cookie_keychain_delete(key: &str) {
-    if let Ok(entry) = cookie_entry(key) {
-        let _ = entry.delete_credential();
-    }
-}
-
-#[cfg(not(any(target_os = "macos", target_os = "windows")))]
-fn cookie_keychain_set(_key: &str, _value: &str) -> Result<(), String> {
-    Err("no OS keychain on this platform".into())
-}
-
-#[cfg(not(any(target_os = "macos", target_os = "windows")))]
-fn cookie_keychain_get(_key: &str) -> Option<String> {
-    None
-}
-
-#[cfg(not(any(target_os = "macos", target_os = "windows")))]
-fn cookie_keychain_delete(_key: &str) {}
-
-fn cookie_secret_ns(key: &str) -> String {
-    format!("cookie.{key}")
-}
-
-pub fn set_cookie_secret(key: &str, value: &str) -> Result<(), String> {
-    if cfg!(debug_assertions) {
-        return encrypted_secret_set(&cookie_secret_ns(key), value);
-    }
-    let encrypted = encrypted_secret_set(&cookie_secret_ns(key), value);
-    match cookie_keychain_set(key, value) {
-        Ok(()) => Ok(()),
-        Err(err) => {
-            log::warn!("[keychain] cookie '{key}' keychain write failed, encrypted file fallback in use: {err}");
-            encrypted
-        }
-    }
-}
-
-pub fn get_cookie_secret(key: &str) -> Option<String> {
-    if !cfg!(debug_assertions) {
-        if let Some(value) = cookie_keychain_get(key) {
-            return Some(value);
-        }
-    }
-    encrypted_secret_get(&cookie_secret_ns(key))
-}
-
-pub fn delete_cookie_secret(key: &str) {
-    if !cfg!(debug_assertions) {
-        cookie_keychain_delete(key);
-    }
-    let _ = std::fs::remove_file(encrypted_secret_path(&cookie_secret_ns(key)));
 }

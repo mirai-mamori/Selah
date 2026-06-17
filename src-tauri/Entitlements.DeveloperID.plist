@@ -8,9 +8,12 @@
 
      Non-sandboxed is intentional: the app shells out to /usr/bin/caffeinate
      (sleep prevention during live transcription) and reads gethostuuid(),
-     which the App Sandbox would block. Keychain access here is ACL-bound to
-     this Developer ID signing identity (stable across releases → no repeated
-     prompts once an item is created by a signed build). -->
+     which the App Sandbox would block.
+
+     keychain-access-groups is required to use the data-protection keychain
+     (kSecUseDataProtectionKeychain), which is what backs the Touch ID-gated
+     secret bundle. Literal team prefix (not $(AppIdentifierPrefix)) because
+     Developer ID signing has no provisioning profile to substitute it. -->
 <plist version="1.0">
 <dict>
     <!-- Hardened Runtime: required for Tauri WebView JIT -->
@@ -40,5 +43,10 @@
     <!-- Debug-only osascript notification fallback (ai.rs) -->
     <key>com.apple.security.automation.apple-events</key>
     <true/>
+    <!-- Data-protection keychain access group (Touch ID secret bundle) -->
+    <key>keychain-access-groups</key>
+    <array>
+        <string>4H88DC6RMN.com.kgu.selah</string>
+    </array>
 </dict>
 </plist>
