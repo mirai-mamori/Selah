@@ -353,6 +353,21 @@ pub struct CourseArtifactRecord {
     pub error: String,
 }
 
+/// One entry in the run log shown on the control capsule's detail page. Each
+/// entry describes a single operation (file + what happened). `level` is one of
+/// "ok" / "warn" / "error" and drives the dot colour; `message` is ready-to-show
+/// text such as「『資料X』を分析」.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct RunLogEntry {
+    #[serde(default)]
+    pub at: i64,
+    #[serde(default)]
+    pub level: String,
+    #[serde(default)]
+    pub message: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct PrintResult {
@@ -417,6 +432,9 @@ pub struct CourseAutomationStatus {
     /// findings and fed to the summary model so it won't re-list them.
     #[serde(default)]
     pub acknowledged_findings: Vec<String>,
+    /// Recent run history shown on the control capsule's detail page (bounded).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub run_log: Vec<RunLogEntry>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -945,6 +963,7 @@ async fn run_course(
 ) -> Result<(), String> {
     // Exclusivity is provided by the single queue worker; here we only keep a
     // watchdog so a hung run can't wedge the queue.
+    let mut timed_out = false;
     let outcome = match tokio::time::timeout(
         Duration::from_secs(RUN_TIMEOUT_SECS),
         run_course_inner(app, luna_id, course_name_hint, trigger, force_all),
@@ -952,7 +971,10 @@ async fn run_course(
     .await
     {
         Ok(result) => result,
-        Err(_) => Err("実行がタイムアウトしました・次回再試行します".to_string()),
+        Err(_) => {
+            timed_out = true;
+            Err("実行がタイムアウトしました・次回再試行します".to_string())
+        }
     };
     // Any failure (timeout OR an early error return from the inner run) must
     // clear the running flag — otherwise the persisted status stays running and
@@ -965,6 +987,11 @@ async fn run_course(
         status.last_ok = Some(false);
         status.stage = "error".into();
         status.last_error = error.clone();
+        // On timeout the inner run was cancelled before it could log, so record
+        // it here. Inner errors are already logged by run_course_inner.
+        if timed_out {
+            push_run_log(&mut status, "error", error.clone());
+        }
         let _ = save_status_and_emit(app, &db, &status);
     }
     outcome
@@ -1330,10 +1357,20 @@ async fn run_course_inner(
             if document.path.is_empty() && !document.content.is_empty() {
                 analysis.content = document.content.clone();
             }
+            let doc_label = if analysis.title.trim().is_empty() {
+                analysis.filename.clone()
+            } else {
+                analysis.title.clone()
+            };
             if analysis.status == "done"
                 && previous_document.is_none_or(|item| item.status != "done")
             {
                 newly_analyzed_ids.push(analysis.id.clone());
+                push_run_log(&mut status, "ok", format!("『{}』を分析", doc_label));
+            } else if analysis.status == "error"
+                && previous_document.is_none_or(|item| item.status != "error")
+            {
+                push_run_log(&mut status, "error", format!("『{}』の分析に失敗", doc_label));
             }
             upsert_document_analysis(&mut document_analyses, analysis);
             status.processed_documents += 1;
@@ -1419,6 +1456,11 @@ async fn run_course_inner(
                 &previous.last_summary_document_ids,
                 new_items.iter().map(|item| item.id.clone()),
             );
+            push_run_log(
+                &mut status,
+                "ok",
+                format!("{} 件の摘要から記憶を更新", new_items.len()),
+            );
             result
         } else {
             status.pending_summary_ids = pending_summary_ids;
@@ -1480,16 +1522,37 @@ async fn run_course_inner(
         {
             status.stage = "printing".into();
             save_status_and_emit(app, &db, &status)?;
-            merge_print_results(
-                &previous.print_results,
-                process_print_candidates(
-                    &downloaded,
-                    &status.analysis.print_candidates,
-                    &previous,
-                    &config.approved_print_categories,
-                )
-                .await,
+            let fresh = process_print_candidates(
+                &downloaded,
+                &status.analysis.print_candidates,
+                &previous,
+                &config.approved_print_categories,
             )
+            .await;
+            // Log only print outcomes that changed this run (file + operation).
+            for result in &fresh {
+                let unchanged = previous
+                    .print_results
+                    .iter()
+                    .any(|item| item.filename == result.filename && item.status == result.status);
+                if unchanged {
+                    continue;
+                }
+                let entry = match result.status.as_str() {
+                    "printed" => Some(("ok", format!("『{}』を印刷", result.filename))),
+                    "needs_confirmation" => {
+                        Some(("warn", format!("『{}』の印刷を保留(確認待ち)", result.filename)))
+                    }
+                    "error" | "not_found" => {
+                        Some(("error", format!("『{}』の印刷に失敗", result.filename)))
+                    }
+                    _ => None,
+                };
+                if let Some((level, message)) = entry {
+                    push_run_log(&mut status, level, message);
+                }
+            }
+            merge_print_results(&previous.print_results, fresh)
         } else if should_summarize {
             previous.print_results.clone()
         } else {
@@ -1522,9 +1585,25 @@ async fn run_course_inner(
     };
     if let Err(error) = &outcome {
         status.last_error = error.clone();
+        // Per-operation entries are logged inline during the run; here we add a
+        // single run-level entry only when the whole run failed.
+        push_run_log(&mut status, "error", error.clone());
     }
     save_status_and_emit(app, &db, &status)?;
     outcome
+}
+
+/// Appends a run-log entry (one per operation) and keeps the log bounded.
+fn push_run_log(status: &mut CourseAutomationStatus, level: &str, message: String) {
+    status.run_log.push(RunLogEntry {
+        at: epoch_secs(),
+        level: level.to_string(),
+        message,
+    });
+    let len = status.run_log.len();
+    if len > 40 {
+        status.run_log.drain(0..len - 40);
+    }
 }
 
 fn collect_download_value(
@@ -2640,11 +2719,16 @@ fn load_config(db: &Database, luna_id: &str, course_name: &str) -> CourseAutomat
 }
 
 fn load_status(db: &Database, luna_id: &str, course_name: &str) -> CourseAutomationStatus {
-    load_json(db, &status_key(luna_id)).unwrap_or_else(|| CourseAutomationStatus {
-        luna_id: luna_id.to_string(),
-        course_name: course_name.to_string(),
-        ..Default::default()
-    })
+    let mut status: CourseAutomationStatus =
+        load_json(db, &status_key(luna_id)).unwrap_or_else(|| CourseAutomationStatus {
+            luna_id: luna_id.to_string(),
+            course_name: course_name.to_string(),
+            ..Default::default()
+        });
+    // Drop legacy run-log entries from before the per-operation format (they have
+    // no `level`), so the log only shows the new file/operation lines.
+    status.run_log.retain(|entry| !entry.level.trim().is_empty());
+    status
 }
 
 fn load_json<T: for<'de> Deserialize<'de>>(db: &Database, key: &str) -> Option<T> {

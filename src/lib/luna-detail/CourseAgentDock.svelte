@@ -49,6 +49,7 @@
     };
     printResults: Array<{ filename: string; status: string; detail: string; category?: string }>;
     acknowledgedFindings?: string[];
+    runLog?: Array<{ at: number; level: string; message: string }>;
   }
 
   interface CourseAutomationView {
@@ -67,7 +68,7 @@
   let error = $state("");
   // Which bento cell is drilled into. Tapping a cell opens its full content as
   // a focused second page; null is the home (bento) view.
-  type DetailKey = "findings" | "seat" | "print" | "standing" | "documents";
+  type DetailKey = "findings" | "seat" | "print" | "standing" | "documents" | "log";
   let detail = $state<DetailKey | null>(null);
   const detailTitle: Record<DetailKey, string> = {
     findings: "確認事項",
@@ -75,7 +76,18 @@
     print: "印刷",
     standing: "記憶",
     documents: "分析した資料",
+    log: "ログ",
   };
+
+  // Relative "time ago" for log entries (epoch seconds).
+  function timeAgo(secs: number): string {
+    if (!secs) return "";
+    const delta = Date.now() / 1000 - secs;
+    if (delta < 60) return "たった今";
+    if (delta < 3600) return `${Math.floor(delta / 60)}分前`;
+    if (delta < 86400) return `${Math.floor(delta / 3600)}時間前`;
+    return `${Math.floor(delta / 86400)}日前`;
+  }
 
   function kindLabel(kind: string): string {
     switch (kind) {
@@ -93,20 +105,22 @@
   const enabled = $derived(view?.config.enabled ?? false);
   const running = $derived(view?.status.running ?? false);
 
-  const stageLabel = $derived.by(() => {
-    const stage = view?.status.stage || "";
-    return {
-      checking: "更新を確認中",
-      downloading: "資料を取得中",
-      analyzing: "資料を一件ずつ分析中",
-      summarizing: "個別摘要を最終確認中",
-      pending_summary: "新しい摘要を蓄積中",
-      printing: "印刷を検証中",
-      unchanged: "変更なし",
-      done: "確認済み",
-      error: "確認エラー",
-    }[stage] || (enabled ? "次の確認を待機中" : "無効");
-  });
+  function stageText(stage: string): string {
+    return (
+      {
+        checking: "更新を確認中",
+        downloading: "資料を取得中",
+        analyzing: "資料を一件ずつ分析中",
+        summarizing: "個別摘要を最終確認中",
+        pending_summary: "新しい摘要を蓄積中",
+        printing: "印刷を検証中",
+        unchanged: "変更なし",
+        done: "確認済み",
+        error: "確認エラー",
+      }[stage] || (enabled ? "次の確認を待機中" : "無効")
+    );
+  }
+  const stageLabel = $derived(stageText(view?.status.stage || ""));
 
   // Documents the agent flagged as needing prompt attention. Drives the
   // headline "要確認" emphasis and the header status tone.
@@ -128,13 +142,15 @@
 
   const failureNote = $derived(error || view?.status.lastError || "");
 
-  // Control capsule: dot state + a compact status line. It also carries the
-  // error message when a run fails, so there is no separate error pill.
+  // Control capsule: dot state + a compact status line. The error MESSAGE is no
+  // longer shown on the face — it lives on the control capsule's ログ detail
+  // page. The dot still reflects an error state so it stays glanceable.
   const barState = $derived(running ? "busy" : failureNote ? "error" : "idle");
   const controlText = $derived.by(() => {
     if (running) return hasProgress ? `${progressPct}% ・ ${stageLabel}` : stageLabel;
-    return failureNote || stageLabel;
+    return stageLabel;
   });
+  const runLog = $derived((view?.status.runLog ?? []).slice().reverse());
 
   // ── Bento content ────────────────────────────────────────────────────────
   const summary = $derived(view?.status.analysis?.summary?.trim() ?? "");
@@ -217,6 +233,7 @@
       case "standing": return standingContext.length;
       case "print": return printResults.length;
       case "documents": return analyzedDocs.length;
+      case "log": return runLog.length;
       default: return null;
     }
   });
@@ -582,6 +599,24 @@
                 </li>
               {/each}
             </ul>
+          {:else if detail === "log"}
+            <!-- Control capsule's log: recent run history. The current error (if
+                 any) is briefly surfaced at the top; the rest is run-by-run. -->
+            {#if failureNote}
+              <p class="sa-detail-err">{failureNote}</p>
+            {/if}
+            <ul class="sa-rows">
+              {#each runLog as entry}
+                <li class="sa-row sa-row-log">
+                  <span class="sa-log-dot" data-level={entry.level}></span>
+                  <p class="sa-row-text">{entry.message}</p>
+                  <span class="sa-row-until">{timeAgo(entry.at)}</span>
+                </li>
+              {/each}
+              {#if runLog.length === 0}
+                <li class="sa-row sa-row-dim"><p class="sa-row-text">まだ実行ログはありません。</p></li>
+              {/if}
+            </ul>
           {/if}
         </div>
       </div>
@@ -590,9 +625,11 @@
       <!-- Capsule row above the cards: control (carries status + errors) and
            compact entries. Each pill hugs its content; no borders, one style. -->
       <div class="sa-pills">
-        <div class="sa-pill sa-pill-ctl" data-state={barState} title={controlText}>
-          <span class="sa-pill-dot"></span>
-          <span class="sa-pill-text">{controlText}</span>
+        <div class="sa-pill sa-pill-ctl" data-state={barState}>
+          <button class="sa-pill-ctl-open" type="button" onclick={() => (detail = "log")} title="ログを見る">
+            <span class="sa-pill-dot"></span>
+            <span class="sa-pill-text">{controlText}</span>
+          </button>
           <button class="sa-pill-btn" type="button" disabled={busy || running || reanalyzingIds.length > 0} onclick={runNow} aria-label="今すぐ確認" title="今すぐ確認">
             <Icon name="arrow.clockwise" size={13} />
           </button>
@@ -843,6 +880,19 @@
   @media (max-width: 560px) {
     .sa-rows { grid-template-columns: 1fr; }
   }
+  /* Log rows (two columns, like the other detail lists): status dot + the
+     file/operation line + a relative time hugging the end. */
+  .sa-row.sa-row-log { align-items: center; }
+  .sa-row-log .sa-row-text { flex: 1; min-width: 0; }
+  .sa-log-dot {
+    flex: none;
+    width: 7px;
+    height: 7px;
+    border-radius: 50%;
+    background: #1a7f37;
+  }
+  .sa-log-dot[data-level="warn"] { background: var(--detail-warn); }
+  .sa-log-dot[data-level="error"] { background: var(--detail-danger); }
   .sa-row {
     display: flex;
     align-items: flex-start;
@@ -1177,6 +1227,10 @@
   .sa-pill-text {
     min-width: 0;
     max-width: 100%;
+    /* Match the other pill labels' sizing — the text now lives inside a button,
+       so it no longer inherits it from `.sa-pill > span`. */
+    font-size: 11.5px;
+    font-weight: 700;
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
@@ -1185,6 +1239,21 @@
   /* Control: a state dot, status line, and the refresh action hugging the end. */
   .sa-pill-ctl { padding-right: 3px; }
   .sa-pill-ctl .sa-pill-text { color: var(--detail-muted); }
+  /* The dot + status line are one button opening the ログ detail page. */
+  .sa-pill-ctl-open {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    min-width: 0;
+    max-width: 100%;
+    margin: 0;
+    padding: 0;
+    border: 0;
+    background: transparent;
+    color: inherit;
+    font: inherit;
+    cursor: pointer;
+  }
   .sa-pill-dot {
     flex: none;
     width: 7px;

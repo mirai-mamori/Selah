@@ -3,6 +3,7 @@
   import { tick } from "svelte";
   import Icon, { type IconName } from "../Icon.svelte";
   import CourseAgentDock from "./CourseAgentDock.svelte";
+  import CourseMessages from "./CourseMessages.svelte";
   import CourseSupplemental from "./CourseSupplemental.svelte";
   import { splitLunaCourseHeading } from "./courseHeading";
   import { lunaDraftKey, readDraft, writeDraft } from "./drafts";
@@ -385,6 +386,10 @@
       {/each}
     </div>
   </section>
+{/if}
+
+{#if mode !== "attendance"}
+  <CourseMessages courseName={course.course_name} {idnumberParam} />
 {/if}
 
 {#if course.attendances?.length}
