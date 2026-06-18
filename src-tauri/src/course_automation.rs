@@ -42,6 +42,7 @@ enum JobKind {
     Cycle { force_all: bool },
     ReanalyzeDoc { document_id: String },
     RebuildMemory,
+    ConfirmPrint { category: String },
 }
 
 struct Job {
@@ -100,7 +101,14 @@ pub struct CourseAutomationConfig {
     pub monitor_announcements: bool,
     pub monitor_assignments: bool,
     pub analyze_all: bool,
+    /// Master switch for printing. When on, printable candidates are gated by
+    /// per-category approval: the first file of a type waits for the user to
+    /// confirm, after which that category prints automatically.
     pub auto_print: bool,
+    /// Print categories the user has approved. A candidate whose category is
+    /// listed prints without asking; others wait as `needs_confirmation`.
+    #[serde(default)]
+    pub approved_print_categories: Vec<String>,
     pub notify_seat_changes: bool,
 }
 
@@ -116,6 +124,7 @@ impl CourseAutomationConfig {
             monitor_assignments: true,
             analyze_all: true,
             auto_print: true,
+            approved_print_categories: Vec::new(),
             notify_seat_changes: true,
         }
     }
@@ -141,6 +150,11 @@ pub struct PrintCandidate {
     pub reason: String,
     #[serde(default)]
     pub confidence: f32,
+    /// A short type name grouping similar printables (例: ワークシート / 小テスト /
+    /// 出席カード). Per-category user approval decides whether this prints
+    /// automatically.
+    #[serde(default)]
+    pub category: String,
 }
 
 /// A continuing memory item that is explicitly tied to this course and may
@@ -206,6 +220,59 @@ impl<'de> Deserialize<'de> for StandingMemory {
     }
 }
 
+/// A 確認事項 item the student should check. Carries an optional expiry (auto-
+/// dropped once past, like memory) and an `action` flag marking items the student
+/// must act on — those are pushed into the main TODO page.
+#[derive(Debug, Clone, Serialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct Finding {
+    #[serde(default)]
+    pub text: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub expires_at: String,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub action: bool,
+}
+
+// Accept the legacy bare-string form so already-persisted findings load without
+// migration.
+impl<'de> Deserialize<'de> for Finding {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Repr {
+            Text(String),
+            Object {
+                #[serde(default)]
+                text: String,
+                #[serde(default, rename = "expiresAt")]
+                expires_at: String,
+                #[serde(default)]
+                action: bool,
+            },
+        }
+        Ok(match Repr::deserialize(deserializer)? {
+            Repr::Text(text) => Finding {
+                text,
+                expires_at: String::new(),
+                action: false,
+            },
+            Repr::Object {
+                text,
+                expires_at,
+                action,
+            } => Finding {
+                text,
+                expires_at,
+                action,
+            },
+        })
+    }
+}
+
 /// A consolidated cluster of past (expired) memories under one short heading,
 /// e.g. label「完了した課題」with items for each finished assignment.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -223,7 +290,7 @@ pub struct AgentCourseAnalysis {
     #[serde(default)]
     pub summary: String,
     #[serde(default)]
-    pub findings: Vec<String>,
+    pub findings: Vec<Finding>,
     #[serde(default)]
     pub standing_context: Vec<StandingMemory>,
     /// Past memory, consolidated. When a standing memory expires it is not kept
@@ -294,6 +361,10 @@ pub struct PrintResult {
     pub status: String,
     #[serde(default)]
     pub detail: String,
+    /// The candidate's print category, so the confirm UI can approve the whole
+    /// type at once. Empty for legacy records.
+    #[serde(default)]
+    pub category: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -342,6 +413,10 @@ pub struct CourseAutomationStatus {
     pub analysis: AgentCourseAnalysis,
     #[serde(default)]
     pub print_results: Vec<PrintResult>,
+    /// 確認事項 the user has marked known/done. Filtered out of the displayed
+    /// findings and fed to the summary model so it won't re-list them.
+    #[serde(default)]
+    pub acknowledged_findings: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -464,6 +539,12 @@ async fn process_job(app: &AppHandle, job: &Job) -> Result<CourseAutomationView,
                 Err(_) => Err("記憶の再構築がタイムアウトしました".into()),
             }
         }
+        JobKind::ConfirmPrint { category } => {
+            // Printing a pending file is independent of cycles; share the read
+            // side so it never overlaps a full cycle's status rewrite.
+            let _shared = state.cycle_lock.read().await;
+            confirm_print_category(app, &job.luna_id, &job.course_name, category).await
+        }
     }
 }
 
@@ -550,6 +631,54 @@ pub async fn course_automation_rebuild_memory(
         return Err("このコースの SenseA を先に有効にしてください".into());
     }
     enqueue_job(&app, luna_id, course_name, "manual", JobKind::RebuildMemory).await
+}
+
+#[tauri::command]
+pub async fn course_automation_acknowledge_finding(
+    app: AppHandle,
+    luna_id: String,
+    course_name: String,
+    text: String,
+    done: bool,
+) -> Result<CourseAutomationView, String> {
+    let db = app.state::<Database>();
+    let text = text.trim().to_string();
+    if text.is_empty() {
+        return Err("確認事項が指定されていません".into());
+    }
+    let state = app.state::<CourseAutomationState>();
+    // Share the read side so this never overlaps a full cycle's status rewrite.
+    let _shared = state.cycle_lock.read().await;
+    let _write = state.status_write.lock().await;
+    let mut status = load_status(&db, &luna_id, &course_name);
+    let exists = status.acknowledged_findings.iter().any(|item| item == &text);
+    if done && !exists {
+        status.acknowledged_findings.push(text);
+    } else if !done {
+        status.acknowledged_findings.retain(|item| item != &text);
+    }
+    save_status_and_emit(&app, &db, &status)?;
+    Ok(load_view(&db, &luna_id, &course_name))
+}
+
+#[tauri::command]
+pub async fn course_automation_confirm_print(
+    app: AppHandle,
+    luna_id: String,
+    course_name: String,
+    category: String,
+) -> Result<CourseAutomationView, String> {
+    if !load_config(&app.state::<Database>(), &luna_id, &course_name).enabled {
+        return Err("このコースの SenseA を先に有効にしてください".into());
+    }
+    enqueue_job(
+        &app,
+        luna_id,
+        course_name,
+        "manual",
+        JobKind::ConfirmPrint { category },
+    )
+    .await
 }
 
 #[tauri::command]
@@ -699,10 +828,61 @@ async fn rebuild_memory(
     // clobbering anything a concurrent change touched.
     let mut status = load_status(&db, luna_id, course_name);
     status.analysis = analysis;
+    prune_acknowledged_findings(&mut status);
     status.pending_summary_ids.clear();
     status.last_summary_document_ids = analysed_ids;
     save_status_and_emit(app, &db, &status)?;
 
+    Ok(load_view(&db, luna_id, course_name))
+}
+
+/// Approves a print category and prints the files currently waiting under it.
+/// Approval is remembered in the config, so subsequent same-category files
+/// print automatically without asking again.
+async fn confirm_print_category(
+    app: &AppHandle,
+    luna_id: &str,
+    course_name: &str,
+    category: &str,
+) -> Result<CourseAutomationView, String> {
+    let db = app.state::<Database>();
+    let category = category.trim().to_string();
+    if category.is_empty() {
+        return Err("印刷タイプが指定されていません".into());
+    }
+
+    // Remember the approval for future runs.
+    let mut config = load_config(&db, luna_id, course_name);
+    if !config
+        .approved_print_categories
+        .iter()
+        .any(|item| item.trim() == category)
+    {
+        config.approved_print_categories.push(category.clone());
+        save_json(&db, &config_key(luna_id), &config)?;
+    }
+
+    // Print every file currently waiting under this category. Done before taking
+    // the status lock so the (slow) print isn't holding it.
+    let pending: Vec<PrintResult> = load_status(&db, luna_id, course_name)
+        .print_results
+        .into_iter()
+        .filter(|item| item.status == "needs_confirmation" && item.category.trim() == category)
+        .collect();
+    if pending.is_empty() {
+        return Ok(load_view(&db, luna_id, course_name));
+    }
+    let mut printed = Vec::new();
+    for item in pending {
+        let path = PathBuf::from(&item.path);
+        printed.push(print_one(&item.filename, &path, item.path.clone(), item.category).await);
+    }
+
+    let state = app.state::<CourseAutomationState>();
+    let _write = state.status_write.lock().await;
+    let mut status = load_status(&db, luna_id, course_name);
+    status.print_results = merge_print_results(&status.print_results, printed);
+    save_status_and_emit(app, &db, &status)?;
     Ok(load_view(&db, luna_id, course_name))
 }
 
@@ -1273,6 +1453,7 @@ async fn run_course_inner(
         }
 
         status.analysis = analysis;
+        prune_acknowledged_findings(&mut status);
         if !status.pending_notification_ids.is_empty() && !status.analysis.summary.trim().is_empty()
         {
             let pending_ids = status.pending_notification_ids.clone();
@@ -1301,8 +1482,13 @@ async fn run_course_inner(
             save_status_and_emit(app, &db, &status)?;
             merge_print_results(
                 &previous.print_results,
-                auto_print_candidates(&downloaded, &status.analysis.print_candidates, &previous)
-                    .await,
+                process_print_candidates(
+                    &downloaded,
+                    &status.analysis.print_candidates,
+                    &previous,
+                    &config.approved_print_categories,
+                )
+                .await,
             )
         } else if should_summarize {
             previous.print_results.clone()
@@ -1323,10 +1509,10 @@ async fn run_course_inner(
     status.running = false;
     status.last_run = Some(epoch_secs());
     status.last_ok = Some(outcome.is_ok() && retryable_failure_count == 0);
-    status.stage = if outcome.is_ok() && retryable_failure_count > 0 {
-        status.last_error = format!("{} 件失敗・次回再試行します", retryable_failure_count);
-        "error".into()
-    } else if outcome.is_ok() {
+    // Print failures are surfaced on the 印刷 capsule (via print_results), not the
+    // control capsule, so a successful run with only print failures is not an
+    // error here — it does not touch last_error or the error stage.
+    status.stage = if outcome.is_ok() {
         match status.stage.as_str() {
             "unchanged" | "pending_summary" => status.stage.clone(),
             _ => "done".into(),
@@ -2048,7 +2234,7 @@ fn normalize_document_agent_output(mut output: DocumentAgentOutput) -> DocumentA
 
 fn normalize_course_analysis(mut analysis: AgentCourseAnalysis, today: &str) -> AgentCourseAnalysis {
     analysis.summary = truncate_chars(analysis.summary.trim(), 240);
-    analysis.findings = normalize_short_list(analysis.findings, 6, 280);
+    analysis.findings = normalize_findings(std::mem::take(&mut analysis.findings), today);
     let (active, stale) = split_active_memory(std::mem::take(&mut analysis.standing_context), today);
     analysis.standing_context = active;
     analysis.archived_context =
@@ -2152,6 +2338,46 @@ fn consolidate_archive(groups: Vec<ArchivedGroup>, fallback_items: Vec<String>) 
     result
 }
 
+/// Trims/dedupes 確認事項 and drops any past their `expires_at` (auto-expire,
+/// like memory). No item cap — the list is bounded by relevance, not a number.
+fn normalize_findings(findings: Vec<Finding>, today: &str) -> Vec<Finding> {
+    let today_date = chrono::NaiveDate::parse_from_str(today, "%Y-%m-%d").ok();
+    let mut out = Vec::new();
+    let mut seen = HashSet::new();
+    for mut finding in findings {
+        finding.text = truncate_chars(finding.text.trim(), 280);
+        finding.expires_at = finding.expires_at.trim().to_string();
+        if finding.text.is_empty() || !seen.insert(finding.text.clone()) {
+            continue;
+        }
+        if let (Some(today), Some(expiry)) = (
+            today_date,
+            chrono::NaiveDate::parse_from_str(finding.expires_at.get(..10).unwrap_or(""), "%Y-%m-%d")
+                .ok(),
+        ) {
+            if expiry < today {
+                continue;
+            }
+        }
+        out.push(finding);
+    }
+    out
+}
+
+/// Drops acknowledgements whose finding the model no longer produces, so the
+/// set stays bounded. An ack persists exactly while its finding keeps appearing.
+fn prune_acknowledged_findings(status: &mut CourseAutomationStatus) {
+    let present: HashSet<String> = status
+        .analysis
+        .findings
+        .iter()
+        .map(|finding| finding.text.clone())
+        .collect();
+    status
+        .acknowledged_findings
+        .retain(|text| present.contains(text));
+}
+
 fn normalize_short_list(values: Vec<String>, max_items: usize, max_chars: usize) -> Vec<String> {
     let mut normalized = Vec::new();
     let mut seen = HashSet::new();
@@ -2178,7 +2404,7 @@ fn proactive_notification_body(analysis: &AgentCourseAnalysis) -> String {
             .findings
             .iter()
             .take(3)
-            .map(|item| format!("・{}", item)),
+            .map(|item| format!("・{}", item.text)),
     );
     truncate_chars(&lines.join("\n"), 600)
 }
@@ -2211,18 +2437,21 @@ fn should_refresh_summary(
         || pending_count >= FULL_SUMMARY_NEW_ITEM_THRESHOLD
 }
 
-async fn auto_print_candidates(
+async fn process_print_candidates(
     downloaded: &[(String, String, String, PathBuf, String)],
     candidates: &[PrintCandidate],
     previous: &CourseAutomationStatus,
+    approved_categories: &[String],
 ) -> Vec<PrintResult> {
     let mut results = Vec::new();
     for candidate in candidates {
+        let category = candidate.category.trim().to_string();
         if candidate.confidence < PRINT_CONFIDENCE_THRESHOLD {
             results.push(PrintResult {
                 filename: candidate.filename.clone(),
                 status: "skipped_low_confidence".into(),
                 detail: format!("confidence={:.2}", candidate.confidence),
+                category,
                 ..Default::default()
             });
             continue;
@@ -2240,6 +2469,7 @@ async fn auto_print_candidates(
                 filename: candidate.filename.clone(),
                 status: "not_found".into(),
                 detail: "Agent が指定したダウンロード済みファイルを特定できません".into(),
+                category,
                 ..Default::default()
             });
             continue;
@@ -2254,33 +2484,59 @@ async fn auto_print_candidates(
                 path: path_text,
                 status: "already_printed".into(),
                 detail: "同じ SenseA 履歴で印刷済みです".into(),
+                category,
             });
             continue;
         }
-        let path = path.clone();
-        let result = tauri::async_runtime::spawn_blocking(move || print_verified(&path)).await;
-        results.push(match result {
-            Ok(Ok(detail)) => PrintResult {
+        // Gate by per-category approval: an un-approved type waits for the user
+        // to confirm once; an approved type prints automatically from then on.
+        let approved = !category.is_empty()
+            && approved_categories
+                .iter()
+                .any(|item| item.trim() == category);
+        if !approved {
+            results.push(PrintResult {
                 filename: filename.clone(),
                 path: path_text,
-                status: "printed".into(),
-                detail,
-            },
-            Ok(Err(error)) => PrintResult {
-                filename: filename.clone(),
-                path: path_text,
-                status: "error".into(),
-                detail: error,
-            },
-            Err(error) => PrintResult {
-                filename: filename.clone(),
-                path: path_text,
-                status: "error".into(),
-                detail: format!("印刷タスク失敗: {}", error),
-            },
-        });
+                status: "needs_confirmation".into(),
+                detail: "このタイプの印刷を許可すると、以降の同種ファイルは自動で印刷されます".into(),
+                category,
+            });
+            continue;
+        }
+        results.push(print_one(filename, path, path_text, category).await);
     }
     results
+}
+
+/// Sends one already-located file to the printer and maps the outcome to a
+/// `PrintResult`. Shared by the automatic path and the manual confirm command.
+async fn print_one(filename: &str, path: &Path, path_text: String, category: String) -> PrintResult {
+    let path = path.to_path_buf();
+    let result = tauri::async_runtime::spawn_blocking(move || print_verified(&path)).await;
+    match result {
+        Ok(Ok(detail)) => PrintResult {
+            filename: filename.to_string(),
+            path: path_text,
+            status: "printed".into(),
+            detail,
+            category,
+        },
+        Ok(Err(error)) => PrintResult {
+            filename: filename.to_string(),
+            path: path_text,
+            status: "error".into(),
+            detail: error,
+            category,
+        },
+        Err(error) => PrintResult {
+            filename: filename.to_string(),
+            path: path_text,
+            status: "error".into(),
+            detail: format!("印刷タスク失敗: {}", error),
+            category,
+        },
+    }
 }
 
 fn print_verified(path: &Path) -> Result<String, String> {
@@ -2714,16 +2970,23 @@ mod tests {
         let analysis = normalize_course_analysis(
             AgentCourseAnalysis {
                 summary: "a".repeat(400),
-                findings: vec![
-                    "same".into(),
-                    "same".into(),
-                    "b".repeat(400),
-                    "third".into(),
-                    "fourth".into(),
-                    "fifth".into(),
-                    "sixth".into(),
-                    "seventh".into(),
-                ],
+                findings: [
+                    "same",
+                    "same",
+                    &"b".repeat(400),
+                    "third",
+                    "fourth",
+                    "fifth",
+                    "sixth",
+                    "seventh",
+                    "eighth",
+                ]
+                .into_iter()
+                .map(|text| Finding {
+                    text: text.to_string(),
+                    ..Default::default()
+                })
+                .collect(),
                 standing_context: (0..20)
                     .map(|index| StandingMemory {
                         text: format!("context-{index}"),
@@ -2742,7 +3005,9 @@ mod tests {
         );
 
         assert_eq!(analysis.summary.chars().count(), 240);
-        assert_eq!(analysis.findings.len(), 6);
+        // No cap any more: 8 unique survive ("same" deduped). Exceeding the old
+        // limit of 6 proves there is no item cap; the 400-char one is kept too.
+        assert_eq!(analysis.findings.len(), 8);
         assert_eq!(analysis.standing_context.len(), 20);
         assert_eq!(analysis.seat.assignment.chars().count(), 80);
         assert_eq!(analysis.seat.evidence.len(), 6);
@@ -3005,6 +3270,7 @@ mod tests {
             path: "/tmp/handout.pdf".into(),
             status: "printed".into(),
             detail: "accepted".into(),
+            ..Default::default()
         };
         let merged = merge_print_results(
             std::slice::from_ref(&printed),
@@ -3013,6 +3279,7 @@ mod tests {
                 path: "/tmp/handout.pdf".into(),
                 status: "error".into(),
                 detail: "later error".into(),
+                ..Default::default()
             }],
         );
         assert_eq!(merged, vec![printed]);
@@ -3034,11 +3301,13 @@ mod tests {
                 filename: "old.pdf".into(),
                 reason: "persist".into(),
                 confidence: 0.9,
+                ..Default::default()
             }],
             vec![PrintCandidate {
                 filename: "new.pdf".into(),
                 reason: "new".into(),
                 confidence: 0.95,
+                ..Default::default()
             }],
         );
         assert_eq!(merged.len(), 2);
@@ -3110,12 +3379,13 @@ mod tests {
     fn proactive_notification_body_is_compact_and_actionable() {
         let body = proactive_notification_body(&AgentCourseAnalysis {
             summary: "Act now".into(),
-            findings: vec![
-                "First".into(),
-                "Second".into(),
-                "Third".into(),
-                "Must not appear".into(),
-            ],
+            findings: ["First", "Second", "Third", "Must not appear"]
+                .into_iter()
+                .map(|text| Finding {
+                    text: text.to_string(),
+                    ..Default::default()
+                })
+                .collect(),
             ..Default::default()
         });
 

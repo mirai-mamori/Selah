@@ -226,6 +226,13 @@ fn bundle_kc_read() -> BundleRead {
 
 #[cfg(target_os = "macos")]
 fn bundle_kc_write(json: &str) -> Result<(), String> {
+    // Delete then add so the item is recreated owned by the *current* code
+    // signature. Plain `set` on an item created by a different identity (a prior
+    // build, or a dev rebuild — ad-hoc cdhash changes every build) takes the
+    // SecItemUpdate path, which prompts on write and never takes ownership, so
+    // every read+write keeps prompting. Recreating it makes writes — and later
+    // reads — silent. Delete does not require the read ACL, so it is itself silent.
+    let _ = security_framework::passwords::delete_generic_password(SERVICE, BUNDLE_ACCOUNT);
     security_framework::passwords::set_generic_password(SERVICE, BUNDLE_ACCOUNT, json.as_bytes())
         .map_err(|e| format!("keychain set: {e}"))
 }

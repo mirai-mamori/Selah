@@ -4,6 +4,11 @@
   import { onDestroy, onMount } from "svelte";
   import { fly } from "svelte/transition";
   import Icon from "../Icon.svelte";
+  import {
+    saveDetailGeneratedTodos,
+    getDetailGeneratedTodos,
+    completeDetailGeneratedTodo,
+  } from "../api";
 
   interface CourseAutomationConfig {
     enabled: boolean;
@@ -36,13 +41,14 @@
     }>;
     analysis: {
       summary: string;
-      findings: string[];
+      findings: Array<{ text: string; expiresAt?: string; action?: boolean }>;
       standingContext: Array<{ text: string; expiresAt: string; urgent?: boolean }>;
       archivedContext?: Array<{ label: string; items: string[] }>;
       seat: { assignment: string; evidence: string[]; confidence: number };
       printCandidates: Array<{ filename: string; reason: string; confidence: number }>;
     };
-    printResults: Array<{ filename: string; status: string; detail: string }>;
+    printResults: Array<{ filename: string; status: string; detail: string; category?: string }>;
+    acknowledgedFindings?: string[];
   }
 
   interface CourseAutomationView {
@@ -132,7 +138,6 @@
 
   // ── Bento content ────────────────────────────────────────────────────────
   const summary = $derived(view?.status.analysis?.summary?.trim() ?? "");
-  const findings = $derived(view?.status.analysis?.findings ?? []);
   // Memories carry an expiry date. Active ones drive the メモ pill; expired ones
   // (the backend's archive, plus any active item whose date just rolled past)
   // are not dropped — they stay as a dim 過去 reference, since old context can
@@ -144,7 +149,8 @@
     const d = `${now.getDate()}`.padStart(2, "0");
     return `${now.getFullYear()}-${m}-${d}`;
   });
-  const isExpired = (m: { expiresAt: string }) => !!m.expiresAt && m.expiresAt.slice(0, 10) < todayStr;
+  const isExpired = (m: { expiresAt?: string }) =>
+    !!m.expiresAt && m.expiresAt.slice(0, 10) < todayStr;
   const standingContext = $derived(
     (view?.status.analysis?.standingContext ?? [])
       .filter((m) => !isExpired(m))
@@ -166,9 +172,28 @@
     }
     return groups;
   });
+  // 確認事項 carry an expiry (auto-drop once past) and an action flag. Items the
+  // user marked known/done (acknowledgedFindings) are hidden; action items lead.
+  const acknowledgedFindings = $derived(view?.status.acknowledgedFindings ?? []);
+  const isAcknowledged = (text: string) => acknowledgedFindings.includes(text);
+  const findings = $derived(
+    (view?.status.analysis?.findings ?? [])
+      .filter((f) => !isExpired(f) && !isAcknowledged(f.text))
+      .slice()
+      .sort((a, b) => Number(b.action ?? false) - Number(a.action ?? false)),
+  );
+
   const seat = $derived(view?.status.analysis?.seat);
   const seatConfidence = $derived(Math.round(Math.max(0, Math.min(1, seat?.confidence ?? 0)) * 100));
   const printResults = $derived(view?.status.printResults ?? []);
+  // Print failures (retryable) are surfaced on the 印刷 capsule itself, not on
+  // the control capsule.
+  const printFailures = $derived(
+    printResults.filter((r) => r.status === "error" || r.status === "not_found").length,
+  );
+  // Files waiting for the user to approve their print type. The first file of a
+  // type asks once; approving it auto-prints that category from then on.
+  const printPending = $derived(printResults.filter((r) => r.status === "needs_confirmation").length);
 
   // 確認事項 plays one item at a time, banner / widget style: an index advances
   // on a timer and the line cross-slides in. Pauses on hover and under reduced
@@ -178,7 +203,7 @@
   let findingsPaused = $state(false);
   let reduceMotion = $state(false);
   const safeFindingIndex = $derived(findings.length ? findingIndex % findings.length : 0);
-  const currentFinding = $derived(findings[safeFindingIndex] ?? "");
+  const currentFinding = $derived(findings[safeFindingIndex]?.text ?? "");
 
   // Materials / announcements the agent has individually analysed & summarised.
   const analyzedDocs = $derived(
@@ -215,12 +240,13 @@
     return `${Math.floor(delta / 86400)}日前`;
   });
 
-  function printLabel(status: string): { text: string; tone: "ok" | "warn" | "bad" } {
+  function printLabel(status: string): { text: string; tone: "ok" | "warn" | "bad" | "info" } {
     switch (status) {
       case "printed": return { text: "印刷済み", tone: "ok" };
       case "already_printed": return { text: "印刷済み", tone: "ok" };
       case "error": return { text: "印刷失敗", tone: "bad" };
       case "not_found": return { text: "対象不明", tone: "bad" };
+      case "needs_confirmation": return { text: "確認待ち", tone: "info" };
       case "skipped_low_confidence": return { text: "確度不足で保留", tone: "warn" };
       default: return { text: status, tone: "warn" };
     }
@@ -293,6 +319,84 @@
       rebuildingMemory = false;
     }
   }
+
+  // Approve a print category: prints the files waiting under it now and
+  // remembers the type so future same-type files print automatically.
+  let confirmingCategory = $state<string | null>(null);
+  async function confirmPrint(category: string): Promise<void> {
+    if (busy || confirmingCategory) return;
+    confirmingCategory = category;
+    error = "";
+    try {
+      view = await invoke<CourseAutomationView>("course_automation_confirm_print", {
+        lunaId,
+        courseName,
+        category,
+      });
+    } catch (cause) {
+      error = String(cause);
+      await load().catch(() => {});
+    } finally {
+      confirmingCategory = null;
+    }
+  }
+
+  // Mark a 確認事項 as known/done: the backend hides it (and won't re-list it
+  // while the model keeps producing it). For action items, also complete the
+  // matching task on the main TODO page so the two stay in sync.
+  let acknowledging = $state<string | null>(null);
+  async function acknowledgeFinding(finding: { text: string; action?: boolean }): Promise<void> {
+    if (acknowledging) return;
+    acknowledging = finding.text;
+    error = "";
+    try {
+      view = await invoke<CourseAutomationView>("course_automation_acknowledge_finding", {
+        lunaId,
+        courseName,
+        text: finding.text,
+        done: true,
+      });
+      if (finding.action) {
+        try {
+          const todos = await getDetailGeneratedTodos();
+          const match = todos.find(
+            (t) => t.course_name === courseName && t.title === finding.text && !t.completed_at,
+          );
+          if (match) await completeDetailGeneratedTodo(match.id);
+        } catch {
+          /* todo sync is best-effort */
+        }
+      }
+    } catch (cause) {
+      error = String(cause);
+      await load().catch(() => {});
+    } finally {
+      acknowledging = null;
+    }
+  }
+
+  // Action-required 確認事項 flow into the main TODO page automatically. Pushed
+  // whenever they change; saveDetailGeneratedTodos dedupes by course+title+
+  // deadline, so re-pushing is a no-op. A signature guard avoids redundant writes.
+  let lastTodoPushSig = "";
+  $effect(() => {
+    const actions = findings.filter((f) => f.action);
+    const sig = actions.map((f) => `${f.text}|${f.expiresAt ?? ""}`).join("\n");
+    if (sig === lastTodoPushSig) return;
+    lastTodoPushSig = sig;
+    if (!actions.length) return;
+    saveDetailGeneratedTodos(
+      actions.map((f) => ({
+        title: f.text,
+        course_name: courseName,
+        content_type: "課題",
+        deadline: f.expiresAt ?? "",
+        source_url: "",
+        source_excerpt: "",
+        note: "SenseA 自動検知",
+      })),
+    ).catch(() => {});
+  });
 
   // One document — lightweight; several may be in flight at once. Not gated on
   // status.running: if a full cycle is active the backend queue makes this wait
@@ -369,11 +473,28 @@
           {#if detail === "findings"}
             <ol class="sa-rows">
               {#each findings as finding, i}
-                <li class="sa-row">
+                <li class="sa-row sa-row-find">
                   <span class="sa-row-ix">{i + 1}</span>
-                  <p class="sa-row-text">{finding}</p>
+                  <p class="sa-row-text">
+                    {#if finding.action}<span class="sa-row-flag sa-row-flag-do">要対応</span>{/if}
+                    {finding.text}
+                    {#if finding.expiresAt}<span class="sa-row-until">〜{finding.expiresAt}</span>{/if}
+                  </p>
+                  <button
+                    class="sa-find-done"
+                    type="button"
+                    disabled={acknowledging === finding.text}
+                    onclick={() => acknowledgeFinding(finding)}
+                    title="完了 / 既知にする"
+                    aria-label="完了 / 既知にする"
+                  >
+                    <Icon name="check" size={14} />
+                  </button>
                 </li>
               {/each}
+              {#if findings.length === 0}
+                <li class="sa-row sa-row-dim"><p class="sa-row-text">確認事項はありません。</p></li>
+              {/if}
             </ol>
           {:else if detail === "standing"}
             <ul class="sa-rows">
@@ -428,7 +549,21 @@
                 {@const meta = printLabel(item.status)}
                 <li class="sa-row sa-row-print">
                   <span class="sa-row-text sa-row-name">{item.filename}</span>
-                  <span class="sa-print-tag" data-tone={meta.tone}>{meta.text}</span>
+                  {#if item.status === "needs_confirmation"}
+                    <button
+                      class="sa-print-approve"
+                      class:spin={confirmingCategory === (item.category ?? "")}
+                      type="button"
+                      disabled={busy || confirmingCategory !== null}
+                      onclick={() => confirmPrint(item.category ?? "")}
+                      title={item.category ? `「${item.category}」を許可して印刷(以降は自動)` : "許可して印刷"}
+                    >
+                      <Icon name="printer" size={12} />
+                      <span>許可{item.category ? `(${item.category})` : ""}</span>
+                    </button>
+                  {:else}
+                    <span class="sa-print-tag" data-tone={meta.tone}>{meta.text}</span>
+                  {/if}
                 </li>
               {/each}
             </ul>
@@ -479,10 +614,24 @@
           </button>
         {/if}
         {#if printResults.length}
-          <button class="sa-pill sa-pill-go" data-cat="print" type="button" onclick={() => (detail = "print")}>
+          <button
+            class="sa-pill sa-pill-go"
+            class:sa-pill-info={printPending > 0}
+            class:sa-pill-attn={printPending === 0 && printFailures > 0}
+            data-cat="print"
+            type="button"
+            onclick={() => (detail = "print")}
+            title={printPending > 0 ? `${printPending} 件が印刷の許可待ちです` : printFailures > 0 ? `${printFailures} 件失敗・次回再試行します` : undefined}
+          >
             <Icon name="printer" size={13} />
             <span>印刷</span>
-            <b>{printResults.length}</b>
+            {#if printPending > 0}
+              <b class="sa-pill-accent">{printPending} 件確認</b>
+            {:else if printFailures > 0}
+              <b class="sa-pill-warn">{printFailures} 件失敗</b>
+            {:else}
+              <b>{printResults.length}</b>
+            {/if}
             <Icon name="chevron.right" size={12} />
           </button>
         {/if}
@@ -742,6 +891,34 @@
     white-space: nowrap;
     vertical-align: 1px;
   }
+  /* Action 確認事項 (pushed to TODO) flag — accent rather than warn. */
+  .sa-row-flag-do {
+    background: color-mix(in srgb, var(--detail-accent) 18%, transparent);
+    color: var(--detail-accent);
+  }
+  /* 確認事項 rows carry a trailing done/known toggle. */
+  .sa-row-find { align-items: center; }
+  .sa-row-find .sa-row-text { flex: 1; min-width: 0; }
+  .sa-find-done {
+    flex: none;
+    width: 26px;
+    height: 26px;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    border: 0;
+    border-radius: 50%;
+    background: color-mix(in srgb, var(--detail-text) 7%, transparent);
+    color: var(--detail-muted);
+    cursor: pointer;
+    transition: background 0.14s ease, color 0.14s ease, transform 0.1s ease;
+  }
+  .sa-find-done:hover:not(:disabled) {
+    background: color-mix(in srgb, #34c759 22%, transparent);
+    color: #1a7f37;
+  }
+  .sa-find-done:active:not(:disabled) { transform: scale(0.9); }
+  .sa-find-done:disabled { opacity: 0.5; cursor: default; }
   .sa-row-until {
     margin-left: 6px;
     font-size: 12px;
@@ -862,6 +1039,33 @@
     background: color-mix(in srgb, var(--detail-danger) 16%, transparent);
     color: var(--detail-danger);
   }
+  .sa-print-tag[data-tone="info"] {
+    background: color-mix(in srgb, var(--detail-accent) 16%, transparent);
+    color: var(--detail-accent);
+  }
+  /* Approve-and-print button on a 確認待ち row. */
+  .sa-print-approve {
+    flex: none;
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    padding: 4px 11px;
+    border: 0;
+    border-radius: 999px;
+    background: color-mix(in srgb, var(--detail-accent) 16%, transparent);
+    color: var(--detail-accent);
+    font: inherit;
+    font-size: 11px;
+    font-weight: 800;
+    cursor: pointer;
+    transition: background 0.14s ease, transform 0.1s ease;
+  }
+  .sa-print-approve :global(.icon) { color: var(--detail-accent); }
+  .sa-print-approve:hover:not(:disabled) {
+    background: color-mix(in srgb, var(--detail-accent) 24%, transparent);
+  }
+  .sa-print-approve:active:not(:disabled) { transform: scale(0.96); }
+  .sa-print-approve:disabled { opacity: 0.5; cursor: default; }
 
   /* Analyzed material / announcement cards: a kind badge + title, then the
      agent's per-document summary. */
@@ -1026,6 +1230,18 @@
   .sa-pill :global(.icon) { flex: none; }
   .sa-pill-go :global(.icon:first-child) { color: var(--detail-muted); }
   .sa-pill-go :global(.icon:last-child) { color: var(--detail-faint); }
+  /* A pill carrying its own failure feedback (印刷): warn-tinted fill + icon. */
+  .sa-pill-attn {
+    background: color-mix(in srgb, var(--detail-warn) 16%, transparent);
+  }
+  .sa-pill-attn :global(.icon:first-child) { color: var(--detail-warn); }
+  .sa-pill-warn { color: var(--detail-warn) !important; }
+  /* A pill awaiting user confirmation (印刷の許可待ち): accent-tinted, not an error. */
+  .sa-pill-info {
+    background: color-mix(in srgb, var(--detail-accent) 16%, transparent);
+  }
+  .sa-pill-info :global(.icon:first-child) { color: var(--detail-accent); }
+  .sa-pill-accent { color: var(--detail-accent) !important; }
 
   /* ── Bento cards ─────────────────────────────────────────────────────
      Same visual language as the capsules above: borderless, the same neutral

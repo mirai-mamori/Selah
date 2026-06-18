@@ -649,6 +649,8 @@ pub fn run() {
             course_automation::course_automation_reanalyze_all,
             course_automation::course_automation_reanalyze_document,
             course_automation::course_automation_rebuild_memory,
+            course_automation::course_automation_confirm_print,
+            course_automation::course_automation_acknowledge_finding,
             commands::list_downloads,
             commands::scan_download_dir,
             commands::scan_duplicate_downloads,
