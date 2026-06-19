@@ -510,8 +510,13 @@ pub(super) fn parse_chunk_ai_result(raw: &str) -> LiveChunkAiResult {
     }
     let whiteboard = parse_live_whiteboard(value.get("whiteboard"));
 
+    // JSON parsed cleanly but the summary field was empty/missing. Do NOT fall
+    // back to the raw JSON text (that surfaced a blob of JSON as the "summary").
+    // Leave body empty so the caller treats it as a retryable empty result.
+    // The sanitized-text fallback only applies above, when no JSON was found at
+    // all — there the model returned plain prose that is reasonable to keep.
     LiveChunkAiResult {
-        body: if body.is_empty() { sanitized } else { body },
+        body,
         terms,
         whiteboard,
     }

@@ -9,7 +9,7 @@
 //! working memory in bounded batches, while the ledger remains available for
 //! deterministic reuse, retries, and provenance.
 
-use super::{AgentCourseAnalysis, AnalysisDocument, DocumentAnalysis};
+use super::{AgentCourseAnalysis, AnalysisDocument, DocumentAnalysis, SourceEvent};
 use serde::Serialize;
 use serde_json::Value;
 
@@ -33,6 +33,7 @@ pub(super) const SUMMARY_SYSTEM_PROMPT: &str =
 入力の役割:\n\
 - previousCourseAnalysis: 前回の圧縮済み作業記憶。追記先ではなく、現在の証拠に基づいて全面的に書き直す草稿です。standingContext は現在有効な記憶、archivedContext は失効・完了した過去の記憶を見出しでまとめた履歴です。どちらもあなたが毎回書き直して維持します。新しい資料を解釈するとき、過去に何があったか・何と関連しそうかの手掛かりとして archivedContext を必ず参照してください。失効済みの事項が新情報で再び現役化した場合に限り、archivedContext から取り出して新しい standingContext に戻してかまいません。\n\
 - newOrChangedDocuments: 今回追加・更新された個別まとめ。今回の判断に使う新しい証拠です。\n\
+- sourceEvents: Luna 側で見えた資料ライフサイクルの変化です。removed は前回まで存在した資料が現在の一覧に無いこと、changed は同じ題名/ファイル名の資料が新しい版に置き換わったことを示します。previousSummary は古い版についての短い記録なので、現在の事実として復唱せず、既存記憶の撤回・更新・保留判断にだけ使ってください。\n\
 - currentLocalTime: 期限や現在性を判断する基準時刻です。\n\
 出力方針:\n\
 - summary: 学生が今最初に知るべき最優先の結論1〜2件だけを、2文・160文字以内で記述してください。大学名、学部、授業名、担当者、教室、座席、印刷対象、授業回の一覧、配布済み資料の列挙は禁止です。複数の締切やルールを一段落へ詰め込まないでください。\n\
@@ -75,6 +76,7 @@ pub(super) struct SummaryInput<'a> {
     pub student: &'a Value,
     pub previous_course_analysis: &'a AgentCourseAnalysis,
     pub new_or_changed_documents: Vec<CompactAnalysis<'a>>,
+    pub source_events: Vec<CompactSourceEvent<'a>>,
 }
 
 #[derive(Serialize)]
@@ -90,6 +92,18 @@ pub(super) struct CompactAnalysis<'a> {
     pub print_instruction: &'a str,
     pub trigger_decision: &'a str,
     pub observation_context: &'a str,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(super) struct CompactSourceEvent<'a> {
+    pub id: &'a str,
+    pub event: &'a str,
+    pub kind: &'a str,
+    pub title: &'a str,
+    pub filename: &'a str,
+    pub previous_summary: &'a str,
+    pub detail: &'a str,
 }
 
 impl<'a> From<&'a AnalysisDocument> for CompactDocument<'a> {
@@ -116,6 +130,20 @@ impl<'a> From<&'a DocumentAnalysis> for CompactAnalysis<'a> {
             print_instruction: &analysis.print_instruction,
             trigger_decision: &analysis.trigger_decision,
             observation_context: &analysis.observation_context,
+        }
+    }
+}
+
+impl<'a> From<&'a SourceEvent> for CompactSourceEvent<'a> {
+    fn from(event: &'a SourceEvent) -> Self {
+        Self {
+            id: &event.id,
+            event: &event.event,
+            kind: &event.kind,
+            title: &event.title,
+            filename: &event.filename,
+            previous_summary: &event.previous_summary,
+            detail: &event.detail,
         }
     }
 }

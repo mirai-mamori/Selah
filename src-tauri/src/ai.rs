@@ -19,11 +19,25 @@ static HTTP_CLIENT: LazyLock<reqwest::Client> = LazyLock::new(|| {
 
 /// How many times a non-streaming AI request is attempted before giving up.
 /// OpenRouter occasionally returns truncated/compressed bodies that fail to
-/// parse; a single retry recovers most of them.
-const NON_STREAMING_ATTEMPTS: usize = 2;
+/// parse; a single retry recovers most of them. Transient server-side failures
+/// (429 rate limit, 5xx) are the dominant cause of probabilistic Live-summary
+/// gaps, so we retry those too with exponential backoff.
+const NON_STREAMING_ATTEMPTS: usize = 4;
+const NON_STREAMING_BACKOFF_BASE: Duration = Duration::from_millis(750);
 
-/// Send a non-streaming request, retrying the transport and body read once on
-/// failure. Mirrors `agent_provider::send_non_streaming_request` so the Live
+/// Compute the wait before the next attempt: honor an explicit `Retry-After`
+/// (seconds) when present, otherwise exponential backoff (0.75s, 2.25s, 6.75s).
+fn non_streaming_backoff(attempt: usize, retry_after: Option<Duration>) -> Duration {
+    if let Some(after) = retry_after {
+        // Clamp to avoid an adversarial gateway stalling the flush for minutes.
+        return after.min(Duration::from_secs(30));
+    }
+    NON_STREAMING_BACKOFF_BASE * 3u32.pow((attempt - 1) as u32)
+}
+
+/// Send a non-streaming request, retrying transient failures with backoff.
+/// Covers transport errors, body-read errors, and retryable status codes
+/// (429, 5xx). Mirrors `agent_provider::send_non_streaming_request` so the Live
 /// summary path gets the same robustness as the planner path.
 async fn send_non_streaming_request(
     request: reqwest::RequestBuilder,
@@ -43,12 +57,37 @@ async fn send_non_streaming_request(
                     NON_STREAMING_ATTEMPTS,
                     error
                 );
-                tokio::time::sleep(Duration::from_millis(750)).await;
+                tokio::time::sleep(non_streaming_backoff(attempt, None)).await;
                 continue;
             }
             Err(error) => return Err(format!("リクエスト失敗: {}", error)),
         };
         let status = resp.status();
+        // Retry rate limiting and server errors, which the caller would
+        // otherwise surface as a hard `API error (...)` with no recovery.
+        if (status == reqwest::StatusCode::TOO_MANY_REQUESTS || status.is_server_error())
+            && attempt < NON_STREAMING_ATTEMPTS
+        {
+            let retry_after = resp
+                .headers()
+                .get(reqwest::header::RETRY_AFTER)
+                .and_then(|value| value.to_str().ok())
+                .and_then(|value| value.trim().parse::<u64>().ok())
+                .map(Duration::from_secs);
+            let wait = non_streaming_backoff(attempt, retry_after);
+            let body = resp.text().await.unwrap_or_default();
+            log::warn!(
+                "ai({}): server returned {} on attempt {}/{}; retrying in {:?}: {}",
+                provider,
+                status,
+                attempt,
+                NON_STREAMING_ATTEMPTS,
+                wait,
+                truncate_error(&body)
+            );
+            tokio::time::sleep(wait).await;
+            continue;
+        }
         match resp.text().await {
             Ok(text) => return Ok((status, text)),
             Err(error) if attempt < NON_STREAMING_ATTEMPTS => {
@@ -59,7 +98,7 @@ async fn send_non_streaming_request(
                     NON_STREAMING_ATTEMPTS,
                     error
                 );
-                tokio::time::sleep(Duration::from_millis(750)).await;
+                tokio::time::sleep(non_streaming_backoff(attempt, None)).await;
             }
             Err(error) => {
                 return Err(format!("レスポンス読み取り失敗: {}", error));

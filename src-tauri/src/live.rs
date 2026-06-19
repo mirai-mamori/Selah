@@ -987,6 +987,14 @@ async fn summarize_chunk(
     ];
     let raw_1 = crate::ai::chat_completion_public(&cfg, messages_1).await?;
     let parsed_1 = parse_chunk_ai_result(&raw_1);
+    // An empty body means the model returned nothing usable (e.g. a reasoning
+    // model that emitted only a <think> block stripped by sanitize). Treat it as
+    // a failure rather than pushing a blank chunk: the caller's error path keeps
+    // the pending lines and does not advance batch_started_at, so the retry
+    // layers (driver loop mid-session, final-flush retry on stop) re-attempt it.
+    if parsed_1.body.trim().is_empty() {
+        return Err("AI要約の本文が空でした（再試行します）".to_string());
+    }
 
     // === Call 2: whiteboard only ===
     let whiteboard_context = format_latest_whiteboard_context(recent_summaries);
@@ -1458,6 +1466,33 @@ async fn flush_session_summary(
     Ok(session.snapshot())
 }
 
+/// Final-flush retry on stop. Unlike scheduled chunks, the closing segment has
+/// no driver loop to retry it, so a single transient AI failure would lose the
+/// last segment permanently. Retry a few times with backoff before giving up.
+const FINAL_FLUSH_RETRY_ATTEMPTS: usize = 3;
+
+async fn flush_final_summary_with_retry(state: &LiveState) -> Result<LiveSessionSnapshot, String> {
+    let mut last_err = "final flush failed".to_string();
+    for attempt in 1..=FINAL_FLUSH_RETRY_ATTEMPTS {
+        match flush_session_summary(state, true).await {
+            Ok(snapshot) => return Ok(snapshot),
+            Err(err) => {
+                log::warn!(
+                    "[Live] final chunk flush failed on attempt {}/{}: {}",
+                    attempt,
+                    FINAL_FLUSH_RETRY_ATTEMPTS,
+                    err
+                );
+                last_err = err;
+                if attempt < FINAL_FLUSH_RETRY_ATTEMPTS {
+                    tokio::time::sleep(std::time::Duration::from_secs(2 * attempt as u64)).await;
+                }
+            }
+        }
+    }
+    Err(last_err)
+}
+
 fn live_session_matches(state: &LiveState, session_id: &str) -> bool {
     state
         .0
@@ -1851,7 +1886,16 @@ pub async fn live_finish_session(
         finish_started_check_at,
         pending_line_count,
     ) {
-        flush_session_summary(&state, true).await?;
+        // Retry the closing segment a few times before giving up. If it still
+        // fails, degrade to saving the transcript plus the segments we already
+        // have rather than failing the whole stop and losing everything — the
+        // markdown build below works from whatever summaries exist.
+        if let Err(err) = flush_final_summary_with_retry(&state).await {
+            log::warn!(
+                "[Live] final chunk summary gave up after retries: {err}; \
+                 saving transcript without the last segment"
+            );
+        }
     } else {
         // Non-fatal for short sessions: they intentionally skip AI and save the transcript as-is.
         let _ = flush_session_summary(&state, true).await;

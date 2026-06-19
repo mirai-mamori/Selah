@@ -22,6 +22,7 @@ const STATUS_PREFIX: &str = "course_automation:status:";
 const DEFAULT_INTERVAL_MINUTES: u32 = 30;
 const CHECK_INTERVAL_SECS: u64 = 5 * 60;
 const STARTUP_DELAY_SECS: u64 = 75;
+const DEFERRED_DELTA_FOLLOWUP_SECS: u64 = 20;
 const MAX_FILE_TEXT_CHARS: usize = 16_000;
 const FULL_SUMMARY_NEW_ITEM_THRESHOLD: usize = 4;
 const PRINT_CONFIDENCE_THRESHOLD: f32 = 0.8;
@@ -125,7 +126,7 @@ impl CourseAutomationConfig {
             monitor_materials: true,
             monitor_announcements: true,
             monitor_assignments: true,
-            analyze_all: true,
+            analyze_all: false,
             auto_print: true,
             approved_print_categories: Vec::new(),
             notify_seat_changes: true,
@@ -226,6 +227,23 @@ pub struct DocumentAnalysis {
     pub error: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct SourceEvent {
+    pub id: String,
+    pub event: String,
+    pub document_id: String,
+    pub kind: String,
+    pub title: String,
+    pub filename: String,
+    #[serde(default)]
+    pub previous_summary: String,
+    #[serde(default)]
+    pub detail: String,
+    #[serde(default)]
+    pub attention: bool,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct CourseArtifactRecord {
@@ -324,6 +342,10 @@ pub struct CourseAutomationStatus {
     #[serde(default)]
     pub pending_summary_ids: Vec<String>,
     #[serde(default)]
+    pub source_events: Vec<SourceEvent>,
+    #[serde(default)]
+    pub pending_source_event_ids: Vec<String>,
+    #[serde(default)]
     pub last_summary_document_ids: Vec<String>,
     #[serde(default)]
     pub pending_notification_ids: Vec<String>,
@@ -373,6 +395,13 @@ struct AnalysisDocument {
     // model instead of text. Never serialized into the prompt JSON.
     #[serde(skip)]
     images: Vec<crate::ai::ImagePart>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct SourceDocumentInfo {
+    kind: String,
+    title: String,
+    filename: String,
 }
 
 pub fn start_course_automation_loop(app: &AppHandle) {
@@ -440,6 +469,21 @@ async fn process_job(app: &AppHandle, job: &Job) -> Result<CourseAutomationView,
             // A full cycle rewrites the whole status from a snapshot, so it runs
             // exclusively (write side): no document job writes underneath it.
             let _exclusive = state.cycle_lock.write().await;
+            // Re-check automatic jobs after acquiring exclusivity. A scheduled
+            // or deferred job may have waited behind another cycle while the
+            // user disabled SenseA for this course or another cycle satisfied
+            // the scheduled interval.
+            let config = load_config(&db, &job.luna_id, &job.course_name);
+            let status = load_status(&db, &job.luna_id, &job.course_name);
+            if should_skip_automatic_cycle(
+                config.enabled,
+                &job.trigger,
+                status.last_run,
+                config.interval_minutes,
+                epoch_secs(),
+            ) {
+                return Ok(CourseAutomationView { config, status });
+            }
             // run_course has its own timeout + status cleanup.
             run_course(
                 app,
@@ -917,11 +961,7 @@ async fn run_due_courses(app: &AppHandle) -> Result<(), String> {
             continue;
         }
         let status = load_status(&db, &config.luna_id, &config.course_name);
-        let due_after = i64::from(config.interval_minutes.max(5)) * 60;
-        if status
-            .last_run
-            .is_some_and(|last_run| now.saturating_sub(last_run) < due_after)
-        {
+        if !scheduled_cycle_is_due(status.last_run, config.interval_minutes, now) {
             continue;
         }
         // Hand the due course to the unified queue; the worker logs failures.
@@ -980,6 +1020,53 @@ async fn run_course(
     outcome
 }
 
+fn schedule_deferred_delta_followup(app: &AppHandle, luna_id: &str, course_name: &str) {
+    let app = app.clone();
+    let luna_id = luna_id.to_string();
+    let course_name = course_name.to_string();
+    tauri::async_runtime::spawn(async move {
+        tokio::time::sleep(Duration::from_secs(DEFERRED_DELTA_FOLLOWUP_SECS)).await;
+        let job = Job {
+            luna_id,
+            course_name,
+            trigger: "deferred".into(),
+            kind: JobKind::Cycle { force_all: false },
+            respond: None,
+        };
+        if let Err(error) = app.state::<CourseAutomationState>().job_tx.send(job) {
+            log::warn!(
+                "[course_automation] deferred delta follow-up could not be queued: {}",
+                error
+            );
+        }
+    });
+}
+
+fn should_queue_deferred_delta_followup(
+    run_succeeded: bool,
+    deferred_delta_followup: bool,
+) -> bool {
+    run_succeeded && deferred_delta_followup
+}
+
+fn scheduled_cycle_is_due(last_run: Option<i64>, interval_minutes: u32, now: i64) -> bool {
+    let due_after = i64::from(interval_minutes.max(5)) * 60;
+    last_run.is_none_or(|last_run| now.saturating_sub(last_run) >= due_after)
+}
+
+fn should_skip_automatic_cycle(
+    config_enabled: bool,
+    trigger: &str,
+    last_run: Option<i64>,
+    interval_minutes: u32,
+    now: i64,
+) -> bool {
+    if !config_enabled && matches!(trigger, "scheduled" | "deferred") {
+        return true;
+    }
+    trigger == "scheduled" && !scheduled_cycle_is_due(last_run, interval_minutes, now)
+}
+
 async fn run_course_inner(
     app: &AppHandle,
     luna_id: &str,
@@ -1002,6 +1089,7 @@ async fn run_course_inner(
     status.last_error.clear();
     save_status_and_emit(app, &db, &status)?;
 
+    let mut deferred_delta_followup = false;
     let outcome: Result<(), String> = async {
         let contents = crate::agent_tools::fetch_luna_course_contents(app, luna_id).await?;
         if !contents.course_name.trim().is_empty() {
@@ -1020,6 +1108,7 @@ async fn run_course_inner(
         let mut artifacts = previous.artifacts.clone();
         let mut external_links = Vec::new();
         let mut activity_documents = Vec::new();
+        let mut current_source_infos = Vec::<SourceDocumentInfo>::new();
         let mut seen_paths = HashSet::new();
         for material in contents
             .materials
@@ -1036,6 +1125,11 @@ async fn run_course_inner(
                     continue;
                 }
                 let source_fingerprint = material_source_fingerprint(file)?;
+                current_source_infos.push(SourceDocumentInfo {
+                    kind: "material".into(),
+                    title: material.title.clone(),
+                    filename: filename.to_string(),
+                });
                 if let Some((path, persisted_source_fingerprint)) = reusable_artifact_path(
                     &artifacts,
                     "material",
@@ -1173,11 +1267,20 @@ async fn run_course_inner(
                 .and_then(Value::as_str)
                 .unwrap_or("activity");
             let title = value.get("title").and_then(Value::as_str).unwrap_or("");
+            let filename = value
+                .get("filename")
+                .or_else(|| value.get("attachment_name"))
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            current_source_infos.push(SourceDocumentInfo {
+                kind: kind.to_string(),
+                title: title.to_string(),
+                filename: filename.to_string(),
+            });
             if matches!(
                 value.get("status").and_then(Value::as_str),
                 Some("downloaded" | "reused" | "error")
             ) {
-                let filename = value.get("filename").and_then(Value::as_str).unwrap_or("");
                 let source_fingerprint = value
                     .get("source_fingerprint")
                     .and_then(Value::as_str)
@@ -1263,21 +1366,37 @@ async fn run_course_inner(
         status.stage = "analyzing".into();
         let mut documents = activity_documents;
         documents.extend(build_analysis_documents(&downloaded, &previous));
-        // analyze_all = false: only touch new or changed items. Already-done
-        // items keep their stored analysis (still in working/audit memory) and
-        // are dropped from this run's set. Default (true) keeps the full sweep.
-        // A manual "re-analyze all" overrides this and re-analyses everything.
-        if !(config.analyze_all || force_all) {
-            documents.retain(
-                |document| match previous_document_analysis(&previous, document) {
-                    Some(previous_analysis) if previous_analysis.status == "done" => {
-                        document_fingerprint(document)
-                            .map(|fingerprint| fingerprint != previous_analysis.fingerprint)
-                            .unwrap_or(true)
-                    }
-                    _ => true,
-                },
-            );
+        let current_source_documents = documents.clone();
+        let detected_source_events = detect_source_events(
+            &previous,
+            &current_source_infos,
+            &current_source_documents,
+            &config,
+        );
+        let mut pending_source_event_ids = previous.pending_source_event_ids.clone();
+        let previous_source_event_ids = previous
+            .source_events
+            .iter()
+            .map(|event| event.id.clone())
+            .collect::<HashSet<_>>();
+        for event in &detected_source_events {
+            if !previous_source_event_ids.contains(&event.id)
+                && !pending_source_event_ids
+                    .iter()
+                    .any(|existing| existing == &event.id)
+            {
+                pending_source_event_ids.push(event.id.clone());
+            }
+        }
+        let source_events = merge_source_events(&previous.source_events, detected_source_events);
+        status.source_events = source_events.clone();
+        status.pending_source_event_ids = pending_source_event_ids.clone();
+        // Normal checks are delta-first: only new, changed, or retryable items
+        // enter the document loop. Old `analyze_all` config values are kept for
+        // backwards-compatible serialization, but a true full sweep now requires
+        // the explicit "re-analyze all" command (`force_all`).
+        if !force_all {
+            documents.retain(|document| should_process_document_delta(&previous, document));
         }
         let student = load_student_profile(&db);
         status.total_documents = documents.len();
@@ -1287,6 +1406,7 @@ async fn run_course_inner(
 
         let mut document_analyses = previous.document_analyses.clone();
         let mut newly_analyzed_ids = Vec::new();
+        let mut processed_document_ids = Vec::new();
         for document in &documents {
             status.current_document = document_label(document);
             save_status_and_emit(app, &db, &status)?;
@@ -1370,13 +1490,32 @@ async fn run_course_inner(
                     format!("『{}』の分析に失敗", doc_label),
                 );
             }
+            let should_pause_for_immediate =
+                should_pause_delta_cycle_after_analysis(force_all, previous_document, &analysis);
+            let processed_id = analysis.id.clone();
             upsert_document_analysis(&mut document_analyses, analysis);
             status.processed_documents += 1;
+            processed_document_ids.push(processed_id);
+            if should_pause_for_immediate {
+                let remaining = documents.len().saturating_sub(status.processed_documents);
+                if remaining > 0 {
+                    push_run_log(
+                        &mut status,
+                        "ok",
+                        format!("即時対応を優先し、残り {} 件は次回確認します", remaining),
+                    );
+                    status.total_documents = status.processed_documents;
+                    deferred_delta_followup = true;
+                }
+            }
             status.document_analyses = document_analyses.clone();
             save_status_and_emit(app, &db, &status)?;
+            if should_pause_for_immediate {
+                break;
+            }
         }
         status.current_document.clear();
-        let current_document_ids = documents.iter().map(document_id).collect::<HashSet<_>>();
+        let current_document_ids = processed_document_ids.into_iter().collect::<HashSet<_>>();
         let successful = document_analyses
             .iter()
             .filter(|analysis| {
@@ -1418,6 +1557,20 @@ async fn run_course_inner(
                 pending_notification_ids.push(notification_key);
             }
         }
+        for event in &source_events {
+            if event.attention
+                && pending_source_event_ids
+                    .iter()
+                    .any(|pending_id| pending_id == &event.id)
+                && !previous
+                    .notified_document_ids
+                    .iter()
+                    .any(|id| id == &event.id)
+                && !pending_notification_ids.iter().any(|id| id == &event.id)
+            {
+                pending_notification_ids.push(event.id.clone());
+            }
+        }
         status.pending_notification_ids = pending_notification_ids;
         let agent_requests_immediate_summary = document_analyses.iter().any(|item| {
             pending_summary_ids.iter().any(|id| id == &item.id)
@@ -1433,27 +1586,48 @@ async fn run_course_inner(
             pending_summary_ids.len(),
             agent_requests_immediate_summary,
             agent_requests_observe_followup,
+            pending_source_event_ids.len(),
         );
         let analysis = if should_summarize {
             status.stage = "summarizing".into();
             status.pending_summary_ids = pending_summary_ids.clone();
+            status.pending_source_event_ids = pending_source_event_ids.clone();
             save_status_and_emit(app, &db, &status)?;
-            let new_items = document_analyses
+            let mut new_items = document_analyses
                 .iter()
                 .filter(|item| pending_summary_ids.iter().any(|id| id == &item.id))
+                .cloned()
+                .collect::<Vec<_>>();
+            prioritize_summary_items(&mut new_items);
+            let pending_source_events = source_events
+                .iter()
+                .filter(|event| pending_source_event_ids.iter().any(|id| id == &event.id))
                 .cloned()
                 .collect::<Vec<_>>();
             let provider = AgentProvider::resolve().map_err(|error| error.to_string())?;
             let configured_max_tokens = crate::ai::load_ai_config().max_tokens;
             let mut result = previous.analysis.clone();
-            for (batch_index, batch) in context::summary_batches(&new_items).into_iter().enumerate()
-            {
+            let mut batches = context::summary_batches(&new_items);
+            if batches.is_empty() && !pending_source_events.is_empty() {
+                batches.push(Vec::new());
+            }
+            for (batch_index, batch) in batches.into_iter().enumerate() {
                 let consumed_ids = batch.iter().map(|item| item.id.clone()).collect::<Vec<_>>();
+                let event_batch = if batch_index == 0 {
+                    pending_source_events.iter().collect::<Vec<_>>()
+                } else {
+                    Vec::new()
+                };
+                let consumed_event_ids = event_batch
+                    .iter()
+                    .map(|event| event.id.clone())
+                    .collect::<Vec<_>>();
                 let (next_result, usage) = summarize_batch_with_agent(
                     &provider,
                     luna_id,
                     &status.course_name,
                     &batch,
+                    &event_batch,
                     &student,
                     &result,
                     configured_max_tokens,
@@ -1467,6 +1641,7 @@ async fn run_course_inner(
                     result.print_candidates,
                 );
                 remove_consumed_ids(&mut status.pending_summary_ids, &consumed_ids);
+                remove_consumed_ids(&mut status.pending_source_event_ids, &consumed_event_ids);
                 status.last_summary_document_ids =
                     merge_unique_ids(&status.last_summary_document_ids, consumed_ids);
                 status.analysis = result.clone();
@@ -1475,11 +1650,22 @@ async fn run_course_inner(
             push_run_log(
                 &mut status,
                 "ok",
-                format!("{} 件の摘要から記憶を更新", new_items.len()),
+                if pending_source_events.is_empty() {
+                    format!("{} 件の摘要から記憶を更新", new_items.len())
+                } else if new_items.is_empty() {
+                    format!("{} 件の資料変更から記憶を更新", pending_source_events.len())
+                } else {
+                    format!(
+                        "{} 件の摘要と {} 件の資料変更から記憶を更新",
+                        new_items.len(),
+                        pending_source_events.len()
+                    )
+                },
             );
             result
         } else {
             status.pending_summary_ids = pending_summary_ids;
+            status.pending_source_event_ids = pending_source_event_ids;
             normalize_course_analysis(
                 previous.analysis.clone(),
                 &previous.analysis.archived_context,
@@ -1619,6 +1805,9 @@ async fn run_course_inner(
         push_run_log(&mut status, "error", error.clone());
     }
     save_status_and_emit(app, &db, &status)?;
+    if should_queue_deferred_delta_followup(outcome.is_ok(), deferred_delta_followup) {
+        schedule_deferred_delta_followup(app, luna_id, &status.course_name);
+    }
     outcome
 }
 
@@ -2147,6 +2336,18 @@ fn merge_print_candidates(
     merged
 }
 
+fn merge_source_events(existing: &[SourceEvent], current: Vec<SourceEvent>) -> Vec<SourceEvent> {
+    let mut merged = existing.to_vec();
+    for event in current {
+        if let Some(existing) = merged.iter_mut().find(|item| item.id == event.id) {
+            *existing = event;
+        } else {
+            merged.push(event);
+        }
+    }
+    merged
+}
+
 fn retryable_failure_count(status: &CourseAutomationStatus) -> usize {
     status
         .artifacts
@@ -2247,11 +2448,13 @@ async fn summarize_with_agent(
         .into_iter()
         .enumerate()
     {
+        let source_events = Vec::new();
         let (next_memory, _usage) = summarize_batch_with_agent(
             &provider,
             luna_id,
             course_name,
             &batch,
+            &source_events,
             student,
             &working_memory,
             configured_max_tokens,
@@ -2268,6 +2471,7 @@ async fn summarize_batch_with_agent(
     luna_id: &str,
     course_name: &str,
     batch: &[&DocumentAnalysis],
+    source_events: &[&SourceEvent],
     student: &Value,
     working_memory: &AgentCourseAnalysis,
     configured_max_tokens: u32,
@@ -2283,6 +2487,11 @@ async fn summarize_batch_with_agent(
             .iter()
             .copied()
             .map(context::CompactAnalysis::from)
+            .collect(),
+        source_events: source_events
+            .iter()
+            .copied()
+            .map(context::CompactSourceEvent::from)
             .collect(),
     };
     let label = format!("最終まとめ batch {}", batch_index + 1);
@@ -2490,6 +2699,170 @@ fn previous_document_analysis<'a>(
                     && analysis.filename == document.filename
             })
         })
+}
+
+fn should_process_document_delta(
+    previous: &CourseAutomationStatus,
+    document: &AnalysisDocument,
+) -> bool {
+    match previous_document_analysis(previous, document) {
+        Some(previous_analysis)
+            if matches!(previous_analysis.status.as_str(), "done" | "skipped") =>
+        {
+            document_fingerprint(document)
+                .map(|fingerprint| fingerprint != previous_analysis.fingerprint)
+                .unwrap_or(true)
+        }
+        _ => true,
+    }
+}
+
+fn should_pause_delta_cycle_after_analysis(
+    force_all: bool,
+    previous: Option<&DocumentAnalysis>,
+    analysis: &DocumentAnalysis,
+) -> bool {
+    !force_all
+        && analysis.status == "done"
+        && analysis.trigger_decision == "immediate"
+        && previous.is_none_or(|item| item.status != "done")
+}
+
+fn normalized_source_part(value: &str) -> String {
+    value.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn source_document_key(kind: &str, title: &str, filename: &str) -> String {
+    format!(
+        "{}|{}|{}",
+        normalized_source_part(kind),
+        normalized_source_part(title),
+        normalized_source_part(filename)
+    )
+}
+
+fn analysis_source_key(analysis: &DocumentAnalysis) -> String {
+    source_document_key(&analysis.kind, &analysis.title, &analysis.filename)
+}
+
+fn document_source_key(document: &AnalysisDocument) -> String {
+    source_document_key(&document.kind, &document.title, &document.filename)
+}
+
+fn source_info_key(info: &SourceDocumentInfo) -> String {
+    source_document_key(&info.kind, &info.title, &info.filename)
+}
+
+fn source_kind_monitored(kind: &str, config: &CourseAutomationConfig) -> bool {
+    match kind {
+        "material" | "legacy" => config.monitor_materials,
+        "announcement" => config.monitor_announcements,
+        "report" => config.monitor_assignments,
+        _ => true,
+    }
+}
+
+fn source_event_attention(previous: &DocumentAnalysis) -> bool {
+    previous.trigger_decision == "immediate"
+        || previous.trigger_decision == "observe"
+        || !previous.findings.is_empty()
+        || !previous.print_instruction.trim().is_empty()
+        || !previous.seat_evidence.is_empty()
+}
+
+fn source_event_id(event: &str, previous_id: &str, current_id: &str) -> String {
+    format!(
+        "{:x}",
+        Sha256::digest(format!(
+            "source-event|{}|{}|{}",
+            event, previous_id, current_id
+        ))
+    )
+}
+
+fn source_event_label(analysis: &DocumentAnalysis) -> String {
+    if analysis.filename.trim().is_empty() {
+        analysis.title.clone()
+    } else {
+        analysis.filename.clone()
+    }
+}
+
+fn detect_source_events(
+    previous: &CourseAutomationStatus,
+    current_sources: &[SourceDocumentInfo],
+    current_documents: &[AnalysisDocument],
+    config: &CourseAutomationConfig,
+) -> Vec<SourceEvent> {
+    let current_source_keys = current_sources
+        .iter()
+        .map(source_info_key)
+        .collect::<HashSet<_>>();
+    let current_document_ids = current_documents
+        .iter()
+        .map(document_id)
+        .collect::<HashSet<_>>();
+    let current_matched_previous_ids = current_documents
+        .iter()
+        .filter_map(|document| {
+            previous_document_analysis(previous, document).map(|item| item.id.clone())
+        })
+        .collect::<HashSet<_>>();
+    let current_analyzable_by_key = current_documents
+        .iter()
+        .filter(|document| document.load_error.is_empty())
+        .map(|document| (document_source_key(document), document))
+        .collect::<HashMap<_, _>>();
+
+    let mut events = Vec::new();
+    let mut seen = HashSet::new();
+    for analysis in &previous.document_analyses {
+        if analysis.status != "done" || !source_kind_monitored(&analysis.kind, config) {
+            continue;
+        }
+        if current_document_ids.contains(&analysis.id)
+            || current_matched_previous_ids.contains(&analysis.id)
+        {
+            continue;
+        }
+        let source_key = analysis_source_key(analysis);
+        let (event, current_id, detail) =
+            if let Some(current_document) = current_analyzable_by_key.get(&source_key) {
+                let current_id = document_id(current_document);
+                if current_id == analysis.id {
+                    continue;
+                }
+                (
+                    "changed",
+                    current_id,
+                    "同じ題名/ファイル名の資料が新しい版に置き換わりました".to_string(),
+                )
+            } else if !current_source_keys.contains(&source_key) {
+                (
+                    "removed",
+                    String::new(),
+                    "前回まで存在した資料が現在の Luna 一覧にありません".to_string(),
+                )
+            } else {
+                continue;
+            };
+        let id = source_event_id(event, &analysis.id, &current_id);
+        if !seen.insert(id.clone()) {
+            continue;
+        }
+        events.push(SourceEvent {
+            id,
+            event: event.to_string(),
+            document_id: analysis.id.clone(),
+            kind: analysis.kind.clone(),
+            title: analysis.title.clone(),
+            filename: analysis.filename.clone(),
+            previous_summary: truncate_chars(&analysis.summary, 240),
+            detail: format!("{}: {}", source_event_label(analysis), detail),
+            attention: source_event_attention(analysis),
+        });
+    }
+    events
 }
 
 fn normalize_trigger_decision(value: &str) -> String {
@@ -2790,11 +3163,25 @@ fn should_refresh_summary(
     pending_count: usize,
     agent_requests_immediate_summary: bool,
     agent_requests_observe_followup: bool,
+    pending_source_event_count: usize,
 ) -> bool {
     previous_summary.trim().is_empty()
         || agent_requests_immediate_summary
         || agent_requests_observe_followup
+        || pending_source_event_count > 0
         || pending_count >= FULL_SUMMARY_NEW_ITEM_THRESHOLD
+}
+
+fn summary_priority(analysis: &DocumentAnalysis) -> usize {
+    match analysis.trigger_decision.as_str() {
+        "immediate" => 0,
+        "observe" => 1,
+        _ => 2,
+    }
+}
+
+fn prioritize_summary_items(items: &mut [DocumentAnalysis]) {
+    items.sort_by_key(summary_priority);
 }
 
 fn has_observe_followup(
@@ -3197,7 +3584,7 @@ mod tests {
         assert!(config.monitor_materials);
         assert!(config.monitor_announcements);
         assert!(config.monitor_assignments);
-        assert!(config.analyze_all);
+        assert!(!config.analyze_all);
         assert!(config.auto_print);
     }
 
@@ -3217,6 +3604,161 @@ mod tests {
         document.content = "A-2".into();
         let after = document_fingerprint(&document).expect("fingerprint");
         assert_ne!(before, after);
+    }
+
+    #[test]
+    fn delta_cycle_processes_only_new_changed_or_retryable_documents() {
+        let mut document = AnalysisDocument {
+            kind: "material".into(),
+            title: "Week 1".into(),
+            filename: "notes.pdf".into(),
+            path: "/tmp/notes.pdf".into(),
+            content: "same".into(),
+            source_fingerprint: "remote-v1".into(),
+            load_error: String::new(),
+            images: Vec::new(),
+        };
+        let fingerprint = document_fingerprint(&document).expect("fingerprint");
+        let id = document_id(&document);
+        let previous_done = CourseAutomationStatus {
+            document_analyses: vec![DocumentAnalysis {
+                id: id.clone(),
+                fingerprint: fingerprint.clone(),
+                status: "done".into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        assert!(!should_process_document_delta(&previous_done, &document));
+
+        let previous_skipped = CourseAutomationStatus {
+            document_analyses: vec![DocumentAnalysis {
+                id: id.clone(),
+                fingerprint: fingerprint.clone(),
+                status: "skipped".into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        assert!(!should_process_document_delta(&previous_skipped, &document));
+
+        let previous_error = CourseAutomationStatus {
+            document_analyses: vec![DocumentAnalysis {
+                id,
+                fingerprint,
+                status: "error".into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        assert!(should_process_document_delta(&previous_error, &document));
+
+        document.content = "changed".into();
+        assert!(should_process_document_delta(&previous_done, &document));
+    }
+
+    #[test]
+    fn delta_cycle_pauses_after_new_immediate_but_full_sweep_continues() {
+        let previous_done = DocumentAnalysis {
+            id: "old".into(),
+            status: "done".into(),
+            trigger_decision: "immediate".into(),
+            ..Default::default()
+        };
+        let immediate = DocumentAnalysis {
+            id: "new".into(),
+            status: "done".into(),
+            trigger_decision: "immediate".into(),
+            ..Default::default()
+        };
+        let routine = DocumentAnalysis {
+            id: "routine".into(),
+            status: "done".into(),
+            trigger_decision: "routine".into(),
+            ..Default::default()
+        };
+
+        assert!(should_pause_delta_cycle_after_analysis(
+            false, None, &immediate
+        ));
+        assert!(!should_pause_delta_cycle_after_analysis(
+            true, None, &immediate
+        ));
+        assert!(!should_pause_delta_cycle_after_analysis(
+            false,
+            Some(&previous_done),
+            &immediate
+        ));
+        assert!(!should_pause_delta_cycle_after_analysis(
+            false, None, &routine
+        ));
+    }
+
+    #[test]
+    fn deferred_delta_followup_is_queued_only_after_successful_pause() {
+        assert!(should_queue_deferred_delta_followup(true, true));
+        assert!(!should_queue_deferred_delta_followup(true, false));
+        assert!(!should_queue_deferred_delta_followup(false, true));
+        assert!(!should_queue_deferred_delta_followup(false, false));
+    }
+
+    #[test]
+    fn disabled_course_skips_only_automatic_cycles() {
+        assert!(should_skip_automatic_cycle(
+            false,
+            "scheduled",
+            None,
+            30,
+            1_000
+        ));
+        assert!(should_skip_automatic_cycle(
+            false, "deferred", None, 30, 1_000
+        ));
+        assert!(!should_skip_automatic_cycle(
+            false, "manual", None, 30, 1_000
+        ));
+        assert!(!should_skip_automatic_cycle(
+            true,
+            "scheduled",
+            None,
+            30,
+            1_000
+        ));
+        assert!(!should_skip_automatic_cycle(
+            true,
+            "deferred",
+            Some(990),
+            30,
+            1_000
+        ));
+    }
+
+    #[test]
+    fn scheduled_cycle_rechecks_due_at_execution_time() {
+        assert!(scheduled_cycle_is_due(None, 30, 2_000));
+        assert!(scheduled_cycle_is_due(Some(0), 30, 2_000));
+        assert!(!scheduled_cycle_is_due(Some(900), 30, 2_000));
+        assert!(should_skip_automatic_cycle(
+            true,
+            "scheduled",
+            Some(900),
+            30,
+            2_000
+        ));
+        assert!(!should_skip_automatic_cycle(
+            true,
+            "scheduled",
+            Some(0),
+            30,
+            2_000
+        ));
+        assert!(!should_skip_automatic_cycle(
+            true,
+            "deferred",
+            Some(1_999),
+            30,
+            2_000
+        ));
     }
 
     #[test]
@@ -3411,6 +3953,17 @@ mod tests {
             ..Default::default()
         };
         let student = json!({"studentNumber": "1234"});
+        let source_event = SourceEvent {
+            id: "event-1".into(),
+            event: "removed".into(),
+            document_id: "old-document-id".into(),
+            kind: "material".into(),
+            title: "Week 1".into(),
+            filename: "old.pdf".into(),
+            previous_summary: "old context".into(),
+            detail: "old.pdf: removed".into(),
+            attention: true,
+        };
         let input = context::SummaryInput {
             current_local_time: "2026-06-15 10:00".into(),
             course_id: "course",
@@ -3418,13 +3971,16 @@ mod tests {
             student: &student,
             previous_course_analysis: &previous,
             new_or_changed_documents: vec![context::CompactAnalysis::from(&delta)],
+            source_events: vec![context::CompactSourceEvent::from(&source_event)],
         };
         let serialized = serde_json::to_string(&input).expect("serialize compact input");
 
         assert!(serialized.contains("compressed working memory"));
         assert!(serialized.contains("new-success"));
+        assert!(serialized.contains("old context"));
         assert!(!serialized.contains("must-not-be-sent"));
         assert!(!serialized.contains("/must/not/be/sent.pdf"));
+        assert!(!serialized.contains("old-document-id"));
     }
 
     #[test]
@@ -3758,11 +4314,78 @@ mod tests {
 
     #[test]
     fn comprehensive_summary_waits_for_enough_new_items() {
-        assert!(!should_refresh_summary("existing context", 3, false, false));
-        assert!(should_refresh_summary("existing context", 4, false, false));
-        assert!(should_refresh_summary("existing context", 1, true, false));
-        assert!(should_refresh_summary("existing context", 1, false, true));
-        assert!(should_refresh_summary("", 1, false, false));
+        assert!(!should_refresh_summary(
+            "existing context",
+            3,
+            false,
+            false,
+            0
+        ));
+        assert!(should_refresh_summary(
+            "existing context",
+            4,
+            false,
+            false,
+            0
+        ));
+        assert!(should_refresh_summary(
+            "existing context",
+            1,
+            true,
+            false,
+            0
+        ));
+        assert!(should_refresh_summary(
+            "existing context",
+            1,
+            false,
+            true,
+            0
+        ));
+        assert!(should_refresh_summary(
+            "existing context",
+            0,
+            false,
+            false,
+            1
+        ));
+        assert!(should_refresh_summary("", 1, false, false, 0));
+    }
+
+    #[test]
+    fn summary_items_prioritize_immediate_without_dropping_routine_backlog() {
+        let mut items = vec![
+            DocumentAnalysis {
+                id: "routine-old".into(),
+                trigger_decision: "routine".into(),
+                ..Default::default()
+            },
+            DocumentAnalysis {
+                id: "observe-old".into(),
+                trigger_decision: "observe".into(),
+                ..Default::default()
+            },
+            DocumentAnalysis {
+                id: "immediate-new".into(),
+                trigger_decision: "immediate".into(),
+                ..Default::default()
+            },
+            DocumentAnalysis {
+                id: "routine-new".into(),
+                trigger_decision: "routine".into(),
+                ..Default::default()
+            },
+        ];
+
+        prioritize_summary_items(&mut items);
+
+        assert_eq!(
+            items
+                .iter()
+                .map(|item| item.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["immediate-new", "observe-old", "routine-old", "routine-new"]
+        );
     }
 
     #[test]
@@ -3793,6 +4416,137 @@ mod tests {
             &["watch".into(), "later".into()],
             &["later".into()]
         ));
+    }
+
+    #[test]
+    fn source_events_distinguish_changed_removed_and_transient_missing_download() {
+        let config = CourseAutomationConfig::new("course".into(), "Course".into());
+        let old_doc = AnalysisDocument {
+            kind: "material".into(),
+            title: "Week 1".into(),
+            filename: "worksheet.pdf".into(),
+            path: "/tmp/worksheet-v1.pdf".into(),
+            content: "old".into(),
+            source_fingerprint: "remote-v1".into(),
+            load_error: String::new(),
+            images: Vec::new(),
+        };
+        let removed_doc = AnalysisDocument {
+            kind: "material".into(),
+            title: "Week 2".into(),
+            filename: "removed.pdf".into(),
+            path: "/tmp/removed.pdf".into(),
+            content: "removed".into(),
+            source_fingerprint: "removed-v1".into(),
+            load_error: String::new(),
+            images: Vec::new(),
+        };
+        let previous = CourseAutomationStatus {
+            document_analyses: vec![
+                DocumentAnalysis {
+                    id: document_id(&old_doc),
+                    kind: old_doc.kind.clone(),
+                    title: old_doc.title.clone(),
+                    filename: old_doc.filename.clone(),
+                    source_fingerprint: old_doc.source_fingerprint.clone(),
+                    status: "done".into(),
+                    trigger_decision: "observe".into(),
+                    summary: "old worksheet summary".into(),
+                    ..Default::default()
+                },
+                DocumentAnalysis {
+                    id: document_id(&removed_doc),
+                    kind: removed_doc.kind.clone(),
+                    title: removed_doc.title.clone(),
+                    filename: removed_doc.filename.clone(),
+                    source_fingerprint: removed_doc.source_fingerprint.clone(),
+                    status: "done".into(),
+                    print_instruction: "印刷して記入".into(),
+                    summary: "removed worksheet summary".into(),
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+        let new_doc = AnalysisDocument {
+            source_fingerprint: "remote-v2".into(),
+            path: "/tmp/worksheet-v2.pdf".into(),
+            content: "new".into(),
+            ..old_doc.clone()
+        };
+        let events = detect_source_events(
+            &previous,
+            &[SourceDocumentInfo {
+                kind: "material".into(),
+                title: "Week 1".into(),
+                filename: "worksheet.pdf".into(),
+            }],
+            &[new_doc],
+            &config,
+        );
+
+        assert_eq!(events.len(), 2);
+        assert!(events
+            .iter()
+            .any(|event| event.event == "changed"
+                && event.previous_summary == "old worksheet summary"));
+        assert!(events
+            .iter()
+            .any(|event| event.event == "removed" && event.attention));
+
+        let transient = detect_source_events(
+            &previous,
+            &[SourceDocumentInfo {
+                kind: "material".into(),
+                title: "Week 1".into(),
+                filename: "worksheet.pdf".into(),
+            }],
+            &[],
+            &config,
+        );
+        assert!(transient
+            .iter()
+            .all(|event| !(event.event == "removed" && event.filename == "worksheet.pdf")));
+    }
+
+    #[test]
+    fn source_events_do_not_treat_legacy_identity_migration_as_change() {
+        let config = CourseAutomationConfig::new("course".into(), "Course".into());
+        let previous = CourseAutomationStatus {
+            document_analyses: vec![DocumentAnalysis {
+                id: "legacy-id".into(),
+                kind: "material".into(),
+                title: "Week 1".into(),
+                filename: "notes.pdf".into(),
+                status: "done".into(),
+                summary: "legacy summary".into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let current = AnalysisDocument {
+            kind: "material".into(),
+            title: "Week 1".into(),
+            filename: "notes.pdf".into(),
+            path: "/tmp/notes.pdf".into(),
+            content: "same logical source".into(),
+            source_fingerprint: "remote-v1".into(),
+            load_error: String::new(),
+            images: Vec::new(),
+        };
+
+        let events = detect_source_events(
+            &previous,
+            &[SourceDocumentInfo {
+                kind: "material".into(),
+                title: "Week 1".into(),
+                filename: "notes.pdf".into(),
+            }],
+            &[current],
+            &config,
+        );
+
+        assert!(events.is_empty());
     }
 
     #[test]

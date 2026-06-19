@@ -42,7 +42,7 @@ still owns action permissions, idempotency, retries, and verification.
 |---|---|---|---|
 | Audit memory | artifacts and per-document analyses | provenance, reuse, retry, history | no |
 | Working memory | summary, findings, standing context, seat, print candidates | current decision state | yes, compact |
-| Episodic delta | newly analyzed or changed items | update working memory | yes, once |
+| Episodic delta | newly analyzed items and source lifecycle events | update working memory | yes, once |
 | Action ledger | notified versions and print results | idempotency and feedback | only when decision-relevant |
 
 Working memory is rewritten, not appended. Expired, completed, superseded, and
@@ -62,6 +62,25 @@ duplicate items must disappear. Audit memory is never used as a prompt dump.
    unlikely to have completed a generation. Response-body interruptions and
    SenseA-level timeouts are not automatically replayed, because they may
    already have consumed provider tokens.
+
+Normal checks are delta-first. A cycle indexes the current Luna source list, but
+only new, changed, retryable, or explicitly selected documents enter the AI
+document loop. A full sweep requires the explicit re-analyze-all command.
+When multiple pending deltas are folded, `immediate` items are sent before
+`observe` and routine backlog so urgent updates cannot be trapped behind older
+low-impact summaries.
+When a normal cycle finds a newly analyzed `immediate` document, it may pause the
+remaining delta work, fold the urgent item into working memory, notify, and let
+the next cycle continue the leftover documents. That continuation is queued
+shortly after the urgent run finishes, rather than waiting for the course's
+normal interval. Automatic scheduled and deferred cycles re-check the course's
+enabled state at execution time, so disabling SenseA stops queued background
+work before it starts. This check happens after the cycle acquires exclusive
+status-write access, closing the window where a queued job was enabled when
+enqueued but disabled while waiting behind another cycle. Scheduled cycles also
+re-check `lastRun` at that same point, so stale queued schedule jobs collapse
+after another cycle has already refreshed the course. Deferred follow-ups bypass
+the normal interval but still obey the enabled-state check.
 
 The current estimator is deliberately conservative for mixed Japanese and
 English text. Provider-side token usage should replace it when uniformly
@@ -92,6 +111,9 @@ design.
   matches. Filename-only reuse is reserved for legacy records that do not yet
   have a fingerprint, and only to migrate them forward.
 - A changed document version can trigger a new notification.
+- A source removal or replacement is detected from the current Luna source list,
+  not from transient download or detail-fetch failures. The event is kept as a
+  pending delta until a comprehensive summary consumes it.
 - A failed notification or print remains retryable.
 - A dispatched print whose final receipt is unknown remains visible but is not
   treated as retryable.
