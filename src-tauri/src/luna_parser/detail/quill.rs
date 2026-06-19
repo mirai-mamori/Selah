@@ -47,6 +47,23 @@ pub(in crate::luna_parser) fn extract_named_quill_payloads(html: &str) -> Vec<(S
     payloads
 }
 
+/// Extract every Quill payload in an HTML fragment, preserving rich embeds.
+pub(in crate::luna_parser) fn extract_all_quill_rich_html(html: &str) -> Vec<String> {
+    let mut payloads = Vec::new();
+    let call = ".setJsonData(\"";
+    let mut offset = 0usize;
+
+    while let Some(call_pos) = html[offset..].find(call) {
+        let start = offset + call_pos + call.len();
+        if let Some(payload) = extract_quill_call_payload(&html[start..]) {
+            payloads.push(payload);
+        }
+        offset = start;
+    }
+
+    payloads
+}
+
 fn extract_quill_call_payload(after: &str) -> Option<String> {
     // Byte-level scan for closing unescaped ": safe because ASCII 0x22/0x5C
     // cannot appear as UTF-8 continuation bytes (continuation bytes are 0x80–0xBF).
@@ -74,6 +91,51 @@ fn escape_html_fragment(s: &str) -> String {
         .replace('>', "&gt;")
         .replace('"', "&quot;")
         .replace('\'', "&#39;")
+}
+
+fn is_safe_quill_image_src(src: &str) -> bool {
+    let trimmed = src.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+    let lower = trimmed.to_ascii_lowercase();
+    lower.starts_with("http://")
+        || lower.starts_with("https://")
+        || lower.starts_with('/')
+        || lower.starts_with("data:image/png;base64,")
+        || lower.starts_with("data:image/jpeg;base64,")
+        || lower.starts_with("data:image/jpg;base64,")
+        || lower.starts_with("data:image/gif;base64,")
+        || lower.starts_with("data:image/webp;base64,")
+}
+
+fn quill_attr_str<'a>(
+    attrs: Option<&'a serde_json::Map<String, serde_json::Value>>,
+    key: &str,
+) -> Option<&'a str> {
+    attrs?.get(key).and_then(|v| v.as_str())
+}
+
+fn render_quill_image(
+    src: &str,
+    attrs: Option<&serde_json::Map<String, serde_json::Value>>,
+) -> Option<String> {
+    if !is_safe_quill_image_src(src) {
+        return None;
+    }
+
+    let mut out = format!("<img src=\"{}\"", escape_html_fragment(src.trim()));
+    if let Some(alt) = quill_attr_str(attrs, "alt").filter(|s| !s.trim().is_empty()) {
+        out.push_str(&format!(" alt=\"{}\"", escape_html_fragment(alt.trim())));
+    }
+    if let Some(title) = quill_attr_str(attrs, "title").filter(|s| !s.trim().is_empty()) {
+        out.push_str(&format!(
+            " title=\"{}\"",
+            escape_html_fragment(title.trim())
+        ));
+    }
+    out.push('>');
+    Some(out)
 }
 
 fn wrap_quill_inline_attrs(
@@ -137,10 +199,23 @@ pub(in crate::luna_parser) fn extract_quill_rich_html(json_str: &str) -> Option<
     // temporary strings just for the emptiness check below.
     let mut has_content = false;
     for op in ops {
-        let Some(insert) = op.get("insert").and_then(|v| v.as_str()) else {
+        let Some(insert) = op.get("insert") else {
             continue;
         };
         let attrs = op.get("attributes").and_then(|a| a.as_object());
+        if let Some(embed) = insert.as_object() {
+            if let Some(src) = embed.get("image").and_then(|v| v.as_str()) {
+                if let Some(img) = render_quill_image(src, attrs) {
+                    has_content = true;
+                    html.push_str(&img);
+                }
+            }
+            continue;
+        }
+
+        let Some(insert) = insert.as_str() else {
+            continue;
+        };
 
         let mut segment = String::new();
         for ch in insert.chars() {

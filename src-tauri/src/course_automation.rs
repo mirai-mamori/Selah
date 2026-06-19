@@ -13,6 +13,9 @@ use std::time::Duration;
 use tauri::{AppHandle, Emitter, Manager, State};
 
 mod context;
+mod items;
+
+use items::Item;
 
 const CONFIG_PREFIX: &str = "course_automation:config:";
 const STATUS_PREFIX: &str = "course_automation:status:";
@@ -157,122 +160,6 @@ pub struct PrintCandidate {
     pub category: String,
 }
 
-/// A continuing memory item that is explicitly tied to this course and may
-/// carry an expiry date. `expires_at` is an ISO date (`YYYY-MM-DD`) after which
-/// the item is no longer relevant; an empty value means a standing rule with no
-/// fixed expiry. Items whose expiry has passed are pruned deterministically in
-/// code (see `prune_and_normalize_standing`), independent of the model.
-#[derive(Debug, Clone, Serialize, Default)]
-#[serde(rename_all = "camelCase")]
-pub struct StandingMemory {
-    #[serde(default)]
-    pub text: String,
-    #[serde(default, skip_serializing_if = "String::is_empty")]
-    pub expires_at: String,
-    /// True when this memory is time-critical / action-required (a near deadline,
-    /// schedule change, exam, seat change, …). Surfaced first in the UI so the
-    /// student sees what needs attention now; the kinds of change that set this
-    /// are also what make an incoming document trigger an immediate refresh.
-    #[serde(default, skip_serializing_if = "is_false")]
-    pub urgent: bool,
-}
-
-fn is_false(value: &bool) -> bool {
-    !*value
-}
-
-// Accept both the legacy bare-string form and the new object so already-persisted
-// memories deserialize without migration.
-impl<'de> Deserialize<'de> for StandingMemory {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        #[derive(Deserialize)]
-        #[serde(untagged)]
-        enum Repr {
-            Text(String),
-            Object {
-                #[serde(default)]
-                text: String,
-                #[serde(default, rename = "expiresAt")]
-                expires_at: String,
-                #[serde(default)]
-                urgent: bool,
-            },
-        }
-        Ok(match Repr::deserialize(deserializer)? {
-            Repr::Text(text) => StandingMemory {
-                text,
-                expires_at: String::new(),
-                urgent: false,
-            },
-            Repr::Object {
-                text,
-                expires_at,
-                urgent,
-            } => StandingMemory {
-                text,
-                expires_at,
-                urgent,
-            },
-        })
-    }
-}
-
-/// A 確認事項 item the student should check. Carries an optional expiry (auto-
-/// dropped once past, like memory) and an `action` flag marking items the student
-/// must act on — those are pushed into the main TODO page.
-#[derive(Debug, Clone, Serialize, Default)]
-#[serde(rename_all = "camelCase")]
-pub struct Finding {
-    #[serde(default)]
-    pub text: String,
-    #[serde(default, skip_serializing_if = "String::is_empty")]
-    pub expires_at: String,
-    #[serde(default, skip_serializing_if = "is_false")]
-    pub action: bool,
-}
-
-// Accept the legacy bare-string form so already-persisted findings load without
-// migration.
-impl<'de> Deserialize<'de> for Finding {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        #[derive(Deserialize)]
-        #[serde(untagged)]
-        enum Repr {
-            Text(String),
-            Object {
-                #[serde(default)]
-                text: String,
-                #[serde(default, rename = "expiresAt")]
-                expires_at: String,
-                #[serde(default)]
-                action: bool,
-            },
-        }
-        Ok(match Repr::deserialize(deserializer)? {
-            Repr::Text(text) => Finding {
-                text,
-                expires_at: String::new(),
-                action: false,
-            },
-            Repr::Object {
-                text,
-                expires_at,
-                action,
-            } => Finding {
-                text,
-                expires_at,
-                action,
-            },
-        })
-    }
-}
-
 /// A consolidated cluster of past (expired) memories under one short heading,
 /// e.g. label「完了した課題」with items for each finished assignment.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -290,9 +177,9 @@ pub struct AgentCourseAnalysis {
     #[serde(default)]
     pub summary: String,
     #[serde(default)]
-    pub findings: Vec<Finding>,
+    pub findings: Vec<Item>,
     #[serde(default)]
-    pub standing_context: Vec<StandingMemory>,
+    pub standing_context: Vec<Item>,
     /// Past memory, consolidated. When a standing memory expires it is not kept
     /// verbatim — it is folded into a short labeled group here (e.g. a finished
     /// assignment becomes one sub-item under「完了した課題」), so old context stays
@@ -370,7 +257,29 @@ pub struct RunLogEntry {
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
+pub struct AiUsageEstimate {
+    #[serde(default)]
+    pub at: i64,
+    #[serde(default)]
+    pub label: String,
+    #[serde(default)]
+    pub prompt_tokens: usize,
+    #[serde(default)]
+    pub response_tokens: usize,
+    #[serde(default)]
+    pub max_tokens: u32,
+    #[serde(default)]
+    pub attempts: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
 pub struct PrintResult {
+    /// Stable identity for one print action. New records include the source
+    /// fingerprint when available, so a revised file with the same filename is not
+    /// mistaken for an already-printed old version.
+    #[serde(default)]
+    pub action_key: String,
     pub filename: String,
     pub path: String,
     pub status: String,
@@ -428,13 +337,19 @@ pub struct CourseAutomationStatus {
     pub analysis: AgentCourseAnalysis,
     #[serde(default)]
     pub print_results: Vec<PrintResult>,
-    /// 確認事項 the user has marked known/done. Filtered out of the displayed
-    /// findings and fed to the summary model so it won't re-list them.
+    /// Per-course user-state overlay keyed by item id (e.g. "done" / "known").
+    /// Unified across facets; survives the model regenerating items because the
+    /// id is a stable content fingerprint. Pruned to currently-present ids.
     #[serde(default)]
-    pub acknowledged_findings: Vec<String>,
+    pub item_states: HashMap<String, String>,
     /// Recent run history shown on the control capsule's detail page (bounded).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub run_log: Vec<RunLogEntry>,
+    /// Bounded estimated AI token telemetry for SenseA requests. Providers do not
+    /// consistently return usage, so this stores local estimates for debugging
+    /// timeout/limit behaviour without cluttering the dock UI.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub ai_usage: Vec<AiUsageEstimate>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -526,7 +441,14 @@ async fn process_job(app: &AppHandle, job: &Job) -> Result<CourseAutomationView,
             // exclusively (write side): no document job writes underneath it.
             let _exclusive = state.cycle_lock.write().await;
             // run_course has its own timeout + status cleanup.
-            run_course(app, &job.luna_id, &job.course_name, &job.trigger, *force_all).await?;
+            run_course(
+                app,
+                &job.luna_id,
+                &job.course_name,
+                &job.trigger,
+                *force_all,
+            )
+            .await?;
             Ok(load_view(&db, &job.luna_id, &job.course_name))
         }
         JobKind::ReanalyzeDoc { document_id } => {
@@ -586,8 +508,7 @@ async fn enqueue_job(
         .job_tx
         .send(job)
         .map_err(|_| "処理キューに送信できません".to_string())?;
-    rx.await
-        .map_err(|_| "処理が中断されました".to_string())?
+    rx.await.map_err(|_| "処理が中断されました".to_string())?
 }
 
 #[tauri::command]
@@ -624,7 +545,14 @@ pub async fn course_automation_run_now(
     if !load_config(&app.state::<Database>(), &luna_id, &course_name).enabled {
         return Err("このコースの SenseA を先に有効にしてください".into());
     }
-    enqueue_job(&app, luna_id, course_name, "manual", JobKind::Cycle { force_all: false }).await
+    enqueue_job(
+        &app,
+        luna_id,
+        course_name,
+        "manual",
+        JobKind::Cycle { force_all: false },
+    )
+    .await
 }
 
 #[tauri::command]
@@ -636,7 +564,14 @@ pub async fn course_automation_reanalyze_all(
     if !load_config(&app.state::<Database>(), &luna_id, &course_name).enabled {
         return Err("このコースの SenseA を先に有効にしてください".into());
     }
-    enqueue_job(&app, luna_id, course_name, "manual", JobKind::Cycle { force_all: true }).await
+    enqueue_job(
+        &app,
+        luna_id,
+        course_name,
+        "manual",
+        JobKind::Cycle { force_all: true },
+    )
+    .await
 }
 
 #[tauri::command]
@@ -651,30 +586,34 @@ pub async fn course_automation_rebuild_memory(
     enqueue_job(&app, luna_id, course_name, "manual", JobKind::RebuildMemory).await
 }
 
+/// Sets (or clears) the user-state of any item by its stable id. Unified across
+/// facets — `state` is e.g. "done" / "known"; an empty string clears it.
 #[tauri::command]
-pub async fn course_automation_acknowledge_finding(
+pub async fn course_automation_set_item_state(
     app: AppHandle,
     luna_id: String,
     course_name: String,
-    text: String,
-    done: bool,
+    id: String,
+    state: String,
 ) -> Result<CourseAutomationView, String> {
     let db = app.state::<Database>();
-    let text = text.trim().to_string();
-    if text.is_empty() {
-        return Err("確認事項が指定されていません".into());
+    let id = id.trim().to_string();
+    if id.is_empty() {
+        return Err("項目が指定されていません".into());
     }
-    let state = app.state::<CourseAutomationState>();
+    let automation = app.state::<CourseAutomationState>();
     // Share the read side so this never overlaps a full cycle's status rewrite.
-    let _shared = state.cycle_lock.read().await;
-    let _write = state.status_write.lock().await;
+    let _shared = automation.cycle_lock.read().await;
+    let _write = automation.status_write.lock().await;
     let mut status = load_status(&db, &luna_id, &course_name);
-    let exists = status.acknowledged_findings.iter().any(|item| item == &text);
-    if done && !exists {
-        status.acknowledged_findings.push(text);
-    } else if !done {
-        status.acknowledged_findings.retain(|item| item != &text);
+    let state = state.trim().to_string();
+    if state.is_empty() {
+        status.item_states.remove(&id);
+    } else {
+        status.item_states.insert(id, state);
     }
+    // Keep the TODO page in sync immediately (done → complete its task).
+    sync_action_todos(&app, &db, &status);
     save_status_and_emit(&app, &db, &status)?;
     Ok(load_view(&db, &luna_id, &course_name))
 }
@@ -751,7 +690,9 @@ async fn reanalyze_one_document(
     };
     if existing.path.is_empty() {
         if existing.content.is_empty() {
-            return Err("この資料は本文が保存されていないため、「全て再分析」で再取得してください".into());
+            return Err(
+                "この資料は本文が保存されていないため、「全て再分析」で再取得してください".into(),
+            );
         }
         document.content = existing.content.clone();
     } else {
@@ -763,6 +704,7 @@ async fn reanalyze_one_document(
     }
 
     let fingerprint = document_fingerprint(&document)?;
+    let mut ai_usage = None;
     let mut analysis = if document.load_error == DOC_SKIP_MARKER {
         DocumentAnalysis {
             id: document_id.to_string(),
@@ -780,7 +722,10 @@ async fn reanalyze_one_document(
         return Err(document.load_error);
     } else {
         let student = load_student_profile(&db);
-        analyze_document_with_agent(luna_id, course_name, &document, &student).await?
+        let (analysis, usage) =
+            analyze_document_with_agent(luna_id, course_name, &document, &student).await?;
+        ai_usage = Some(usage);
+        analysis
     };
     // Preserve the text on the record so fileless docs stay re-analysable.
     if existing.path.is_empty() && !document.content.is_empty() {
@@ -795,8 +740,16 @@ async fn reanalyze_one_document(
     let state = app.state::<CourseAutomationState>();
     let _write = state.status_write.lock().await;
     let mut status = load_status(&db, luna_id, course_name);
+    if let Some(usage) = ai_usage {
+        push_ai_usage(&mut status, usage);
+    }
     upsert_document_analysis(&mut status.document_analyses, analysis);
-    if was_done && !status.pending_summary_ids.iter().any(|id| id == document_id) {
+    if was_done
+        && !status
+            .pending_summary_ids
+            .iter()
+            .any(|id| id == document_id)
+    {
         status.pending_summary_ids.push(document_id.to_string());
     }
     save_status_and_emit(app, &db, &status)?;
@@ -846,9 +799,10 @@ async fn rebuild_memory(
     // clobbering anything a concurrent change touched.
     let mut status = load_status(&db, luna_id, course_name);
     status.analysis = analysis;
-    prune_acknowledged_findings(&mut status);
+    prune_item_states(&mut status);
     status.pending_summary_ids.clear();
     status.last_summary_document_ids = analysed_ids;
+    sync_action_todos(app, &db, &status);
     save_status_and_emit(app, &db, &status)?;
 
     Ok(load_view(&db, luna_id, course_name))
@@ -874,18 +828,25 @@ async fn confirm_print_category(
     if !config
         .approved_print_categories
         .iter()
-        .any(|item| item.trim() == category)
+        .any(|item| normalize_category(item) == normalize_category(&category))
     {
         config.approved_print_categories.push(category.clone());
         save_json(&db, &config_key(luna_id), &config)?;
     }
 
-    // Print every file currently waiting under this category. Done before taking
-    // the status lock so the (slow) print isn't holding it.
-    let pending: Vec<PrintResult> = load_status(&db, luna_id, course_name)
+    // Print every file currently waiting under this category. The status lock is
+    // held across the print so dispatch/final states stay serial and durable.
+    let state = app.state::<CourseAutomationState>();
+    let _write = state.status_write.lock().await;
+    let mut status = load_status(&db, luna_id, course_name);
+    let pending: Vec<PrintResult> = status
         .print_results
-        .into_iter()
-        .filter(|item| item.status == "needs_confirmation" && item.category.trim() == category)
+        .iter()
+        .filter(|item| {
+            item.status == "needs_confirmation"
+                && normalize_category(&item.category) == normalize_category(&category)
+        })
+        .cloned()
         .collect();
     if pending.is_empty() {
         return Ok(load_view(&db, luna_id, course_name));
@@ -893,13 +854,30 @@ async fn confirm_print_category(
     let mut printed = Vec::new();
     for item in pending {
         let path = PathBuf::from(&item.path);
-        printed.push(print_one(&item.filename, &path, item.path.clone(), item.category).await);
+        let action_key = print_result_action_key(&item);
+        let dispatching = dispatching_print_result(
+            &item.filename,
+            item.path.clone(),
+            item.category.clone(),
+            action_key.clone(),
+        );
+        status.stage = "printing".into();
+        status.print_results = merge_print_results(&status.print_results, vec![dispatching]);
+        save_status_and_emit(app, &db, &status)?;
+        let result = print_one(
+            &item.filename,
+            &path,
+            item.path.clone(),
+            item.category,
+            action_key,
+        )
+        .await;
+        status.print_results = merge_print_results(&status.print_results, vec![result.clone()]);
+        save_status_and_emit(app, &db, &status)?;
+        printed.push(result);
     }
-
-    let state = app.state::<CourseAutomationState>();
-    let _write = state.status_write.lock().await;
-    let mut status = load_status(&db, luna_id, course_name);
     status.print_results = merge_print_results(&status.print_results, printed);
+    status.stage = "done".into();
     save_status_and_emit(app, &db, &status)?;
     Ok(load_view(&db, luna_id, course_name))
 }
@@ -915,9 +893,13 @@ fn reset_stale_running_flags(app: &AppHandle) {
         let Ok(mut status) = serde_json::from_str::<CourseAutomationStatus>(&raw) else {
             continue;
         };
+        let had_running = status.running;
         if status.running {
             status.running = false;
             status.stage = String::new();
+        }
+        let settled_prints = settle_stale_print_dispatches(&mut status);
+        if had_running || settled_prints {
             let _ = save_status_and_emit(app, &db, &status);
         }
     }
@@ -987,6 +969,7 @@ async fn run_course(
         status.last_ok = Some(false);
         status.stage = "error".into();
         status.last_error = error.clone();
+        settle_stale_print_dispatches(&mut status);
         // On timeout the inner run was cancelled before it could log, so record
         // it here. Inner errors are already logged by run_course_inner.
         if timed_out {
@@ -1038,7 +1021,11 @@ async fn run_course_inner(
         let mut external_links = Vec::new();
         let mut activity_documents = Vec::new();
         let mut seen_paths = HashSet::new();
-        for material in contents.materials.iter().filter(|_| config.monitor_materials) {
+        for material in contents
+            .materials
+            .iter()
+            .filter(|_| config.monitor_materials)
+        {
             for file in &material.files {
                 let filename = if file.file_name.trim().is_empty() {
                     file.display_name.trim()
@@ -1049,9 +1036,13 @@ async fn run_course_inner(
                     continue;
                 }
                 let source_fingerprint = material_source_fingerprint(file)?;
-                if let Some((path, persisted_source_fingerprint)) =
-                    reusable_artifact_path(&artifacts, "material", &material.title, filename)
-                {
+                if let Some((path, persisted_source_fingerprint)) = reusable_artifact_path(
+                    &artifacts,
+                    "material",
+                    &material.title,
+                    filename,
+                    &source_fingerprint,
+                ) {
                     let persisted_source_fingerprint = if persisted_source_fingerprint.is_empty() {
                         source_fingerprint.clone()
                     } else {
@@ -1277,16 +1268,16 @@ async fn run_course_inner(
         // are dropped from this run's set. Default (true) keeps the full sweep.
         // A manual "re-analyze all" overrides this and re-analyses everything.
         if !(config.analyze_all || force_all) {
-            documents.retain(|document| {
-                match previous_document_analysis(&previous, document) {
+            documents.retain(
+                |document| match previous_document_analysis(&previous, document) {
                     Some(previous_analysis) if previous_analysis.status == "done" => {
                         document_fingerprint(document)
                             .map(|fingerprint| fingerprint != previous_analysis.fingerprint)
                             .unwrap_or(true)
                     }
                     _ => true,
-                }
-            });
+                },
+            );
         }
         let student = load_student_profile(&db);
         status.total_documents = documents.len();
@@ -1337,7 +1328,10 @@ async fn run_course_inner(
                 match analyze_document_with_agent(luna_id, &status.course_name, document, &student)
                     .await
                 {
-                    Ok(analysis) => analysis,
+                    Ok((analysis, usage)) => {
+                        push_ai_usage(&mut status, usage);
+                        analysis
+                    }
                     Err(error) => DocumentAnalysis {
                         id: document_id(document),
                         fingerprint,
@@ -1370,7 +1364,11 @@ async fn run_course_inner(
             } else if analysis.status == "error"
                 && previous_document.is_none_or(|item| item.status != "error")
             {
-                push_run_log(&mut status, "error", format!("『{}』の分析に失敗", doc_label));
+                push_run_log(
+                    &mut status,
+                    "error",
+                    format!("『{}』の分析に失敗", doc_label),
+                );
             }
             upsert_document_analysis(&mut document_analyses, analysis);
             status.processed_documents += 1;
@@ -1399,9 +1397,9 @@ async fn run_course_inner(
 
         let mut pending_summary_ids = previous.pending_summary_ids.to_vec();
         let mut pending_notification_ids = previous.pending_notification_ids.to_vec();
-        for id in newly_analyzed_ids {
-            if !pending_summary_ids.iter().any(|existing| existing == &id) {
-                pending_summary_ids.push(id);
+        for id in &newly_analyzed_ids {
+            if !pending_summary_ids.iter().any(|existing| existing == id) {
+                pending_summary_ids.push(id.clone());
             }
         }
         for analysis in &document_analyses {
@@ -1425,10 +1423,16 @@ async fn run_course_inner(
             pending_summary_ids.iter().any(|id| id == &item.id)
                 && item.trigger_decision == "immediate"
         });
+        let agent_requests_observe_followup = has_observe_followup(
+            &document_analyses,
+            &pending_summary_ids,
+            &newly_analyzed_ids,
+        );
         let should_summarize = should_refresh_summary(
             &previous.analysis.summary,
             pending_summary_ids.len(),
             agent_requests_immediate_summary,
+            agent_requests_observe_followup,
         );
         let analysis = if should_summarize {
             status.stage = "summarizing".into();
@@ -1439,23 +1443,35 @@ async fn run_course_inner(
                 .filter(|item| pending_summary_ids.iter().any(|id| id == &item.id))
                 .cloned()
                 .collect::<Vec<_>>();
-            let mut result = summarize_with_agent(
-                luna_id,
-                &status.course_name,
-                &new_items,
-                &student,
-                &previous.analysis,
-            )
-            .await?;
-            result.print_candidates = merge_print_candidates(
-                &previous.analysis.print_candidates,
-                result.print_candidates,
-            );
-            status.pending_summary_ids.clear();
-            status.last_summary_document_ids = merge_unique_ids(
-                &previous.last_summary_document_ids,
-                new_items.iter().map(|item| item.id.clone()),
-            );
+            let provider = AgentProvider::resolve().map_err(|error| error.to_string())?;
+            let configured_max_tokens = crate::ai::load_ai_config().max_tokens;
+            let mut result = previous.analysis.clone();
+            for (batch_index, batch) in context::summary_batches(&new_items).into_iter().enumerate()
+            {
+                let consumed_ids = batch.iter().map(|item| item.id.clone()).collect::<Vec<_>>();
+                let (next_result, usage) = summarize_batch_with_agent(
+                    &provider,
+                    luna_id,
+                    &status.course_name,
+                    &batch,
+                    &student,
+                    &result,
+                    configured_max_tokens,
+                    batch_index,
+                )
+                .await?;
+                push_ai_usage(&mut status, usage);
+                result = next_result;
+                result.print_candidates = merge_print_candidates(
+                    &previous.analysis.print_candidates,
+                    result.print_candidates,
+                );
+                remove_consumed_ids(&mut status.pending_summary_ids, &consumed_ids);
+                status.last_summary_document_ids =
+                    merge_unique_ids(&status.last_summary_document_ids, consumed_ids);
+                status.analysis = result.clone();
+                save_status_and_emit(app, &db, &status)?;
+            }
             push_run_log(
                 &mut status,
                 "ok",
@@ -1464,7 +1480,11 @@ async fn run_course_inner(
             result
         } else {
             status.pending_summary_ids = pending_summary_ids;
-            previous.analysis.clone()
+            normalize_course_analysis(
+                previous.analysis.clone(),
+                &previous.analysis.archived_context,
+                &chrono::Local::now().format("%Y-%m-%d").to_string(),
+            )
         };
 
         status.pending_seat_notification = config.notify_seat_changes
@@ -1495,7 +1515,8 @@ async fn run_course_inner(
         }
 
         status.analysis = analysis;
-        prune_acknowledged_findings(&mut status);
+        prune_item_states(&mut status);
+        sync_action_todos(app, &db, &status);
         if !status.pending_notification_ids.is_empty() && !status.analysis.summary.trim().is_empty()
         {
             let pending_ids = status.pending_notification_ids.clone();
@@ -1522,37 +1543,45 @@ async fn run_course_inner(
         {
             status.stage = "printing".into();
             save_status_and_emit(app, &db, &status)?;
+            let candidates = status.analysis.print_candidates.clone();
             let fresh = process_print_candidates(
+                app,
+                &db,
+                &mut status,
                 &downloaded,
-                &status.analysis.print_candidates,
-                &previous,
+                &candidates,
                 &config.approved_print_categories,
             )
-            .await;
+            .await?;
             // Log only print outcomes that changed this run (file + operation).
             for result in &fresh {
                 let unchanged = previous
                     .print_results
                     .iter()
-                    .any(|item| item.filename == result.filename && item.status == result.status);
+                    .any(|item| print_results_match(item, result) && item.status == result.status);
                 if unchanged {
                     continue;
                 }
                 let entry = match result.status.as_str() {
                     "printed" => Some(("ok", format!("『{}』を印刷", result.filename))),
-                    "needs_confirmation" => {
-                        Some(("warn", format!("『{}』の印刷を保留(確認待ち)", result.filename)))
-                    }
+                    "needs_confirmation" => Some((
+                        "warn",
+                        format!("『{}』の印刷を保留(確認待ち)", result.filename),
+                    )),
                     "error" | "not_found" => {
                         Some(("error", format!("『{}』の印刷に失敗", result.filename)))
                     }
+                    "unknown" => Some((
+                        "warn",
+                        format!("『{}』の印刷結果を確認してください", result.filename),
+                    )),
                     _ => None,
                 };
                 if let Some((level, message)) = entry {
                     push_run_log(&mut status, level, message);
                 }
             }
-            merge_print_results(&previous.print_results, fresh)
+            merge_print_results(&status.print_results, fresh)
         } else if should_summarize {
             previous.print_results.clone()
         } else {
@@ -1603,6 +1632,14 @@ fn push_run_log(status: &mut CourseAutomationStatus, level: &str, message: Strin
     let len = status.run_log.len();
     if len > 40 {
         status.run_log.drain(0..len - 40);
+    }
+}
+
+fn push_ai_usage(status: &mut CourseAutomationStatus, usage: AiUsageEstimate) {
+    status.ai_usage.push(usage);
+    let len = status.ai_usage.len();
+    if len > 40 {
+        status.ai_usage.drain(0..len - 40);
     }
 }
 
@@ -1692,9 +1729,7 @@ fn load_document_images_or_error(path: &Path, document: &mut AnalysisDocument, t
             .filter(|images| !images.is_empty())
             .or_else(|| {
                 crate::agent_tools::render_pdf_images(path)
-                    .map_err(|error| {
-                        log::warn!("[course_automation] PDF render failed: {}", error)
-                    })
+                    .map_err(|error| log::warn!("[course_automation] PDF render failed: {}", error))
                     .ok()
                     .filter(|images| !images.is_empty())
             });
@@ -1735,6 +1770,7 @@ fn reusable_artifact_path(
     kind: &str,
     _title: &str,
     filename: &str,
+    current_source_fingerprint: &str,
 ) -> Option<(PathBuf, String)> {
     artifacts
         .iter()
@@ -1742,6 +1778,8 @@ fn reusable_artifact_path(
             artifact.status == "downloaded"
                 && (artifact.kind == kind || artifact.kind == "legacy")
                 && artifact.filename == filename
+                && (artifact.source_fingerprint.is_empty()
+                    || artifact.source_fingerprint == current_source_fingerprint)
                 && !artifact.path.is_empty()
                 && Path::new(&artifact.path).is_file()
         })
@@ -1774,6 +1812,7 @@ fn reusable_activity_downloads(
                 format!("fingerprint:{}", artifact.source_fingerprint),
                 reusable.clone(),
             );
+            continue;
         }
         if artifact.kind == "legacy" {
             paths.insert(
@@ -1965,19 +2004,122 @@ fn merge_unique_ids(
     merged
 }
 
+fn remove_consumed_ids(pending: &mut Vec<String>, consumed: &[String]) {
+    if consumed.is_empty() {
+        return;
+    }
+    pending.retain(|id| !consumed.iter().any(|consumed_id| consumed_id == id));
+}
+
 fn has_retryable_print_failure(results: &[PrintResult]) -> bool {
     results
         .iter()
         .any(|item| matches!(item.status.as_str(), "error" | "not_found"))
 }
 
+fn print_action_key(
+    filename: &str,
+    path: &str,
+    source_fingerprint: &str,
+    category: &str,
+) -> String {
+    let source_identity = if source_fingerprint.trim().is_empty() {
+        path.trim()
+    } else {
+        source_fingerprint.trim()
+    };
+    format!(
+        "{:x}",
+        Sha256::digest(format!(
+            "{}|{}|{}",
+            filename.trim(),
+            source_identity,
+            normalize_category(category)
+        ))
+    )
+}
+
+fn print_result_action_key(result: &PrintResult) -> String {
+    if !result.action_key.trim().is_empty() {
+        result.action_key.clone()
+    } else {
+        print_action_key(&result.filename, &result.path, "", &result.category)
+    }
+}
+
+fn print_results_match(left: &PrintResult, right: &PrintResult) -> bool {
+    match (
+        left.action_key.trim().is_empty(),
+        right.action_key.trim().is_empty(),
+    ) {
+        (false, false) => left.action_key == right.action_key,
+        _ => {
+            (!left.path.is_empty() && !right.path.is_empty() && left.path == right.path)
+                || (!left.filename.is_empty()
+                    && !right.filename.is_empty()
+                    && left.filename == right.filename)
+        }
+    }
+}
+
+fn dispatching_print_result(
+    filename: &str,
+    path: String,
+    category: String,
+    action_key: String,
+) -> PrintResult {
+    PrintResult {
+        action_key,
+        filename: filename.to_string(),
+        path,
+        status: "dispatching".into(),
+        detail: "プリンタへ送信中です".into(),
+        category,
+    }
+}
+
+fn unknown_print_result(
+    filename: &str,
+    path: String,
+    category: String,
+    action_key: String,
+) -> PrintResult {
+    PrintResult {
+        action_key,
+        filename: filename.to_string(),
+        path,
+        status: "unknown".into(),
+        detail:
+            "前回の印刷送信後に完了状態を確認できませんでした。重複を避けるため自動再印刷しません"
+                .into(),
+        category,
+    }
+}
+
+fn settle_stale_print_dispatches(status: &mut CourseAutomationStatus) -> bool {
+    let mut changed = false;
+    for result in &mut status.print_results {
+        if result.status != "dispatching" {
+            continue;
+        }
+        result.status = "unknown".into();
+        result.detail =
+            "前回の印刷送信後に完了状態を確認できませんでした。重複を避けるため自動再印刷しません"
+                .into();
+        if result.action_key.trim().is_empty() {
+            result.action_key = print_result_action_key(result);
+        }
+        changed = true;
+    }
+    changed
+}
+
 fn merge_print_results(existing: &[PrintResult], current: Vec<PrintResult>) -> Vec<PrintResult> {
     let mut merged = existing.to_vec();
     for result in current {
-        let matching_index = merged.iter().position(|item| {
-            (!result.path.is_empty() && item.path == result.path)
-                || item.filename == result.filename
-        });
+        let matching_index = merged
+            .iter()
+            .position(|item| print_results_match(item, &result));
         match matching_index {
             Some(index) if merged[index].status == "printed" => {}
             Some(index) => merged[index] = result,
@@ -2047,7 +2189,7 @@ async fn analyze_document_with_agent(
     course_name: &str,
     document: &AnalysisDocument,
     student: &Value,
-) -> Result<DocumentAnalysis, String> {
+) -> Result<(DocumentAnalysis, AiUsageEstimate), String> {
     let provider = AgentProvider::resolve().map_err(|error| error.to_string())?;
     let input = context::IndividualInput {
         course_id: luna_id,
@@ -2056,7 +2198,7 @@ async fn analyze_document_with_agent(
         document: document.into(),
     };
     let label = format!("「{}」の個別まとめ", document_label(document));
-    let output: DocumentAgentOutput = request_plus_json(
+    let response: PlusJsonResponse<DocumentAgentOutput> = request_plus_json(
         &provider,
         context::INDIVIDUAL_SYSTEM_PROMPT,
         serde_json::to_string(&input).map_err(|error| error.to_string())?,
@@ -2067,25 +2209,28 @@ async fn analyze_document_with_agent(
         &label,
     )
     .await?;
-    let output = normalize_document_agent_output(output);
-    Ok(DocumentAnalysis {
-        id: document_id(document),
-        fingerprint: document_fingerprint(document)?,
-        source_fingerprint: document.source_fingerprint.clone(),
-        kind: document.kind.clone(),
-        title: document.title.clone(),
-        filename: document.filename.clone(),
-        path: document.path.clone(),
-        status: "done".into(),
-        content: String::new(),
-        summary: output.summary,
-        findings: output.findings,
-        seat_evidence: output.seat_evidence,
-        print_instruction: output.print_instruction,
-        trigger_decision: normalize_trigger_decision(&output.trigger_decision),
-        observation_context: output.observation_context,
-        error: String::new(),
-    })
+    let output = normalize_document_agent_output(response.value);
+    Ok((
+        DocumentAnalysis {
+            id: document_id(document),
+            fingerprint: document_fingerprint(document)?,
+            source_fingerprint: document.source_fingerprint.clone(),
+            kind: document.kind.clone(),
+            title: document.title.clone(),
+            filename: document.filename.clone(),
+            path: document.path.clone(),
+            status: "done".into(),
+            content: String::new(),
+            summary: output.summary,
+            findings: output.findings,
+            seat_evidence: output.seat_evidence,
+            print_instruction: output.print_instruction,
+            trigger_decision: normalize_trigger_decision(&output.trigger_decision),
+            observation_context: output.observation_context,
+            error: String::new(),
+        },
+        response.usage,
+    ))
 }
 
 async fn summarize_with_agent(
@@ -2102,33 +2247,69 @@ async fn summarize_with_agent(
         .into_iter()
         .enumerate()
     {
-        let input = context::SummaryInput {
-            current_local_time: chrono::Local::now().format("%Y-%m-%d %H:%M").to_string(),
-            course_id: luna_id,
-            course_name,
-            student,
-            previous_course_analysis: &working_memory,
-            new_or_changed_documents: batch
-                .into_iter()
-                .map(context::CompactAnalysis::from)
-                .collect(),
-        };
-        let label = format!("最終まとめ batch {}", batch_index + 1);
-        let result = request_plus_json(
+        let (next_memory, _usage) = summarize_batch_with_agent(
             &provider,
-            context::SUMMARY_SYSTEM_PROMPT,
-            serde_json::to_string(&input).map_err(|error| error.to_string())?,
-            Vec::new(),
+            luna_id,
+            course_name,
+            &batch,
+            student,
+            &working_memory,
             configured_max_tokens,
-            20,
-            &format!("course-automation-{}-summary-{}", luna_id, batch_index),
-            &label,
+            batch_index,
         )
         .await?;
-        working_memory =
-            normalize_course_analysis(result, &chrono::Local::now().format("%Y-%m-%d").to_string());
+        working_memory = next_memory;
     }
     Ok(working_memory)
+}
+
+async fn summarize_batch_with_agent(
+    provider: &AgentProvider,
+    luna_id: &str,
+    course_name: &str,
+    batch: &[&DocumentAnalysis],
+    student: &Value,
+    working_memory: &AgentCourseAnalysis,
+    configured_max_tokens: u32,
+    batch_index: usize,
+) -> Result<(AgentCourseAnalysis, AiUsageEstimate), String> {
+    let input = context::SummaryInput {
+        current_local_time: chrono::Local::now().format("%Y-%m-%d %H:%M").to_string(),
+        course_id: luna_id,
+        course_name,
+        student,
+        previous_course_analysis: working_memory,
+        new_or_changed_documents: batch
+            .iter()
+            .copied()
+            .map(context::CompactAnalysis::from)
+            .collect(),
+    };
+    let label = format!("最終まとめ batch {}", batch_index + 1);
+    let response: PlusJsonResponse<AgentCourseAnalysis> = request_plus_json(
+        provider,
+        context::SUMMARY_SYSTEM_PROMPT,
+        serde_json::to_string(&input).map_err(|error| error.to_string())?,
+        Vec::new(),
+        configured_max_tokens,
+        20,
+        &format!("course-automation-{}-summary-{}", luna_id, batch_index),
+        &label,
+    )
+    .await?;
+    Ok((
+        normalize_course_analysis(
+            response.value,
+            &working_memory.archived_context,
+            &chrono::Local::now().format("%Y-%m-%d").to_string(),
+        ),
+        response.usage,
+    ))
+}
+
+struct PlusJsonResponse<T> {
+    value: T,
+    usage: AiUsageEstimate,
 }
 
 async fn request_plus_json<T: DeserializeOwned>(
@@ -2140,8 +2321,9 @@ async fn request_plus_json<T: DeserializeOwned>(
     think_budget_pct: u32,
     gen_id: &str,
     label: &str,
-) -> Result<T, String> {
+) -> Result<PlusJsonResponse<T>, String> {
     context::log_request_size(label, instructions, &input);
+    let prompt_tokens = context::estimate_tokens(instructions) + context::estimate_tokens(&input);
     let mut last_error = String::new();
     for attempt in 1..=PLUS_AI_ATTEMPTS {
         let request = provider.plan(
@@ -2175,6 +2357,9 @@ async fn request_plus_json<T: DeserializeOwned>(
                         PLUS_AI_ATTEMPTS,
                         last_error
                     );
+                    if !plus_error_allows_retry(&last_error) {
+                        return Err(last_error);
+                    }
                     if attempt < PLUS_AI_ATTEMPTS {
                         tokio::time::sleep(Duration::from_millis(750)).await;
                     }
@@ -2191,16 +2376,14 @@ async fn request_plus_json<T: DeserializeOwned>(
                         attempt,
                         PLUS_AI_ATTEMPTS
                     );
-                    if attempt < PLUS_AI_ATTEMPTS {
-                        tokio::time::sleep(Duration::from_millis(750)).await;
-                    }
-                    continue;
+                    return Err(last_error);
                 }
             };
+        let response_tokens = context::estimate_tokens(&response);
         log::info!(
             "[course_automation] {} response size: {} tokens",
             label,
-            context::estimate_tokens(&response)
+            response_tokens
         );
         let Some(json_text) = extract_json_object(&response) else {
             last_error = format!("{}の結果に JSON がありません", label);
@@ -2216,7 +2399,19 @@ async fn request_plus_json<T: DeserializeOwned>(
             continue;
         };
         match serde_json::from_str(json_text) {
-            Ok(output) => return Ok(output),
+            Ok(output) => {
+                return Ok(PlusJsonResponse {
+                    value: output,
+                    usage: AiUsageEstimate {
+                        at: epoch_secs(),
+                        label: label.to_string(),
+                        prompt_tokens,
+                        response_tokens,
+                        max_tokens,
+                        attempts: attempt,
+                    },
+                })
+            }
             Err(error) => {
                 last_error = format!("{} JSON 解析失敗: {}", label, error);
                 log::warn!(
@@ -2233,6 +2428,10 @@ async fn request_plus_json<T: DeserializeOwned>(
         }
     }
     Err(last_error)
+}
+
+fn plus_error_allows_retry(error: &str) -> bool {
+    !error.contains("自動再試行しません") && !error.contains("途中で中断")
 }
 
 fn document_label(document: &AnalysisDocument) -> String {
@@ -2311,13 +2510,35 @@ fn normalize_document_agent_output(mut output: DocumentAgentOutput) -> DocumentA
     output
 }
 
-fn normalize_course_analysis(mut analysis: AgentCourseAnalysis, today: &str) -> AgentCourseAnalysis {
+fn normalize_course_analysis(
+    mut analysis: AgentCourseAnalysis,
+    previous_archive: &[ArchivedGroup],
+    today: &str,
+) -> AgentCourseAnalysis {
     analysis.summary = truncate_chars(analysis.summary.trim(), 240);
-    analysis.findings = normalize_findings(std::mem::take(&mut analysis.findings), today);
-    let (active, stale) = split_active_memory(std::mem::take(&mut analysis.standing_context), today);
+    analysis.findings = items::normalize_items(
+        std::mem::take(&mut analysis.findings),
+        "finding",
+        today,
+        280,
+    );
+    // Memory keeps its expired items: active stay, expired fold into the archive.
+    let (active, expired) = items::partition_by_expiry(
+        std::mem::take(&mut analysis.standing_context),
+        "memory",
+        today,
+        280,
+    );
     analysis.standing_context = active;
-    analysis.archived_context =
-        consolidate_archive(std::mem::take(&mut analysis.archived_context), stale);
+    let stale = expired.into_iter().map(|item| item.text).collect();
+    // Floor the archive with the previous one so history can't be lost if the
+    // model omits it; the model's groups merge on top (dedup keeps it tidy).
+    let merged_groups = previous_archive
+        .iter()
+        .cloned()
+        .chain(std::mem::take(&mut analysis.archived_context))
+        .collect();
+    analysis.archived_context = consolidate_archive(merged_groups, stale);
     analysis.seat.assignment = truncate_chars(analysis.seat.assignment.trim(), 80);
     analysis.seat.evidence = normalize_short_list(analysis.seat.evidence, 6, 280);
     let mut seen_prints = HashSet::new();
@@ -2327,6 +2548,7 @@ fn normalize_course_analysis(mut analysis: AgentCourseAnalysis, today: &str) -> 
     analysis.print_candidates.truncate(12);
     for candidate in &mut analysis.print_candidates {
         candidate.reason = truncate_chars(candidate.reason.trim(), 240);
+        candidate.category = truncate_chars(candidate.category.trim(), 80);
     }
     analysis
 }
@@ -2336,51 +2558,15 @@ fn normalize_course_analysis(mut analysis: AgentCourseAnalysis, today: &str) -> 
 /// groups on the next round; until then they live here so nothing is lost.
 const ARCHIVE_FALLBACK_LABEL: &str = "過去の項目";
 
-/// Splits the model's continuing memories by expiry: active items (empty or
-/// future `expires_at`) stay in the live list; items whose `expires_at` has
-/// passed are returned as `stale` text to be folded into the consolidated
-/// archive. Trims/dedupes; an unparseable expiry is treated as no expiry (kept
-/// active). No item cap.
-fn split_active_memory(
-    produced: Vec<StandingMemory>,
-    today: &str,
-) -> (Vec<StandingMemory>, Vec<String>) {
-    let today_date = chrono::NaiveDate::parse_from_str(today, "%Y-%m-%d").ok();
-    let is_expired = |item: &StandingMemory| {
-        match (
-            today_date,
-            chrono::NaiveDate::parse_from_str(item.expires_at.get(..10).unwrap_or(""), "%Y-%m-%d")
-                .ok(),
-        ) {
-            (Some(today), Some(expiry)) => expiry < today,
-            _ => false,
-        }
-    };
-
-    let mut active = Vec::new();
-    let mut stale = Vec::new();
-    let mut seen = HashSet::new();
-    for mut item in produced {
-        item.text = truncate_chars(item.text.trim(), 280);
-        item.expires_at = item.expires_at.trim().to_string();
-        if item.text.is_empty() || !seen.insert(item.text.clone()) {
-            continue;
-        }
-        if is_expired(&item) {
-            stale.push(item.text);
-        } else {
-            active.push(item);
-        }
-    }
-    (active, stale)
-}
-
 /// Normalizes the model's consolidated past-memory groups and folds in any
 /// freshly-expired `fallback_items` the model didn't group itself. Groups with
 /// the same label are merged, items are trimmed and deduped within a group, and
 /// empty groups are dropped. There is no cap — size is bounded by the model
 /// consolidating related items into compact sub-entries rather than by a limit.
-fn consolidate_archive(groups: Vec<ArchivedGroup>, fallback_items: Vec<String>) -> Vec<ArchivedGroup> {
+fn consolidate_archive(
+    groups: Vec<ArchivedGroup>,
+    fallback_items: Vec<String>,
+) -> Vec<ArchivedGroup> {
     fn insert(result: &mut Vec<ArchivedGroup>, label: &str, item: String) {
         let item = truncate_chars(item.trim(), 280);
         if item.is_empty() {
@@ -2417,44 +2603,137 @@ fn consolidate_archive(groups: Vec<ArchivedGroup>, fallback_items: Vec<String>) 
     result
 }
 
-/// Trims/dedupes 確認事項 and drops any past their `expires_at` (auto-expire,
-/// like memory). No item cap — the list is bounded by relevance, not a number.
-fn normalize_findings(findings: Vec<Finding>, today: &str) -> Vec<Finding> {
-    let today_date = chrono::NaiveDate::parse_from_str(today, "%Y-%m-%d").ok();
-    let mut out = Vec::new();
-    let mut seen = HashSet::new();
-    for mut finding in findings {
-        finding.text = truncate_chars(finding.text.trim(), 280);
-        finding.expires_at = finding.expires_at.trim().to_string();
-        if finding.text.is_empty() || !seen.insert(finding.text.clone()) {
-            continue;
-        }
-        if let (Some(today), Some(expiry)) = (
-            today_date,
-            chrono::NaiveDate::parse_from_str(finding.expires_at.get(..10).unwrap_or(""), "%Y-%m-%d")
-                .ok(),
-        ) {
-            if expiry < today {
-                continue;
-            }
-        }
-        out.push(finding);
-    }
-    out
-}
-
-/// Drops acknowledgements whose finding the model no longer produces, so the
-/// set stays bounded. An ack persists exactly while its finding keeps appearing.
-fn prune_acknowledged_findings(status: &mut CourseAutomationStatus) {
+/// Drops user-state entries whose item is no longer produced, so the overlay
+/// stays bounded. A state persists exactly while its item keeps appearing. As
+/// more facets adopt `Item`, add their ids to `present` here.
+fn prune_item_states(status: &mut CourseAutomationStatus) {
     let present: HashSet<String> = status
         .analysis
         .findings
         .iter()
-        .map(|finding| finding.text.clone())
+        .chain(status.analysis.standing_context.iter())
+        .map(|item| item.id.clone())
         .collect();
-    status
-        .acknowledged_findings
-        .retain(|text| present.contains(text));
+    items::prune_states(&mut status.item_states, &present);
+}
+
+/// The shared data-cache key the main TODO page reads detail-generated todos from
+/// (must match the frontend's `DETAIL_GENERATED_TODO_KEY`).
+const DETAIL_TODO_CACHE_KEY: &str = "detail_generated_todo";
+
+/// One detail-generated todo, mirroring the frontend `DetailGeneratedTodo` shape
+/// (snake_case JSON). `extra` preserves any fields the frontend owns so other
+/// todos round-trip untouched.
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
+struct DetailTodo {
+    id: String,
+    #[serde(default)]
+    title: String,
+    #[serde(default)]
+    course_name: String,
+    #[serde(default)]
+    content_type: String,
+    #[serde(default)]
+    deadline: String,
+    #[serde(default)]
+    source_url: String,
+    #[serde(default)]
+    source_excerpt: String,
+    #[serde(default)]
+    note: String,
+    #[serde(default)]
+    created_at: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    completed_at: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    archived_at: Option<String>,
+    #[serde(flatten)]
+    extra: serde_json::Map<String, Value>,
+}
+
+fn sensea_todo_id(luna_id: &str, item_id: &str) -> String {
+    format!("sensea-{}-{}", luna_id, item_id)
+}
+
+/// The TODO sink: reconciles the main TODO page with this course's action
+/// findings. Runs in the backend (not the dock), so delivery happens on every
+/// summary regardless of whether the UI is open. Adds a todo for each active
+/// action item, reactivates/updates existing ones, and completes orphans whose
+/// finding has expired, been acknowledged, or disappeared — keeping the two
+/// sides in sync. Emits a cache-update only when something changed so other
+/// windows refresh. Best-effort: failures are logged, never abort.
+fn sync_action_todos(app: &AppHandle, db: &Database, status: &CourseAutomationStatus) {
+    let owned_prefix = format!("sensea-{}-", status.luna_id);
+    let now = chrono::Utc::now().to_rfc3339();
+
+    // Active action items the student still needs to do.
+    let desired: Vec<&Item> = status
+        .analysis
+        .findings
+        .iter()
+        .filter(|item| {
+            item.flags.action
+                && !matches!(
+                    status.item_states.get(&item.id).map(String::as_str),
+                    Some("done") | Some("known")
+                )
+        })
+        .collect();
+
+    let mut todos: Vec<DetailTodo> = load_json(db, DETAIL_TODO_CACHE_KEY).unwrap_or_default();
+    let original = todos.clone();
+    // Drop legacy frontend-pushed SenseA todos (marked by note, not our id), so
+    // ownership moves cleanly to the backend without leaving duplicates.
+    todos.retain(|todo| !todo.note.starts_with("SenseA") || todo.id.starts_with("sensea-"));
+
+    // Reconcile our own todos: reactivate+update those still desired, complete
+    // those no longer desired.
+    for todo in todos.iter_mut() {
+        if !todo.id.starts_with(&owned_prefix) {
+            continue;
+        }
+        if let Some(item) = desired
+            .iter()
+            .find(|item| sensea_todo_id(&status.luna_id, &item.id) == todo.id)
+        {
+            todo.completed_at = None;
+            todo.archived_at = None;
+            todo.title = item.text.clone();
+            todo.deadline = item.expires_at.clone();
+        } else if todo.completed_at.is_none() {
+            todo.completed_at = Some(now.clone());
+        }
+    }
+
+    // Add todos for desired items we don't have yet.
+    let existing: HashSet<String> = todos.iter().map(|todo| todo.id.clone()).collect();
+    for item in &desired {
+        let id = sensea_todo_id(&status.luna_id, &item.id);
+        if existing.contains(&id) {
+            continue;
+        }
+        todos.push(DetailTodo {
+            id,
+            title: item.text.clone(),
+            course_name: status.course_name.clone(),
+            content_type: "課題".into(),
+            deadline: item.expires_at.clone(),
+            note: "SenseA 自動検知".into(),
+            created_at: now.clone(),
+            ..Default::default()
+        });
+    }
+
+    if todos == original {
+        return;
+    }
+    if let Err(error) = save_json(db, DETAIL_TODO_CACHE_KEY, &todos) {
+        log::warn!("[course_automation] todo sink write failed: {}", error);
+        return;
+    }
+    // Reuse the app's cache-sync event so the main TODO page rebuilds luna_todo
+    // (which re-merges the detail-generated todos we just wrote).
+    let _ = app.emit("backend-cache-updated", json!({ "keys": ["luna_todo"] }));
 }
 
 fn normalize_short_list(values: Vec<String>, max_items: usize, max_chars: usize) -> Vec<String> {
@@ -2510,21 +2789,57 @@ fn should_refresh_summary(
     previous_summary: &str,
     pending_count: usize,
     agent_requests_immediate_summary: bool,
+    agent_requests_observe_followup: bool,
 ) -> bool {
     previous_summary.trim().is_empty()
         || agent_requests_immediate_summary
+        || agent_requests_observe_followup
         || pending_count >= FULL_SUMMARY_NEW_ITEM_THRESHOLD
 }
 
+fn has_observe_followup(
+    analyses: &[DocumentAnalysis],
+    pending_summary_ids: &[String],
+    newly_analyzed_ids: &[String],
+) -> bool {
+    let has_new_pending_evidence = newly_analyzed_ids.iter().any(|id| {
+        pending_summary_ids
+            .iter()
+            .any(|pending_id| pending_id == id)
+    });
+    if !has_new_pending_evidence || pending_summary_ids.len() < 2 {
+        return false;
+    }
+    analyses.iter().any(|analysis| {
+        analysis.status == "done"
+            && analysis.trigger_decision == "observe"
+            && pending_summary_ids.iter().any(|id| id == &analysis.id)
+    })
+}
+
+/// Whitespace-collapsed, lowercased form for matching print categories, so minor
+/// naming drift ("ワークシート" vs "ワークシート ") doesn't re-ask for approval.
+/// Approvals still store the original string for display.
+fn normalize_category(category: &str) -> String {
+    category
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_lowercase()
+}
+
 async fn process_print_candidates(
+    app: &AppHandle,
+    db: &Database,
+    status: &mut CourseAutomationStatus,
     downloaded: &[(String, String, String, PathBuf, String)],
     candidates: &[PrintCandidate],
-    previous: &CourseAutomationStatus,
     approved_categories: &[String],
-) -> Vec<PrintResult> {
+) -> Result<Vec<PrintResult>, String> {
     let mut results = Vec::new();
     for candidate in candidates {
         let category = candidate.category.trim().to_string();
+        let category_key = normalize_category(&category);
         if candidate.confidence < PRINT_CONFIDENCE_THRESHOLD {
             results.push(PrintResult {
                 filename: candidate.filename.clone(),
@@ -2535,7 +2850,7 @@ async fn process_print_candidates(
             });
             continue;
         }
-        let Some((_, _, filename, path, _)) =
+        let Some((_, _, filename, path, source_fingerprint)) =
             downloaded.iter().find(|(_, _, filename, path, _)| {
                 filename == &candidate.filename
                     || path
@@ -2554,11 +2869,21 @@ async fn process_print_candidates(
             continue;
         };
         let path_text = path.to_string_lossy().to_string();
-        if previous.print_results.iter().any(|item| {
-            item.status == "printed"
-                && (item.path == path_text || item.filename == candidate.filename)
-        }) {
+        let action_key = print_action_key(filename, &path_text, source_fingerprint, &category);
+        let candidate_result = PrintResult {
+            action_key: action_key.clone(),
+            filename: filename.clone(),
+            path: path_text.clone(),
+            category: category.clone(),
+            ..Default::default()
+        };
+        if status
+            .print_results
+            .iter()
+            .any(|item| item.status == "printed" && print_results_match(item, &candidate_result))
+        {
             results.push(PrintResult {
+                action_key,
                 filename: filename.clone(),
                 path: path_text,
                 status: "already_printed".into(),
@@ -2567,34 +2892,72 @@ async fn process_print_candidates(
             });
             continue;
         }
+        if let Some(existing) = status
+            .print_results
+            .iter()
+            .find(|item| item.status == "unknown" && print_results_match(item, &candidate_result))
+        {
+            results.push(existing.clone());
+            continue;
+        }
+        if status.print_results.iter().any(|item| {
+            item.status == "dispatching" && print_results_match(item, &candidate_result)
+        }) {
+            let unknown = unknown_print_result(filename, path_text, category, action_key);
+            status.print_results =
+                merge_print_results(&status.print_results, vec![unknown.clone()]);
+            save_status_and_emit(app, db, status)?;
+            results.push(unknown);
+            continue;
+        }
         // Gate by per-category approval: an un-approved type waits for the user
         // to confirm once; an approved type prints automatically from then on.
-        let approved = !category.is_empty()
+        let approved = !category_key.is_empty()
             && approved_categories
                 .iter()
-                .any(|item| item.trim() == category);
+                .any(|item| normalize_category(item) == category_key);
         if !approved {
             results.push(PrintResult {
+                action_key,
                 filename: filename.clone(),
                 path: path_text,
                 status: "needs_confirmation".into(),
-                detail: "このタイプの印刷を許可すると、以降の同種ファイルは自動で印刷されます".into(),
+                detail: "このタイプの印刷を許可すると、以降の同種ファイルは自動で印刷されます"
+                    .into(),
                 category,
             });
             continue;
         }
-        results.push(print_one(filename, path, path_text, category).await);
+        let dispatching = dispatching_print_result(
+            filename,
+            path_text.clone(),
+            category.clone(),
+            action_key.clone(),
+        );
+        status.print_results = merge_print_results(&status.print_results, vec![dispatching]);
+        save_status_and_emit(app, db, status)?;
+        let result = print_one(filename, path, path_text, category, action_key).await;
+        status.print_results = merge_print_results(&status.print_results, vec![result.clone()]);
+        save_status_and_emit(app, db, status)?;
+        results.push(result);
     }
-    results
+    Ok(results)
 }
 
 /// Sends one already-located file to the printer and maps the outcome to a
 /// `PrintResult`. Shared by the automatic path and the manual confirm command.
-async fn print_one(filename: &str, path: &Path, path_text: String, category: String) -> PrintResult {
+async fn print_one(
+    filename: &str,
+    path: &Path,
+    path_text: String,
+    category: String,
+    action_key: String,
+) -> PrintResult {
     let path = path.to_path_buf();
     let result = tauri::async_runtime::spawn_blocking(move || print_verified(&path)).await;
     match result {
         Ok(Ok(detail)) => PrintResult {
+            action_key,
             filename: filename.to_string(),
             path: path_text,
             status: "printed".into(),
@@ -2602,6 +2965,7 @@ async fn print_one(filename: &str, path: &Path, path_text: String, category: Str
             category,
         },
         Ok(Err(error)) => PrintResult {
+            action_key,
             filename: filename.to_string(),
             path: path_text,
             status: "error".into(),
@@ -2609,6 +2973,7 @@ async fn print_one(filename: &str, path: &Path, path_text: String, category: Str
             category,
         },
         Err(error) => PrintResult {
+            action_key,
             filename: filename.to_string(),
             path: path_text,
             status: "error".into(),
@@ -2727,7 +3092,9 @@ fn load_status(db: &Database, luna_id: &str, course_name: &str) -> CourseAutomat
         });
     // Drop legacy run-log entries from before the per-operation format (they have
     // no `level`), so the log only shows the new file/operation lines.
-    status.run_log.retain(|entry| !entry.level.trim().is_empty());
+    status
+        .run_log
+        .retain(|entry| !entry.level.trim().is_empty());
     status
 }
 
@@ -2896,8 +3263,12 @@ mod tests {
         }];
 
         assert_eq!(
-            reusable_artifact_path(&artifacts, "material", "Week 1", "notes.pdf"),
+            reusable_artifact_path(&artifacts, "material", "Week 1", "notes.pdf", "remote-v1"),
             Some((path.clone(), "remote-v1".into()))
+        );
+        assert!(
+            reusable_artifact_path(&artifacts, "material", "Week 1", "notes.pdf", "remote-v2")
+                .is_none()
         );
         let _ = std::fs::remove_file(path);
     }
@@ -2944,7 +3315,8 @@ mod tests {
                 &status.artifacts,
                 "material",
                 "Week 1",
-                path.file_name().and_then(|name| name.to_str()).unwrap()
+                path.file_name().and_then(|name| name.to_str()).unwrap(),
+                "remote-v1",
             )
             .map(|item| item.0),
             Some(path.clone())
@@ -3014,13 +3386,19 @@ mod tests {
     }
 
     #[test]
+    fn completed_summary_batch_removes_only_consumed_pending_ids() {
+        let mut pending = vec!["a".into(), "b".into(), "c".into(), "d".into()];
+        remove_consumed_ids(&mut pending, &["b".into(), "d".into()]);
+        assert_eq!(pending, vec!["a", "c"]);
+    }
+
+    #[test]
     fn final_summary_input_uses_delta_and_excludes_ledger_metadata() {
         let previous = AgentCourseAnalysis {
             summary: "compressed working memory".into(),
-            standing_context: vec![StandingMemory {
+            standing_context: vec![Item {
                 text: "keep this context".into(),
-                expires_at: String::new(),
-                urgent: false,
+                ..Default::default()
             }],
             ..Default::default()
         };
@@ -3066,16 +3444,15 @@ mod tests {
                     "eighth",
                 ]
                 .into_iter()
-                .map(|text| Finding {
+                .map(|text| Item {
                     text: text.to_string(),
                     ..Default::default()
                 })
                 .collect(),
                 standing_context: (0..20)
-                    .map(|index| StandingMemory {
+                    .map(|index| Item {
                         text: format!("context-{index}"),
-                        expires_at: String::new(),
-                        urgent: false,
+                        ..Default::default()
                     })
                     .collect(),
                 seat: SeatConclusion {
@@ -3085,6 +3462,7 @@ mod tests {
                 },
                 ..Default::default()
             },
+            &[],
             "2026-06-17",
         );
 
@@ -3098,36 +3476,31 @@ mod tests {
     }
 
     #[test]
-    fn split_active_memory_separates_expired_from_active() {
-        let (active, stale) = split_active_memory(
+    fn memory_partition_separates_expired_from_active() {
+        let memory = |text: &str, expires_at: &str| Item {
+            text: text.into(),
+            expires_at: expires_at.into(),
+            ..Default::default()
+        };
+        let (active, expired) = items::partition_by_expiry(
             vec![
-                StandingMemory {
-                    text: "expired".into(),
-                    expires_at: "2026-06-10".into(),
-                    urgent: false,
-                },
-                StandingMemory {
-                    text: "today still valid".into(),
-                    expires_at: "2026-06-17".into(),
-                    urgent: false,
-                },
-                StandingMemory {
-                    text: "future".into(),
-                    expires_at: "2026-12-01".into(),
-                    urgent: false,
-                },
-                StandingMemory {
-                    text: "standing rule".into(),
-                    expires_at: String::new(),
-                    urgent: false,
-                },
+                memory("expired", "2026-06-10"),
+                memory("today still valid", "2026-06-17"),
+                memory("future", "2026-12-01"),
+                memory("standing rule", ""),
             ],
+            "memory",
             "2026-06-17",
+            280,
         );
 
         let active_texts: Vec<&str> = active.iter().map(|item| item.text.as_str()).collect();
-        assert_eq!(active_texts, vec!["today still valid", "future", "standing rule"]);
-        assert_eq!(stale, vec!["expired"]);
+        assert_eq!(
+            active_texts,
+            vec!["today still valid", "future", "standing rule"]
+        );
+        let expired_texts: Vec<&str> = expired.iter().map(|item| item.text.as_str()).collect();
+        assert_eq!(expired_texts, vec!["expired"]);
     }
 
     #[test]
@@ -3159,8 +3532,22 @@ mod tests {
     }
 
     #[test]
-    fn standing_memory_accepts_legacy_string_form() {
-        let parsed: Vec<StandingMemory> =
+    fn archive_floor_restores_history_when_model_omits_it() {
+        let previous = vec![ArchivedGroup {
+            label: "完了した課題".into(),
+            items: vec!["第1回レポート".into()],
+        }];
+        // Model returned an analysis with NO archivedContext — history must survive.
+        let analysis =
+            normalize_course_analysis(AgentCourseAnalysis::default(), &previous, "2026-06-19");
+        assert_eq!(analysis.archived_context.len(), 1);
+        assert_eq!(analysis.archived_context[0].label, "完了した課題");
+        assert_eq!(analysis.archived_context[0].items, vec!["第1回レポート"]);
+    }
+
+    #[test]
+    fn memory_items_accept_legacy_string_form() {
+        let parsed: Vec<Item> =
             serde_json::from_str(r#"["legacy", {"text": "new", "expiresAt": "2026-09-01"}]"#)
                 .expect("deserialize mixed standing context");
         assert_eq!(parsed[0].text, "legacy");
@@ -3170,7 +3557,7 @@ mod tests {
     }
 
     #[test]
-    fn successful_download_identity_is_reused_even_if_remote_metadata_changes() {
+    fn fingerprinted_download_is_not_reused_when_remote_version_changes() {
         let path = std::env::temp_dir().join(format!("course-plus-{}.pdf", uuid::Uuid::new_v4()));
         std::fs::write(&path, b"persisted").expect("write cached file");
         let artifacts = vec![CourseArtifactRecord {
@@ -3184,9 +3571,43 @@ mod tests {
             ..Default::default()
         }];
 
-        let reused = reusable_artifact_path(&artifacts, "material", "Renamed Week", "notes.pdf")
-            .expect("successful download must persist");
+        let reused = reusable_artifact_path(
+            &artifacts,
+            "material",
+            "Renamed Week",
+            "notes.pdf",
+            "first-success",
+        )
+        .expect("same remote version can reuse");
         assert_eq!(reused, (path.clone(), "first-success".into()));
+        assert!(reusable_artifact_path(
+            &artifacts,
+            "material",
+            "Renamed Week",
+            "notes.pdf",
+            "changed"
+        )
+        .is_none());
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn legacy_download_without_fingerprint_can_migrate_once() {
+        let path = std::env::temp_dir().join(format!("course-plus-{}.pdf", uuid::Uuid::new_v4()));
+        std::fs::write(&path, b"persisted").expect("write cached file");
+        let artifacts = vec![CourseArtifactRecord {
+            id: artifact_id("legacy", "notes.pdf"),
+            kind: "legacy".into(),
+            filename: "notes.pdf".into(),
+            path: path.to_string_lossy().to_string(),
+            status: "downloaded".into(),
+            ..Default::default()
+        }];
+
+        let reused =
+            reusable_artifact_path(&artifacts, "material", "Week 1", "notes.pdf", "current-v1")
+                .expect("legacy no-fingerprint cache can be migrated");
+        assert_eq!(reused, (path.clone(), String::new()));
         let _ = std::fs::remove_file(path);
     }
 
@@ -3199,7 +3620,10 @@ mod tests {
             "remote-v1",
             "temporary",
         )];
-        assert!(reusable_artifact_path(&artifacts, "material", "Week 1", "notes.pdf").is_none());
+        assert!(
+            reusable_artifact_path(&artifacts, "material", "Week 1", "notes.pdf", "remote-v1")
+                .is_none()
+        );
 
         upsert_artifact(
             &mut artifacts,
@@ -3334,10 +3758,41 @@ mod tests {
 
     #[test]
     fn comprehensive_summary_waits_for_enough_new_items() {
-        assert!(!should_refresh_summary("existing context", 3, false));
-        assert!(should_refresh_summary("existing context", 4, false));
-        assert!(should_refresh_summary("existing context", 1, true));
-        assert!(should_refresh_summary("", 1, false));
+        assert!(!should_refresh_summary("existing context", 3, false, false));
+        assert!(should_refresh_summary("existing context", 4, false, false));
+        assert!(should_refresh_summary("existing context", 1, true, false));
+        assert!(should_refresh_summary("existing context", 1, false, true));
+        assert!(should_refresh_summary("", 1, false, false));
+    }
+
+    #[test]
+    fn observe_decision_waits_until_followup_evidence_arrives() {
+        let analyses = vec![
+            DocumentAnalysis {
+                id: "watch".into(),
+                status: "done".into(),
+                trigger_decision: "observe".into(),
+                observation_context: "次回資料と照合".into(),
+                ..Default::default()
+            },
+            DocumentAnalysis {
+                id: "later".into(),
+                status: "done".into(),
+                trigger_decision: "routine".into(),
+                ..Default::default()
+            },
+        ];
+
+        assert!(!has_observe_followup(
+            &analyses,
+            &["watch".into()],
+            &["watch".into()]
+        ));
+        assert!(has_observe_followup(
+            &analyses,
+            &["watch".into(), "later".into()],
+            &["later".into()]
+        ));
     }
 
     #[test]
@@ -3348,8 +3803,17 @@ mod tests {
     }
 
     #[test]
+    fn plus_retry_policy_avoids_likely_duplicate_generations() {
+        assert!(!plus_error_allows_retry(
+            "AI応答の受信が途中で中断されました。重複生成を避けるため自動再試行しません"
+        ));
+        assert!(plus_error_allows_retry("リクエスト失敗: connection reset"));
+    }
+
+    #[test]
     fn printed_results_are_persistent_and_only_failures_are_retryable() {
         let printed = PrintResult {
+            action_key: "print-v1".into(),
             filename: "handout.pdf".into(),
             path: "/tmp/handout.pdf".into(),
             status: "printed".into(),
@@ -3359,6 +3823,7 @@ mod tests {
         let merged = merge_print_results(
             std::slice::from_ref(&printed),
             vec![PrintResult {
+                action_key: "print-v1".into(),
                 filename: "handout.pdf".into(),
                 path: "/tmp/handout.pdf".into(),
                 status: "error".into(),
@@ -3374,6 +3839,10 @@ mod tests {
         }]));
         assert!(!has_retryable_print_failure(&[PrintResult {
             status: "skipped_low_confidence".into(),
+            ..Default::default()
+        }]));
+        assert!(!has_retryable_print_failure(&[PrintResult {
+            status: "unknown".into(),
             ..Default::default()
         }]));
     }
@@ -3397,6 +3866,98 @@ mod tests {
         assert_eq!(merged.len(), 2);
         assert!(merged.iter().any(|item| item.filename == "old.pdf"));
         assert!(merged.iter().any(|item| item.filename == "new.pdf"));
+    }
+
+    #[test]
+    fn print_category_approval_uses_normalized_category() {
+        assert_eq!(
+            normalize_category(" ワークシート   小テスト "),
+            normalize_category("ワークシート 小テスト")
+        );
+        assert!(["worksheet".to_string()]
+            .iter()
+            .any(|item| normalize_category(item) == normalize_category("WORKSHEET")));
+    }
+
+    #[test]
+    fn print_action_key_follows_source_version() {
+        let first = print_action_key(
+            "worksheet.pdf",
+            "/tmp/worksheet.pdf",
+            "remote-v1",
+            "課題用紙",
+        );
+        let same = print_action_key(
+            "worksheet.pdf",
+            "/elsewhere/worksheet.pdf",
+            "remote-v1",
+            " 課題用紙 ",
+        );
+        let revised = print_action_key(
+            "worksheet.pdf",
+            "/tmp/worksheet.pdf",
+            "remote-v2",
+            "課題用紙",
+        );
+
+        assert_eq!(first, same);
+        assert_ne!(first, revised);
+    }
+
+    #[test]
+    fn print_merge_uses_action_key_before_filename_fallback() {
+        let first = PrintResult {
+            action_key: "source-v1".into(),
+            filename: "worksheet.pdf".into(),
+            path: "/tmp/worksheet.pdf".into(),
+            status: "printed".into(),
+            ..Default::default()
+        };
+        let revised = PrintResult {
+            action_key: "source-v2".into(),
+            filename: "worksheet.pdf".into(),
+            path: "/tmp/worksheet.pdf".into(),
+            status: "needs_confirmation".into(),
+            ..Default::default()
+        };
+
+        let merged = merge_print_results(std::slice::from_ref(&first), vec![revised.clone()]);
+
+        assert_eq!(merged, vec![first, revised]);
+    }
+
+    #[test]
+    fn stale_dispatching_print_becomes_unknown_without_auto_retry() {
+        let mut status = CourseAutomationStatus {
+            print_results: vec![PrintResult {
+                action_key: "print-action".into(),
+                filename: "worksheet.pdf".into(),
+                status: "dispatching".into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+
+        assert!(settle_stale_print_dispatches(&mut status));
+        assert_eq!(status.print_results[0].status, "unknown");
+        assert!(!has_retryable_print_failure(&status.print_results));
+    }
+
+    #[test]
+    fn ai_usage_log_is_bounded() {
+        let mut status = CourseAutomationStatus::default();
+        for index in 0..45 {
+            push_ai_usage(
+                &mut status,
+                AiUsageEstimate {
+                    label: format!("request-{index}"),
+                    ..Default::default()
+                },
+            );
+        }
+
+        assert_eq!(status.ai_usage.len(), 40);
+        assert_eq!(status.ai_usage[0].label, "request-5");
     }
 
     #[test]
@@ -3465,7 +4026,7 @@ mod tests {
             summary: "Act now".into(),
             findings: ["First", "Second", "Third", "Must not appear"]
                 .into_iter()
-                .map(|text| Finding {
+                .map(|text| Item {
                     text: text.to_string(),
                     ..Default::default()
                 })

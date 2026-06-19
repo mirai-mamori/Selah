@@ -402,28 +402,6 @@ fn extract_quill_text(html: &str) -> Option<String> {
     extract_quill_plain_text(json_str)
 }
 
-/// Extract all Quill texts from the full page HTML
-fn extract_all_quill_texts(html: &str) -> Vec<String> {
-    let marker = "setJsonData(\"";
-    let mut results = Vec::new();
-    let mut search = html;
-    while let Some(pos) = search.find(marker) {
-        let rest = &search[pos + marker.len()..];
-        // Try both closing patterns
-        let end = rest.find("\", '").or_else(|| rest.find("\");"));
-        if let Some(end) = end {
-            let json_str = &rest[..end];
-            if let Some(text) = extract_quill_plain_text(json_str) {
-                results.push(text);
-            }
-            search = &rest[end..];
-        } else {
-            break;
-        }
-    }
-    results
-}
-
 /// Try multiple CSS selectors and return the first non-empty text match.
 fn try_selectors_text(doc: &Html, selectors: &[&str]) -> String {
     for sel_str in selectors {
@@ -674,6 +652,28 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_announcement_detail_preserves_quill_image_embeds() {
+        let html = r#"
+            <div id="osiraseTitle">画像つきのお知らせ</div>
+            <div class="contents-detail contents-vertical">
+              <div class="contents-header-txt"><span class="bold-txt">内容</span></div>
+              <div class="contents-input-area">
+                <script>
+                  _QuillUtil.infoBody.setJsonData("{\"ops\":[{\"insert\":\"座席表です。\\n\"},{\"insert\":{\"image\":\"/lms/information/file/view/sample.png\"},\"attributes\":{\"alt\":\"座席表\"}},{\"insert\":\"\\n\"}]}", 'reference');
+                </script>
+              </div>
+            </div>
+        "#;
+
+        let result = parse_luna_announcement_detail(html);
+        assert_eq!(result.title, "画像つきのお知らせ");
+        assert_eq!(result.sections.len(), 1);
+        assert!(result.sections[0]
+            .body
+            .contains("<img src=\"/lms/information/file/view/sample.png\" alt=\"座席表\">"));
+    }
+
+    #[test]
     fn test_parse_detail_page_ignores_unrelated_page_quill() {
         let html = r#"
             <html>
@@ -712,6 +712,33 @@ mod tests {
             .meta
             .iter()
             .any(|(k, v)| k == "提出期限" && v == "2026/04/30 23:59"));
+    }
+
+    #[test]
+    fn test_parse_detail_page_preserves_quill_image_embeds() {
+        let html = r#"
+            <html>
+              <head><title>図解資料</title></head>
+              <body>
+                <div class="course-title-txt">情報処理</div>
+                <div class="contents-title-txt">図解資料</div>
+                <div class="contents-detail contents-vertical">
+                  <div class="contents-header-txt"><span class="bold-txt">内容</span></div>
+                  <div class="contents-input-area">
+                    <script>
+                      _QuillUtil.materialBody.setJsonData("{\"ops\":[{\"insert\":\"下の図を確認してください。\\n\"},{\"insert\":{\"image\":\"/lms/course/file/image/sample.png\"},\"attributes\":{\"alt\":\"図1\"}},{\"insert\":\"\\n\"}]}", 'reference');
+                    </script>
+                  </div>
+                </div>
+              </body>
+            </html>
+        "#;
+
+        let result = parse_luna_detail_page(html);
+        assert_eq!(result.sections.len(), 1);
+        assert!(result.sections[0]
+            .body
+            .contains("<img src=\"/lms/course/file/image/sample.png\" alt=\"図1\">"));
     }
 
     #[test]

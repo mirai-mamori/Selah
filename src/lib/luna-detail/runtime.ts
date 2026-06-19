@@ -30,10 +30,28 @@ function autoLinkEscaped(value: string): string {
   );
 }
 
-function autoLinkSanitizedHtml(value: string): string {
+function normalizeRichMediaUrl(value: string): string {
+  const trimmed = value.trim();
+  if (!trimmed) return "";
+  if (/^(?:https?:|data:|blob:|mailto:|tel:|#)/i.test(trimmed)) return trimmed;
+  if (trimmed.startsWith("/lms/")) return normalizeLunaUrl(trimmed);
+  return trimmed;
+}
+
+function enhanceSanitizedHtml(value: string): string {
   if (typeof document === "undefined" || !value) return value;
   const template = document.createElement("template");
   template.innerHTML = value;
+
+  for (const image of Array.from(template.content.querySelectorAll("img[src]"))) {
+    const src = image.getAttribute("src") || "";
+    const normalized = normalizeRichMediaUrl(src);
+    if (normalized) image.setAttribute("src", normalized);
+    if (!image.getAttribute("alt")) image.setAttribute("alt", "");
+    image.setAttribute("loading", "lazy");
+    image.setAttribute("decoding", "async");
+  }
+
   const walker = document.createTreeWalker(template.content, NodeFilter.SHOW_TEXT);
   const nodes: Text[] = [];
   while (walker.nextNode()) {
@@ -59,8 +77,8 @@ export function richText(value: string | undefined | null): string {
         .replace(/\n{2,}/g, "</p><p>")
         .replace(/\n/g, "<br>");
   const wrapped = raw.startsWith("<") ? raw : `<p>${raw}</p>`;
-  return autoLinkSanitizedHtml(DOMPurify.sanitize(wrapped, {
-    ADD_ATTR: ["target", "rel", "class", "style"],
+  return enhanceSanitizedHtml(DOMPurify.sanitize(wrapped, {
+    ADD_ATTR: ["target", "rel", "class", "style", "loading", "decoding"],
     FORBID_ATTR: ["onerror", "onload", "onclick", "onmouseover", "onfocus"],
   }));
 }

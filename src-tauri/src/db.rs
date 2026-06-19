@@ -187,8 +187,10 @@ impl Database {
     fn init_tables(&self) -> Result<(), String> {
         let conn = self.conn.lock().map_err(|e| format!("DB lock: {}", e))?;
 
-        // Migration: always drop everything and recreate from scratch.
-        // Data is re-fetched from KGC/Luna on next sync, so no user data is lost.
+        // Migration: refresh the schedule-derived tables and keep generic
+        // data_cache intact. data_cache now contains durable user/app state
+        // (SenseA memory, generated todos, preferences) that cannot be safely
+        // re-fetched from KGC/Luna.
         let user_version: i32 = conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap_or(0);
@@ -205,7 +207,6 @@ impl Database {
                 DROP TABLE IF EXISTS kgc_course_details;
                 DROP TABLE IF EXISTS ai_schedule_cache;
                 DROP TABLE IF EXISTS schedule_snapshot_state;
-                DROP TABLE IF EXISTS data_cache;
             ",
             )
             .map_err(|e| format!("Migration failed: {}", e))?;

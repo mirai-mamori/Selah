@@ -392,19 +392,9 @@ async fn send_non_streaming_request(
         let status = resp.status();
         match resp.text().await {
             Ok(text) => return Ok((status, text)),
-            Err(error) if attempt < NON_STREAMING_ATTEMPTS => {
-                log::warn!(
-                    "plan({}): response body read failed on attempt {}/{}; retrying: {}",
-                    provider,
-                    attempt,
-                    NON_STREAMING_ATTEMPTS,
-                    error
-                );
-                tokio::time::sleep(std::time::Duration::from_millis(750)).await;
-            }
             Err(error) => {
                 return Err(format!(
-                    "AI応答の受信が途中で中断されました。再試行してください: {}",
+                    "AI応答の受信が途中で中断されました。重複生成を避けるため自動再試行しません: {}",
                     error
                 ));
             }

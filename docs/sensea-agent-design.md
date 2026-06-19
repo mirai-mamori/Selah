@@ -56,9 +56,12 @@ duplicate items must disappear. Audit memory is never used as a prompt dump.
 4. Large delta sets are folded recursively in bounded batches.
 5. Model output is normalized before persistence, so verbose violations are not
    replayed forever.
-6. Request and response sizes are logged for regression measurement.
-7. Retries reuse the same compact request and are limited to transient failure
-   recovery.
+6. Request and response sizes are logged and the latest bounded estimates are
+   persisted on the course status for timeout and limit debugging.
+7. Retries reuse the same compact request and are limited to failures that are
+   unlikely to have completed a generation. Response-body interruptions and
+   SenseA-level timeouts are not automatically replayed, because they may
+   already have consumed provider tokens.
 
 The current estimator is deliberately conservative for mixed Japanese and
 English text. Provider-side token usage should replace it when uniformly
@@ -74,17 +77,34 @@ SenseA may act automatically only where the action is narrow and verifiable:
   the candidate passes the confidence threshold.
 
 Every action uses a persistent identity. Successful actions are not repeated;
-failed actions remain pending and retry on a later run. Arbitrary external
-actions require a future permission and confirmation design.
+failed actions remain pending and retry on a later run. Print actions also write
+a dispatch ledger before calling the OS printer. If the process loses the final
+receipt after dispatch, the action becomes `unknown` and is not automatically
+replayed, because duplicate paper output is worse than a visible confirmation
+request. Arbitrary external actions require a future permission and confirmation
+design.
 
 ## Failure Invariants
 
 - A successful download or analysis is reused and never replaced by a later
   transient failure.
+- A fingerprinted download is reused only when the current source fingerprint
+  matches. Filename-only reuse is reserved for legacy records that do not yet
+  have a fingerprint, and only to migrate them forward.
 - A changed document version can trigger a new notification.
 - A failed notification or print remains retryable.
+- A dispatched print whose final receipt is unknown remains visible but is not
+  treated as retryable.
 - A process-level failure cannot leave the global run lock permanently set.
-- A failed comprehensive summary leaves its pending delta IDs intact.
+- A comprehensive summary checkpoints each successful batch: consumed pending
+  IDs are removed and the updated working memory is saved before the next batch.
+  If a later batch fails, the next run retries only the remaining deltas.
+- A single `observe` document can wait, but an unresolved observed item plus
+  later pending evidence triggers a comprehensive re-evaluation.
+- Time passing is deterministic: expired working-memory items are pruned or
+  archived on a normal check even when no AI summary runs.
+- Generic `data_cache` is durable app/user state and must survive schema
+  migrations of schedule-derived tables.
 - No AI response may directly bypass deterministic action checks.
 
 ## Scheduling and Concurrency

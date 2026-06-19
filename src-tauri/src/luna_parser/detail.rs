@@ -14,8 +14,8 @@ pub use model::{LunaAttachment, LunaDetailPage, LunaDetailSection};
 pub(crate) use notice_filter::is_blacklisted_system_notice_text;
 use notice_filter::sanitize_blacklisted_notice_body;
 pub(super) use quill::{
-    extract_first_quill_rich_html, extract_named_quill_payloads, extract_named_quill_text,
-    extract_quill_rich_html,
+    extract_all_quill_rich_html, extract_first_quill_rich_html, extract_named_quill_payloads,
+    extract_named_quill_text, extract_quill_rich_html,
 };
 
 fn normalize_detail_text(s: &str) -> String {
@@ -91,7 +91,7 @@ fn push_unique_section(
 
 fn fallback_single_quill_section(html: &str) -> Option<String> {
     let mut unique = Vec::new();
-    for text in extract_all_quill_texts(html) {
+    for text in extract_all_quill_rich_html(html) {
         let trimmed = text.trim();
         if trimmed.len() <= 5 {
             continue;
@@ -169,7 +169,7 @@ pub fn parse_luna_detail_page(html: &str) -> LunaDetailPage {
                 .unwrap_or_default();
             let row_html = row.html();
 
-            let row_quill_texts = extract_all_quill_texts(&row_html);
+            let row_quill_texts = extract_all_quill_rich_html(&row_html);
 
             if !label.is_empty() && is_body_label(&label) {
                 let heading = if label == "内容" {
@@ -202,7 +202,7 @@ pub fn parse_luna_detail_page(html: &str) -> LunaDetailPage {
                 meta.push((label, value));
             } else if !label.is_empty() {
                 // Value might be in Quill rich text (empty div + script)
-                if let Some(quill_text) = extract_quill_text(&row_html) {
+                if let Some(quill_text) = extract_first_quill_rich_html(&row_html) {
                     meta.push((label, quill_text));
                 }
             }
@@ -542,7 +542,7 @@ pub fn parse_luna_announcement_detail(html: &str) -> LunaDetailPage {
                 if !value.is_empty() {
                     push_unique_section(&mut sections, String::new(), value.clone());
                 }
-                for quill_text in extract_all_quill_texts(&row_html) {
+                for quill_text in extract_all_quill_rich_html(&row_html) {
                     push_unique_section(&mut sections, String::new(), quill_text);
                 }
                 continue;

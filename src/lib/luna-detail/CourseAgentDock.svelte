@@ -4,11 +4,7 @@
   import { onDestroy, onMount } from "svelte";
   import { fly } from "svelte/transition";
   import Icon from "../Icon.svelte";
-  import {
-    saveDetailGeneratedTodos,
-    getDetailGeneratedTodos,
-    completeDetailGeneratedTodo,
-  } from "../api";
+  import type { IconName } from "../Icon.svelte";
 
   interface CourseAutomationConfig {
     enabled: boolean;
@@ -41,14 +37,26 @@
     }>;
     analysis: {
       summary: string;
-      findings: Array<{ text: string; expiresAt?: string; action?: boolean }>;
-      standingContext: Array<{ text: string; expiresAt: string; urgent?: boolean }>;
+      findings: Array<{
+        id: string;
+        facet?: string;
+        text: string;
+        category?: string;
+        expiresAt?: string;
+        flags?: { action?: boolean; urgent?: boolean };
+      }>;
+      standingContext: Array<{
+        id: string;
+        text: string;
+        expiresAt?: string;
+        flags?: { action?: boolean; urgent?: boolean };
+      }>;
       archivedContext?: Array<{ label: string; items: string[] }>;
       seat: { assignment: string; evidence: string[]; confidence: number };
       printCandidates: Array<{ filename: string; reason: string; confidence: number }>;
     };
     printResults: Array<{ filename: string; status: string; detail: string; category?: string }>;
-    acknowledgedFindings?: string[];
+    itemStates?: Record<string, string>;
     runLog?: Array<{ at: number; level: string; message: string }>;
   }
 
@@ -172,7 +180,7 @@
       .filter((m) => !isExpired(m))
       // Time-critical memories (urgent) lead so the student sees them first.
       .slice()
-      .sort((a, b) => Number(b.urgent ?? false) - Number(a.urgent ?? false)),
+      .sort((a, b) => Number(b.flags?.urgent ?? false) - Number(a.flags?.urgent ?? false)),
   );
   // Past memory shown grouped under headings (完了した課題, etc.). Items whose
   // date just rolled past but the backend hasn't consolidated yet appear under
@@ -188,24 +196,25 @@
     }
     return groups;
   });
-  // 確認事項 carry an expiry (auto-drop once past) and an action flag. Items the
-  // user marked known/done (acknowledgedFindings) are hidden; action items lead.
-  const acknowledgedFindings = $derived(view?.status.acknowledgedFindings ?? []);
-  const isAcknowledged = (text: string) => acknowledgedFindings.includes(text);
+  // Unified per-item user-state overlay (id → "done"/"known"). 確認事項 carry an
+  // expiry (auto-drop once past) and an action flag. Items the user marked
+  // done/known are hidden; action items lead.
+  const itemStates = $derived(view?.status.itemStates ?? {});
+  const isHandled = (id: string) => itemStates[id] === "done" || itemStates[id] === "known";
   const findings = $derived(
     (view?.status.analysis?.findings ?? [])
-      .filter((f) => !isExpired(f) && !isAcknowledged(f.text))
+      .filter((f) => !isExpired(f) && !isHandled(f.id))
       .slice()
-      .sort((a, b) => Number(b.action ?? false) - Number(a.action ?? false)),
+      .sort((a, b) => Number(b.flags?.action ?? false) - Number(a.flags?.action ?? false)),
   );
 
   const seat = $derived(view?.status.analysis?.seat);
   const seatConfidence = $derived(Math.round(Math.max(0, Math.min(1, seat?.confidence ?? 0)) * 100));
   const printResults = $derived(view?.status.printResults ?? []);
-  // Print failures (retryable) are surfaced on the 印刷 capsule itself, not on
-  // the control capsule.
+  // Print problems are surfaced on the 印刷 capsule itself, not on the control
+  // capsule. `unknown` is intentionally not auto-retried, but still needs attention.
   const printFailures = $derived(
-    printResults.filter((r) => r.status === "error" || r.status === "not_found").length,
+    printResults.filter((r) => r.status === "error" || r.status === "not_found" || r.status === "unknown").length,
   );
   // Files waiting for the user to approve their print type. The first file of a
   // type asks once; approving it auto-prints that category from then on.
@@ -228,14 +237,73 @@
 
   // Count shown next to a detail page's title (seat has no list, so null).
   const detailCount = $derived.by(() => {
-    switch (detail) {
-      case "findings": return findings.length;
-      case "standing": return standingContext.length;
-      case "print": return printResults.length;
-      case "documents": return analyzedDocs.length;
-      case "log": return runLog.length;
-      default: return null;
+    const counts: Partial<Record<DetailKey, number>> = {
+      findings: findings.length,
+      standing: standingContext.length,
+      print: printResults.length,
+      documents: analyzedDocs.length,
+      log: runLog.length,
+    };
+    return detail ? counts[detail] ?? null : null;
+  });
+
+  // ── Facet registry ───────────────────────────────────────────────────────
+  // The capsule row is data-driven: each "go" pill is one entry here, so adding
+  // a facet pill is a single array push rather than bespoke markup. The control
+  // pill and the highlight/確認事項 cards stay special-cased above.
+  type PillEntry = {
+    key: DetailKey;
+    icon: IconName;
+    label: string;
+    badge: string | number;
+    badgeClass?: string;
+    pillClass?: string;
+    title?: string;
+  };
+  const pills = $derived.by<PillEntry[]>(() => {
+    const out: PillEntry[] = [];
+    if (seat?.assignment) {
+      out.push({
+        key: "seat",
+        icon: "seat",
+        label: "座席",
+        badge: seat.assignment,
+        badgeClass: "sa-pill-val",
+        title: seat.assignment,
+      });
     }
+    if (standingContext.length) {
+      out.push({ key: "standing", icon: "note", label: "記憶", badge: standingContext.length });
+    }
+    if (printResults.length) {
+      if (printPending > 0) {
+        out.push({
+          key: "print",
+          icon: "printer",
+          label: "印刷",
+          badge: `${printPending} 件確認`,
+          badgeClass: "sa-pill-accent",
+          pillClass: "sa-pill-info",
+          title: `${printPending} 件が印刷の許可待ちです`,
+        });
+      } else if (printFailures > 0) {
+        out.push({
+          key: "print",
+          icon: "printer",
+          label: "印刷",
+          badge: `${printFailures} 件失敗`,
+          badgeClass: "sa-pill-warn",
+          pillClass: "sa-pill-attn",
+          title: `${printFailures} 件失敗・次回再試行します`,
+        });
+      } else {
+        out.push({ key: "print", icon: "printer", label: "印刷", badge: printResults.length });
+      }
+    }
+    if (analyzedDocs.length) {
+      out.push({ key: "documents", icon: "doc.search", label: "分析", badge: analyzedDocs.length });
+    }
+    return out;
   });
 
   $effect(() => {
@@ -264,6 +332,8 @@
       case "error": return { text: "印刷失敗", tone: "bad" };
       case "not_found": return { text: "対象不明", tone: "bad" };
       case "needs_confirmation": return { text: "確認待ち", tone: "info" };
+      case "dispatching": return { text: "送信中", tone: "info" };
+      case "unknown": return { text: "結果要確認", tone: "warn" };
       case "skipped_low_confidence": return { text: "確度不足で保留", tone: "warn" };
       default: return { text: status, tone: "warn" };
     }
@@ -358,32 +428,21 @@
     }
   }
 
-  // Mark a 確認事項 as known/done: the backend hides it (and won't re-list it
-  // while the model keeps producing it). For action items, also complete the
-  // matching task on the main TODO page so the two stay in sync.
+  // Mark a 確認事項 as done/known by its stable id: the backend hides it via the
+  // unified item-state overlay and, for action items, completes the matching task
+  // on the main TODO page (the backend TODO sink keeps the two in sync).
   let acknowledging = $state<string | null>(null);
-  async function acknowledgeFinding(finding: { text: string; action?: boolean }): Promise<void> {
+  async function acknowledgeFinding(finding: { id: string }): Promise<void> {
     if (acknowledging) return;
-    acknowledging = finding.text;
+    acknowledging = finding.id;
     error = "";
     try {
-      view = await invoke<CourseAutomationView>("course_automation_acknowledge_finding", {
+      view = await invoke<CourseAutomationView>("course_automation_set_item_state", {
         lunaId,
         courseName,
-        text: finding.text,
-        done: true,
+        id: finding.id,
+        state: "done",
       });
-      if (finding.action) {
-        try {
-          const todos = await getDetailGeneratedTodos();
-          const match = todos.find(
-            (t) => t.course_name === courseName && t.title === finding.text && !t.completed_at,
-          );
-          if (match) await completeDetailGeneratedTodo(match.id);
-        } catch {
-          /* todo sync is best-effort */
-        }
-      }
     } catch (cause) {
       error = String(cause);
       await load().catch(() => {});
@@ -391,29 +450,6 @@
       acknowledging = null;
     }
   }
-
-  // Action-required 確認事項 flow into the main TODO page automatically. Pushed
-  // whenever they change; saveDetailGeneratedTodos dedupes by course+title+
-  // deadline, so re-pushing is a no-op. A signature guard avoids redundant writes.
-  let lastTodoPushSig = "";
-  $effect(() => {
-    const actions = findings.filter((f) => f.action);
-    const sig = actions.map((f) => `${f.text}|${f.expiresAt ?? ""}`).join("\n");
-    if (sig === lastTodoPushSig) return;
-    lastTodoPushSig = sig;
-    if (!actions.length) return;
-    saveDetailGeneratedTodos(
-      actions.map((f) => ({
-        title: f.text,
-        course_name: courseName,
-        content_type: "課題",
-        deadline: f.expiresAt ?? "",
-        source_url: "",
-        source_excerpt: "",
-        note: "SenseA 自動検知",
-      })),
-    ).catch(() => {});
-  });
 
   // One document — lightweight; several may be in flight at once. Not gated on
   // status.running: if a full cycle is active the backend queue makes this wait
@@ -493,14 +529,14 @@
                 <li class="sa-row sa-row-find">
                   <span class="sa-row-ix">{i + 1}</span>
                   <p class="sa-row-text">
-                    {#if finding.action}<span class="sa-row-flag sa-row-flag-do">要対応</span>{/if}
+                    {#if finding.flags?.action}<span class="sa-row-flag sa-row-flag-do">要対応</span>{/if}
                     {finding.text}
                     {#if finding.expiresAt}<span class="sa-row-until">〜{finding.expiresAt}</span>{/if}
                   </p>
                   <button
                     class="sa-find-done"
                     type="button"
-                    disabled={acknowledging === finding.text}
+                    disabled={acknowledging === finding.id}
                     onclick={() => acknowledgeFinding(finding)}
                     title="完了 / 既知にする"
                     aria-label="完了 / 既知にする"
@@ -516,10 +552,10 @@
           {:else if detail === "standing"}
             <ul class="sa-rows">
               {#each standingContext as item}
-                <li class="sa-row sa-row-dim" class:sa-row-urgent={item.urgent}>
+                <li class="sa-row sa-row-dim" class:sa-row-urgent={item.flags?.urgent}>
                   <span class="sa-row-dot"></span>
                   <p class="sa-row-text">
-                    {#if item.urgent}<span class="sa-row-flag">要対応</span>{/if}
+                    {#if item.flags?.urgent}<span class="sa-row-flag">要対応</span>{/if}
                     {item.text}
                     {#if item.expiresAt}<span class="sa-row-until">〜{item.expiresAt}</span>{/if}
                   </p>
@@ -634,52 +670,20 @@
             <Icon name="arrow.clockwise" size={13} />
           </button>
         </div>
-        {#if seat?.assignment}
-          <button class="sa-pill sa-pill-go" data-cat="seat" type="button" onclick={() => (detail = "seat")} title={seat.assignment}>
-            <Icon name="seat" size={13} />
-            <span>座席</span>
-            <b class="sa-pill-val">{seat.assignment}</b>
-            <Icon name="chevron.right" size={12} />
-          </button>
-        {/if}
-        {#if standingContext.length}
-          <button class="sa-pill sa-pill-go" data-cat="standing" type="button" onclick={() => (detail = "standing")}>
-            <Icon name="note" size={13} />
-            <span>記憶</span>
-            <b>{standingContext.length}</b>
-            <Icon name="chevron.right" size={12} />
-          </button>
-        {/if}
-        {#if printResults.length}
+        {#each pills as pill (pill.key)}
           <button
-            class="sa-pill sa-pill-go"
-            class:sa-pill-info={printPending > 0}
-            class:sa-pill-attn={printPending === 0 && printFailures > 0}
-            data-cat="print"
+            class="sa-pill sa-pill-go {pill.pillClass ?? ''}"
+            data-cat={pill.key}
             type="button"
-            onclick={() => (detail = "print")}
-            title={printPending > 0 ? `${printPending} 件が印刷の許可待ちです` : printFailures > 0 ? `${printFailures} 件失敗・次回再試行します` : undefined}
+            onclick={() => (detail = pill.key)}
+            title={pill.title}
           >
-            <Icon name="printer" size={13} />
-            <span>印刷</span>
-            {#if printPending > 0}
-              <b class="sa-pill-accent">{printPending} 件確認</b>
-            {:else if printFailures > 0}
-              <b class="sa-pill-warn">{printFailures} 件失敗</b>
-            {:else}
-              <b>{printResults.length}</b>
-            {/if}
+            <Icon name={pill.icon} size={13} />
+            <span>{pill.label}</span>
+            <b class={pill.badgeClass}>{pill.badge}</b>
             <Icon name="chevron.right" size={12} />
           </button>
-        {/if}
-        {#if analyzedDocs.length}
-          <button class="sa-pill sa-pill-go" data-cat="documents" type="button" onclick={() => (detail = "documents")}>
-            <Icon name="doc.search" size={13} />
-            <span>分析</span>
-            <b>{analyzedDocs.length}</b>
-            <Icon name="chevron.right" size={12} />
-          </button>
-        {/if}
+        {/each}
       </div>
 
       {#if summary}

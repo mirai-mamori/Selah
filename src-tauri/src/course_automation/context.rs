@@ -151,9 +151,7 @@ pub(super) fn compact_student_profile(student: &Value) -> Value {
     Value::Object(compact)
 }
 
-pub(super) fn summary_batches<'a>(
-    analyses: &'a [DocumentAnalysis],
-) -> Vec<Vec<&'a DocumentAnalysis>> {
+pub(super) fn summary_batches(analyses: &[DocumentAnalysis]) -> Vec<Vec<&DocumentAnalysis>> {
     let mut batches = Vec::new();
     let mut current = Vec::new();
     let mut current_tokens = 0usize;

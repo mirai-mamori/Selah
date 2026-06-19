@@ -16,9 +16,9 @@ mod navigation;
 pub use downloads::*;
 pub use navigation::*;
 
-const LUNA_DETAIL_CACHE_VERSION: &str = "v2";
-const LUNA_REPORT_DETAIL_CACHE_VERSION: &str = "v1";
-const LUNA_ANNOUNCEMENT_CACHE_VERSION: &str = "v2";
+const LUNA_DETAIL_CACHE_VERSION: &str = "v3";
+const LUNA_REPORT_DETAIL_CACHE_VERSION: &str = "v2";
+const LUNA_ANNOUNCEMENT_CACHE_VERSION: &str = "v3";
 const LUNA_DETAIL_RETRY_ATTEMPTS: usize = 3;
 const LUNA_FORUM_FILE_MAX_BYTES: usize = 100 * 1024 * 1024;
 
