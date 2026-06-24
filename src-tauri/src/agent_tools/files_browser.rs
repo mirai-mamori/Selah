@@ -242,7 +242,10 @@ fn bind_pdfium() -> Result<pdfium_render::prelude::Pdfium, String> {
     if let Ok(dir) = std::env::var("SELAH_PDFIUM_DIR") {
         dirs.push(std::path::PathBuf::from(dir));
     }
-    dirs.push(std::path::PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/lib")));
+    dirs.push(std::path::PathBuf::from(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/lib"
+    )));
     if let Ok(exe) = std::env::current_exe() {
         if let Some(parent) = exe.parent() {
             dirs.push(parent.join("../Frameworks"));
@@ -928,67 +931,63 @@ pub(super) async fn download_all_luna_activity_attachments(
     contents: &crate::luna_parser::LunaCourseContents,
     activity_types: &[&str],
     reusable_paths: &std::collections::HashMap<String, super::ReusableCourseDownload>,
+    reusable_details: &std::collections::HashMap<String, super::ReusableActivityDetail>,
+    detail_cache_ttl_secs: i64,
+    now: i64,
+    force_detail_fetch: bool,
 ) -> Result<Vec<Value>, String> {
-    let db = app.state::<Database>();
-    let mut activities: Vec<(String, String, String)> = db
-        .get_all_luna_activities()
-        .unwrap_or_default()
-        .into_iter()
-        .filter(|activity| {
-            activity.luna_id == luna_id
-                && activity_types
-                    .iter()
-                    .any(|kind| activity.activity_type == *kind)
-                && !activity.detail_path.is_empty()
-        })
-        .map(|activity| (activity.activity_type, activity.title, activity.detail_path))
-        .collect();
-    if activity_types.contains(&"announcement") {
-        activities.extend(contents.announcements.iter().map(|announcement| {
-            (
-                "announcement".to_string(),
-                announcement.title.clone(),
-                format!(
-                    "/lms/coursetop/information/listdetail?idnumber={}&informationId={}",
-                    luna_id, announcement.info_id
-                ),
-            )
-        }));
-    }
-    if activity_types.contains(&"report") {
-        activities.extend(
-            contents
-                .reports
-                .iter()
-                .filter(|report| !report.url.trim().is_empty())
-                .map(|report| {
-                    let detail_path = report
-                        .url
-                        .strip_prefix(crate::config::LUNA_BASE)
-                        .unwrap_or(&report.url)
-                        .to_string();
-                    ("report".to_string(), report.title.clone(), detail_path)
-                }),
-        );
-    }
-    let mut seen = HashSet::new();
-    activities.retain(|(_, _, path)| seen.insert(path.clone()));
-
+    let activities = current_course_activity_sources(luna_id, contents, activity_types);
     let mut results = Vec::new();
     for (activity_type, title, detail_path) in activities {
+        let list_fingerprint =
+            activity_detail_list_fingerprint(&activity_type, &title, &detail_path)?;
+        if !force_detail_fetch {
+            if let Some(cached) = reusable_details.get(&detail_path).filter(|cached| {
+                cached_activity_detail_is_fresh(
+                    cached,
+                    &list_fingerprint,
+                    now,
+                    detail_cache_ttl_secs,
+                )
+            }) {
+                results.push(json!({
+                    "status": "detail_cached",
+                    "kind": &activity_type,
+                    "title": &title,
+                    "detail_path": &detail_path,
+                    "list_fingerprint": list_fingerprint,
+                    "source_fingerprint": &cached.source_fingerprint,
+                }));
+                continue;
+            }
+        }
         let html = match fetch_luna_detail_html_fresh(app, &detail_path).await {
             Ok(html) => html,
             Err(error) => {
-                let source_fingerprint = course_automation_source_fingerprint(&json!({
-                    "kind": &activity_type,
-                    "title": &title,
-                    "detailPath": &detail_path,
-                }))?;
+                if !force_detail_fetch {
+                    if let Some(cached) = reusable_details.get(&detail_path).filter(|cached| {
+                        cached_activity_detail_matches_source(cached, &list_fingerprint)
+                    }) {
+                        results.push(json!({
+                            "status": "detail_cached",
+                            "stale": true,
+                            "kind": &activity_type,
+                            "title": &title,
+                            "detail_path": &detail_path,
+                            "list_fingerprint": list_fingerprint,
+                            "source_fingerprint": &cached.source_fingerprint,
+                            "error": error,
+                        }));
+                        continue;
+                    }
+                }
                 results.push(json!({
                     "status": "detail_error",
                     "kind": &activity_type,
                     "title": &title,
-                    "source_fingerprint": source_fingerprint,
+                    "detail_path": &detail_path,
+                    "list_fingerprint": list_fingerprint,
+                    "source_fingerprint": list_fingerprint,
                     "error": error,
                 }));
                 continue;
@@ -1011,6 +1010,8 @@ pub(super) async fn download_all_luna_activity_attachments(
             "status": "detail",
             "kind": &activity_type,
             "title": &title,
+            "detail_path": &detail_path,
+            "list_fingerprint": list_fingerprint,
             "source_fingerprint": detail_source_fingerprint,
             "content": detail.sections.iter()
                 .map(|section| format!("{}\n{}", section.heading, section.body))
@@ -1081,6 +1082,75 @@ pub(super) async fn download_all_luna_activity_attachments(
         }
     }
     Ok(results)
+}
+
+fn current_course_activity_sources(
+    luna_id: &str,
+    contents: &crate::luna_parser::LunaCourseContents,
+    activity_types: &[&str],
+) -> Vec<(String, String, String)> {
+    let mut activities: Vec<(String, String, String)> = Vec::new();
+    if activity_types.contains(&"announcement") {
+        activities.extend(contents.announcements.iter().map(|announcement| {
+            (
+                "announcement".to_string(),
+                announcement.title.clone(),
+                format!(
+                    "/lms/coursetop/information/listdetail?idnumber={}&informationId={}",
+                    luna_id, announcement.info_id
+                ),
+            )
+        }));
+    }
+    if activity_types.contains(&"report") {
+        activities.extend(
+            contents
+                .reports
+                .iter()
+                .filter(|report| !report.url.trim().is_empty())
+                .map(|report| {
+                    let detail_path = report
+                        .url
+                        .strip_prefix(crate::config::LUNA_BASE)
+                        .unwrap_or(&report.url)
+                        .to_string();
+                    ("report".to_string(), report.title.clone(), detail_path)
+                }),
+        );
+    }
+    let mut seen = HashSet::new();
+    activities.retain(|(_, _, path)| seen.insert(path.clone()));
+    activities
+}
+
+fn activity_detail_list_fingerprint(
+    activity_type: &str,
+    title: &str,
+    detail_path: &str,
+) -> Result<String, String> {
+    course_automation_source_fingerprint(&json!({
+        "kind": activity_type,
+        "title": title,
+        "detailPath": detail_path,
+    }))
+}
+
+fn cached_activity_detail_is_fresh(
+    cached: &super::ReusableActivityDetail,
+    list_fingerprint: &str,
+    now: i64,
+    ttl_secs: i64,
+) -> bool {
+    ttl_secs > 0
+        && cached_activity_detail_matches_source(cached, list_fingerprint)
+        && now.saturating_sub(cached.checked_at) < ttl_secs
+}
+
+fn cached_activity_detail_matches_source(
+    cached: &super::ReusableActivityDetail,
+    list_fingerprint: &str,
+) -> bool {
+    !cached.source_fingerprint.trim().is_empty() && cached.list_fingerprint == list_fingerprint
 }
 
 fn course_automation_source_fingerprint(value: &Value) -> Result<String, String> {
@@ -2499,6 +2569,18 @@ mod tests {
         }
     }
 
+    fn course_item(title: &str, url: &str, item_type: &str) -> crate::luna_parser::LunaContentItem {
+        crate::luna_parser::LunaContentItem {
+            title: title.to_string(),
+            url: url.to_string(),
+            period: String::new(),
+            status: String::new(),
+            item_type: item_type.to_string(),
+            description: String::new(),
+            files: Vec::new(),
+        }
+    }
+
     fn office_fixture(extension: &str, entries: &[(&str, &str)]) -> PathBuf {
         let path = std::env::temp_dir().join(format!(
             "selah-office-fixture-{}.{}",
@@ -2517,6 +2599,90 @@ mod tests {
         }
         archive.finish().expect("finish fixture");
         path
+    }
+
+    #[test]
+    fn current_course_activity_sources_use_current_contents_only_and_dedup() {
+        let mut contents = course_contents(Vec::new());
+        contents.announcements = vec![
+            crate::luna_parser::LunaCourseAnnouncement {
+                title: "LUNA告知".into(),
+                info_id: "A1".into(),
+                start_date: String::new(),
+                end_date: String::new(),
+                is_new: true,
+            },
+            crate::luna_parser::LunaCourseAnnouncement {
+                title: "重複告知".into(),
+                info_id: "A1".into(),
+                start_date: String::new(),
+                end_date: String::new(),
+                is_new: false,
+            },
+        ];
+        contents.reports = vec![
+            course_item(
+                "提出課題",
+                &format!(
+                    "{}{}",
+                    crate::config::LUNA_BASE,
+                    "/lms/course/report/detail?id=R1"
+                ),
+                "report",
+            ),
+            course_item("空URL課題", "", "report"),
+        ];
+
+        let sources =
+            current_course_activity_sources("6072", &contents, &["announcement", "report"]);
+        assert_eq!(
+            sources,
+            vec![
+                (
+                    "announcement".to_string(),
+                    "LUNA告知".to_string(),
+                    "/lms/coursetop/information/listdetail?idnumber=6072&informationId=A1"
+                        .to_string(),
+                ),
+                (
+                    "report".to_string(),
+                    "提出課題".to_string(),
+                    "/lms/course/report/detail?id=R1".to_string(),
+                ),
+            ]
+        );
+
+        let report_only = current_course_activity_sources("6072", &contents, &["report"]);
+        assert_eq!(
+            report_only,
+            vec![(
+                "report".to_string(),
+                "提出課題".to_string(),
+                "/lms/course/report/detail?id=R1".to_string(),
+            )]
+        );
+    }
+
+    #[test]
+    fn cached_activity_detail_requires_same_list_fingerprint_and_fresh_ttl() {
+        let cached = crate::agent_tools::ReusableActivityDetail {
+            list_fingerprint: "list-v1".into(),
+            source_fingerprint: "detail-v1".into(),
+            checked_at: 100,
+        };
+
+        assert!(cached_activity_detail_is_fresh(
+            &cached, "list-v1", 250, 300
+        ));
+        assert!(!cached_activity_detail_is_fresh(
+            &cached, "list-v2", 250, 300
+        ));
+        assert!(!cached_activity_detail_is_fresh(
+            &cached, "list-v1", 500, 300
+        ));
+        assert!(!cached_activity_detail_is_fresh(&cached, "list-v1", 250, 0));
+        assert!(cached_activity_detail_matches_source(&cached, "list-v1"));
+        assert!(!cached_activity_detail_matches_source(&cached, "list-v2"));
     }
 
     #[test]

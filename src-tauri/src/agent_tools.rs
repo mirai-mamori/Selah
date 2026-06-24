@@ -16,6 +16,13 @@ pub(crate) struct ReusableCourseDownload {
     pub source_fingerprint: String,
 }
 
+#[derive(Debug, Clone)]
+pub(crate) struct ReusableActivityDetail {
+    pub list_fingerprint: String,
+    pub source_fingerprint: String,
+    pub checked_at: i64,
+}
+
 #[path = "agent_tools/academic.rs"]
 mod academic;
 #[path = "agent_tools/calendar.rs"]
@@ -77,6 +84,10 @@ pub(crate) async fn download_luna_activity_attachments(
     contents: &crate::luna_parser::LunaCourseContents,
     kinds: &[&str],
     reusable_paths: &std::collections::HashMap<String, ReusableCourseDownload>,
+    reusable_details: &std::collections::HashMap<String, ReusableActivityDetail>,
+    detail_cache_ttl_secs: i64,
+    now: i64,
+    force_detail_fetch: bool,
 ) -> Result<Vec<Value>, String> {
     files_browser::download_all_luna_activity_attachments(
         app,
@@ -84,6 +95,10 @@ pub(crate) async fn download_luna_activity_attachments(
         contents,
         kinds,
         reusable_paths,
+        reusable_details,
+        detail_cache_ttl_secs,
+        now,
+        force_detail_fetch,
     )
     .await
 }

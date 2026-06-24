@@ -2,342 +2,119 @@
   import { invoke } from "@tauri-apps/api/core";
   import { listen } from "@tauri-apps/api/event";
   import { onDestroy, onMount } from "svelte";
-  import { fly } from "svelte/transition";
   import Icon from "../Icon.svelte";
-  import type { IconName } from "../Icon.svelte";
-
-  interface CourseAutomationConfig {
-    enabled: boolean;
-    intervalMinutes: number;
-  }
-
-  interface CourseAutomationStatus {
-    lunaId: string;
-    running: boolean;
-    stage: string;
-    lastRun?: number;
-    lastOk?: boolean;
-    lastError: string;
-    downloadedFiles: string[];
-    externalLinks: string[];
-    totalDocuments: number;
-    processedDocuments: number;
-    currentDocument: string;
-    pendingSummaryIds: string[];
-    documentAnalyses: Array<{
-      id: string;
-      kind: string;
-      title: string;
-      filename: string;
-      status: string;
-      summary: string;
-      triggerDecision: string;
-      observationContext: string;
-      error: string;
-    }>;
-    analysis: {
-      summary: string;
-      findings: Array<{
-        id: string;
-        facet?: string;
-        text: string;
-        category?: string;
-        expiresAt?: string;
-        flags?: { action?: boolean; urgent?: boolean };
-      }>;
-      standingContext: Array<{
-        id: string;
-        text: string;
-        expiresAt?: string;
-        flags?: { action?: boolean; urgent?: boolean };
-      }>;
-      archivedContext?: Array<{ label: string; items: string[] }>;
-      seat: { assignment: string; evidence: string[]; confidence: number };
-      printCandidates: Array<{ filename: string; reason: string; confidence: number }>;
-    };
-    printResults: Array<{ filename: string; status: string; detail: string; category?: string }>;
-    itemStates?: Record<string, string>;
-    runLog?: Array<{ at: number; level: string; message: string }>;
-  }
-
-  interface CourseAutomationView {
-    config: CourseAutomationConfig;
-    status: CourseAutomationStatus;
-  }
+  import {
+    COURSE_AGENT_DETAIL_TITLES,
+    COURSE_AGENT_MODULE_KEYS,
+    buildCourseAgentModules,
+    kindLabel,
+    printLabel,
+    timeAgo,
+    type CourseAgentDetailKey,
+    type CourseAgentModules,
+    type CourseAutomationStatus,
+    type CourseAutomationView,
+  } from "./courseAgentModules";
 
   interface Props {
     lunaId: string;
     courseName: string;
+    ondetailchange?: (open: boolean) => void;
   }
 
-  let { lunaId, courseName }: Props = $props();
+  let { lunaId, courseName, ondetailchange }: Props = $props();
   let view = $state<CourseAutomationView | null>(null);
   let busy = $state(false);
   let error = $state("");
   // Which bento cell is drilled into. Tapping a cell opens its full content as
   // a focused second page; null is the home (bento) view.
-  type DetailKey = "findings" | "seat" | "print" | "standing" | "documents" | "log";
-  let detail = $state<DetailKey | null>(null);
-  const detailTitle: Record<DetailKey, string> = {
-    findings: "確認事項",
-    seat: "座席",
-    print: "印刷",
-    standing: "記憶",
-    documents: "分析した資料",
-    log: "ログ",
-  };
-
-  // Relative "time ago" for log entries (epoch seconds).
-  function timeAgo(secs: number): string {
-    if (!secs) return "";
-    const delta = Date.now() / 1000 - secs;
-    if (delta < 60) return "たった今";
-    if (delta < 3600) return `${Math.floor(delta / 60)}分前`;
-    if (delta < 86400) return `${Math.floor(delta / 3600)}時間前`;
-    return `${Math.floor(delta / 86400)}日前`;
-  }
-
-  function kindLabel(kind: string): string {
-    switch (kind) {
-      case "material": return "教材";
-      case "announcement": return "お知らせ";
-      case "report": return "課題";
-      default: return kind || "資料";
-    }
-  }
+  let detail = $state<CourseAgentDetailKey | null>(null);
   let unlisten: (() => void) | null = null;
   // The home view's live height, reused as the detail page's height so the two
   // levels occupy exactly the same footprint (measured while home is shown).
   let homeHeight = $state(0);
 
   const enabled = $derived(view?.config.enabled ?? false);
-  const running = $derived(view?.status.running ?? false);
+  const initialModules = buildCourseAgentModules(null, { enabled: false });
+  let controlModule = $state(initialModules.control);
+  let highlightModule = $state(initialModules.highlight);
+  let pendingModule = $state(initialModules.pending);
+  let standingModule = $state(initialModules.standing);
+  let seatModule = $state(initialModules.seat);
+  let printModule = $state(initialModules.print);
+  let organizeModule = $state(initialModules.organize);
+  let documentsModule = $state(initialModules.documents);
+  let logModule = $state(initialModules.log);
+  let navigationModule = $state(initialModules.navigation);
+  let moduleSignatures = initialModules.signatures;
 
-  function stageText(stage: string): string {
-    return (
-      {
-        checking: "更新を確認中",
-        downloading: "資料を取得中",
-        analyzing: "資料を一件ずつ分析中",
-        summarizing: "個別摘要を最終確認中",
-        pending_summary: "新しい摘要を蓄積中",
-        printing: "印刷を検証中",
-        unchanged: "変更なし",
-        done: "確認済み",
-        error: "確認エラー",
-      }[stage] || (enabled ? "次の確認を待機中" : "無効")
-    );
-  }
-  const stageLabel = $derived(stageText(view?.status.stage || ""));
-
-  // Documents the agent flagged as needing prompt attention. Drives the
-  // headline "要確認" emphasis and the header status tone.
-  const immediateCount = $derived(
-    view?.status.documentAnalyses?.filter(
-      (doc) => doc.status === "done" && doc.triggerDecision === "immediate",
-    ).length ?? 0,
-  );
-
-  const progressPct = $derived(
-    view?.status.totalDocuments
-      ? Math.min(100, Math.round((view.status.processedDocuments / view.status.totalDocuments) * 100))
-      : 0,
-  );
-
-  // Only the analyzing stage has a countable total; other stages are
-  // indeterminate and show an animated marker instead of a number.
-  const hasProgress = $derived((view?.status.totalDocuments ?? 0) > 0);
-
-  const failureNote = $derived(error || view?.status.lastError || "");
-
-  // Control capsule: dot state + a compact status line. The error MESSAGE is no
-  // longer shown on the face — it lives on the control capsule's ログ detail
-  // page. The dot still reflects an error state so it stays glanceable.
-  const barState = $derived(running ? "busy" : failureNote ? "error" : "idle");
-  const controlText = $derived.by(() => {
-    if (running) return hasProgress ? `${progressPct}% ・ ${stageLabel}` : stageLabel;
-    return stageLabel;
-  });
-  const runLog = $derived((view?.status.runLog ?? []).slice().reverse());
-
-  // ── Bento content ────────────────────────────────────────────────────────
-  const summary = $derived(view?.status.analysis?.summary?.trim() ?? "");
-  // Memories carry an expiry date. Active ones drive the メモ pill; expired ones
-  // (the backend's archive, plus any active item whose date just rolled past)
-  // are not dropped — they stay as a dim 過去 reference, since old context can
-  // still relate to new material. Split client-side so display is correct even
-  // between backend summary runs.
-  const todayStr = $derived.by(() => {
-    const now = new Date();
-    const m = `${now.getMonth() + 1}`.padStart(2, "0");
-    const d = `${now.getDate()}`.padStart(2, "0");
-    return `${now.getFullYear()}-${m}-${d}`;
-  });
-  const isExpired = (m: { expiresAt?: string }) =>
-    !!m.expiresAt && m.expiresAt.slice(0, 10) < todayStr;
-  const standingContext = $derived(
-    (view?.status.analysis?.standingContext ?? [])
-      .filter((m) => !isExpired(m))
-      // Time-critical memories (urgent) lead so the student sees them first.
-      .slice()
-      .sort((a, b) => Number(b.flags?.urgent ?? false) - Number(a.flags?.urgent ?? false)),
-  );
-  // Past memory shown grouped under headings (完了した課題, etc.). Items whose
-  // date just rolled past but the backend hasn't consolidated yet appear under
-  // a 最近終了 group so they never vanish between summary runs.
-  const standingArchive = $derived.by(() => {
-    const groups: Array<{ label: string; items: string[] }> = [];
-    const stragglers = (view?.status.analysis?.standingContext ?? [])
-      .filter(isExpired)
-      .map((m) => m.text);
-    if (stragglers.length) groups.push({ label: "最近終了", items: stragglers });
-    for (const group of view?.status.analysis?.archivedContext ?? []) {
-      if (group.items?.length) groups.push(group);
-    }
-    return groups;
-  });
-  // Unified per-item user-state overlay (id → "done"/"known"). 確認事項 carry an
-  // expiry (auto-drop once past) and an action flag. Items the user marked
-  // done/known are hidden; action items lead.
-  const itemStates = $derived(view?.status.itemStates ?? {});
-  const isHandled = (id: string) => itemStates[id] === "done" || itemStates[id] === "known";
-  const findings = $derived(
-    (view?.status.analysis?.findings ?? [])
-      .filter((f) => !isExpired(f) && !isHandled(f.id))
-      .slice()
-      .sort((a, b) => Number(b.flags?.action ?? false) - Number(a.flags?.action ?? false)),
-  );
-
-  const seat = $derived(view?.status.analysis?.seat);
-  const seatConfidence = $derived(Math.round(Math.max(0, Math.min(1, seat?.confidence ?? 0)) * 100));
-  const printResults = $derived(view?.status.printResults ?? []);
-  // Print problems are surfaced on the 印刷 capsule itself, not on the control
-  // capsule. `unknown` is intentionally not auto-retried, but still needs attention.
-  const printFailures = $derived(
-    printResults.filter((r) => r.status === "error" || r.status === "not_found" || r.status === "unknown").length,
-  );
-  // Files waiting for the user to approve their print type. The first file of a
-  // type asks once; approving it auto-prints that category from then on.
-  const printPending = $derived(printResults.filter((r) => r.status === "needs_confirmation").length);
-
-  // 確認事項 plays one item at a time, banner / widget style: an index advances
-  // on a timer and the line cross-slides in. Pauses on hover and under reduced
-  // motion (then it simply rests on the first item; the full list is one tap
-  // away via the caption).
-  let findingIndex = $state(0);
-  let findingsPaused = $state(false);
-  let reduceMotion = $state(false);
-  const safeFindingIndex = $derived(findings.length ? findingIndex % findings.length : 0);
-  const currentFinding = $derived(findings[safeFindingIndex]?.text ?? "");
-
-  // Materials / announcements the agent has individually analysed & summarised.
-  const analyzedDocs = $derived(
-    view?.status.documentAnalyses?.filter((doc) => doc.status === "done" && doc.summary?.trim()) ?? [],
-  );
-
-  // Count shown next to a detail page's title (seat has no list, so null).
-  const detailCount = $derived.by(() => {
-    const counts: Partial<Record<DetailKey, number>> = {
-      findings: findings.length,
-      standing: standingContext.length,
-      print: printResults.length,
-      documents: analyzedDocs.length,
-      log: runLog.length,
-    };
-    return detail ? counts[detail] ?? null : null;
-  });
-
-  // ── Facet registry ───────────────────────────────────────────────────────
-  // The capsule row is data-driven: each "go" pill is one entry here, so adding
-  // a facet pill is a single array push rather than bespoke markup. The control
-  // pill and the highlight/確認事項 cards stay special-cased above.
-  type PillEntry = {
-    key: DetailKey;
-    icon: IconName;
-    label: string;
-    badge: string | number;
-    badgeClass?: string;
-    pillClass?: string;
-    title?: string;
-  };
-  const pills = $derived.by<PillEntry[]>(() => {
-    const out: PillEntry[] = [];
-    if (seat?.assignment) {
-      out.push({
-        key: "seat",
-        icon: "seat",
-        label: "座席",
-        badge: seat.assignment,
-        badgeClass: "sa-pill-val",
-        title: seat.assignment,
-      });
-    }
-    if (standingContext.length) {
-      out.push({ key: "standing", icon: "note", label: "記憶", badge: standingContext.length });
-    }
-    if (printResults.length) {
-      if (printPending > 0) {
-        out.push({
-          key: "print",
-          icon: "printer",
-          label: "印刷",
-          badge: `${printPending} 件確認`,
-          badgeClass: "sa-pill-accent",
-          pillClass: "sa-pill-info",
-          title: `${printPending} 件が印刷の許可待ちです`,
-        });
-      } else if (printFailures > 0) {
-        out.push({
-          key: "print",
-          icon: "printer",
-          label: "印刷",
-          badge: `${printFailures} 件失敗`,
-          badgeClass: "sa-pill-warn",
-          pillClass: "sa-pill-attn",
-          title: `${printFailures} 件失敗・次回再試行します`,
-        });
-      } else {
-        out.push({ key: "print", icon: "printer", label: "印刷", badge: printResults.length });
+  function applyCourseAgentModules(next: CourseAgentModules): void {
+    for (const key of COURSE_AGENT_MODULE_KEYS) {
+      if (moduleSignatures[key] === next.signatures[key]) continue;
+      switch (key) {
+        case "control":
+          controlModule = next.control;
+          break;
+        case "highlight":
+          highlightModule = next.highlight;
+          break;
+        case "pending":
+          pendingModule = next.pending;
+          break;
+        case "standing":
+          standingModule = next.standing;
+          break;
+        case "seat":
+          seatModule = next.seat;
+          break;
+        case "print":
+          printModule = next.print;
+          break;
+        case "organize":
+          organizeModule = next.organize;
+          break;
+        case "documents":
+          documentsModule = next.documents;
+          break;
+        case "log":
+          logModule = next.log;
+          break;
+        case "navigation":
+          navigationModule = next.navigation;
+          break;
       }
     }
-    if (analyzedDocs.length) {
-      out.push({ key: "documents", icon: "doc.search", label: "分析", badge: analyzedDocs.length });
-    }
-    return out;
+    moduleSignatures = next.signatures;
+  }
+
+  $effect(() => {
+    applyCourseAgentModules(buildCourseAgentModules(view?.status, { enabled, localError: error }));
   });
 
   $effect(() => {
-    const n = findings.length;
-    if (n <= 1 || findingsPaused || reduceMotion) return;
-    const id = setInterval(() => {
-      findingIndex = (findingIndex + 1) % n;
-    }, 3600);
-    return () => clearInterval(id);
+    ondetailchange?.(detail !== null);
   });
 
-  const lastChecked = $derived.by(() => {
-    const secs = view?.status.lastRun;
-    if (!secs) return "未確認";
-    const delta = Date.now() / 1000 - secs;
-    if (delta < 60) return "たった今";
-    if (delta < 3600) return `${Math.floor(delta / 60)}分前`;
-    if (delta < 86400) return `${Math.floor(delta / 3600)}時間前`;
-    return `${Math.floor(delta / 86400)}日前`;
-  });
-
-  function printLabel(status: string): { text: string; tone: "ok" | "warn" | "bad" | "info" } {
-    switch (status) {
-      case "printed": return { text: "印刷済み", tone: "ok" };
-      case "already_printed": return { text: "印刷済み", tone: "ok" };
-      case "error": return { text: "印刷失敗", tone: "bad" };
-      case "not_found": return { text: "対象不明", tone: "bad" };
-      case "needs_confirmation": return { text: "確認待ち", tone: "info" };
-      case "dispatching": return { text: "送信中", tone: "info" };
-      case "unknown": return { text: "結果要確認", tone: "warn" };
-      case "skipped_low_confidence": return { text: "確度不足で保留", tone: "warn" };
-      default: return { text: status, tone: "warn" };
-    }
-  }
+  const running = $derived(controlModule.running);
+  const barState = $derived(controlModule.barState);
+  const controlText = $derived(controlModule.text);
+  const failureNote = $derived(logModule.failureNote);
+  const runLog = $derived(logModule.entries);
+  const summary = $derived(highlightModule.summary);
+  const standingContext = $derived(standingModule.active);
+  const standingArchive = $derived(standingModule.archive);
+  const pendingItems = $derived(pendingModule.items);
+  const seat = $derived(seatModule.seat);
+  const seatConfidence = $derived(seatModule.confidencePct);
+  const printResults = $derived(printModule.results);
+  const printCandidates = $derived(printModule.unresolvedCandidates);
+  const analyzedDocs = $derived(documentsModule.items);
+  const pendingDocumentCount = $derived(documentsModule.pendingCount);
+  const organizeGroups = $derived(organizeModule.groups);
+  const organizeCanUndo = $derived(organizeModule.canUndo);
+  const detailCount = $derived.by(() => (detail ? navigationModule.detailCounts[detail] ?? null : null));
+  const pills = $derived(navigationModule.pills);
+  const lastChecked = $derived(highlightModule.lastChecked);
 
   async function load(): Promise<void> {
     view = await invoke<CourseAutomationView>("course_automation_get", {
@@ -428,26 +205,68 @@
     }
   }
 
-  // Mark a 確認事項 as done/known by its stable id: the backend hides it via the
-  // unified item-state overlay and, for action items, completes the matching task
-  // on the main TODO page (the backend TODO sink keeps the two in sync).
+  // Mark a 自動検知 notice as known by its stable id. Action items live in TODO,
+  // so this only acknowledges non-TODO notices shown in 保留中.
   let acknowledging = $state<string | null>(null);
-  async function acknowledgeFinding(finding: { id: string }): Promise<void> {
-    if (acknowledging) return;
-    acknowledging = finding.id;
+  async function acknowledgePending(item: { sourceId?: string }): Promise<void> {
+    if (acknowledging || !item.sourceId) return;
+    acknowledging = item.sourceId;
     error = "";
     try {
       view = await invoke<CourseAutomationView>("course_automation_set_item_state", {
         lunaId,
         courseName,
-        id: finding.id,
-        state: "done",
+        id: item.sourceId,
+        state: "known",
       });
     } catch (cause) {
       error = String(cause);
       await load().catch(() => {});
     } finally {
       acknowledging = null;
+    }
+  }
+
+  // Re-run the theme filing on demand instead of waiting for the next cycle.
+  let organizingNow = $state(false);
+  async function organizeNow(): Promise<void> {
+    if (busy || organizingNow) return;
+    busy = true;
+    organizingNow = true;
+    error = "";
+    try {
+      view = await invoke<CourseAutomationView>("course_automation_organize_now", {
+        lunaId,
+        courseName,
+      });
+    } catch (cause) {
+      error = String(cause);
+      await load().catch(() => {});
+    } finally {
+      busy = false;
+      organizingNow = false;
+    }
+  }
+
+  // Revert the last auto-organize batch: moves the filed documents back to where
+  // they were and removes the now-empty theme folders. Exclusive while running.
+  let undoingOrganize = $state(false);
+  async function undoOrganize(): Promise<void> {
+    if (busy || undoingOrganize || !organizeCanUndo) return;
+    busy = true;
+    undoingOrganize = true;
+    error = "";
+    try {
+      view = await invoke<CourseAutomationView>("course_automation_undo_organize", {
+        lunaId,
+        courseName,
+      });
+    } catch (cause) {
+      error = String(cause);
+      await load().catch(() => {});
+    } finally {
+      busy = false;
+      undoingOrganize = false;
     }
   }
 
@@ -472,13 +291,7 @@
     }
   }
 
-  let motionMedia: MediaQueryList | null = null;
-  const syncMotion = () => (reduceMotion = motionMedia?.matches ?? false);
-
   onMount(async () => {
-    motionMedia = window.matchMedia("(prefers-reduced-motion: reduce)");
-    syncMotion();
-    motionMedia.addEventListener("change", syncMotion);
     await load().catch((cause) => error = String(cause));
     unlisten = await listen<CourseAutomationStatus>("course-automation-updated", (event) => {
       if (event.payload.lunaId !== lunaId || !view) return;
@@ -488,7 +301,7 @@
 
   onDestroy(() => {
     unlisten?.();
-    motionMedia?.removeEventListener("change", syncMotion);
+    ondetailchange?.(false);
   });
 </script>
 <section class="sa" aria-label="自動検知">
@@ -502,18 +315,36 @@
           <button class="sa-back" type="button" onclick={() => (detail = null)} aria-label="戻る">
             <Icon name="chevron.left" size={17} />
           </button>
-          <strong class="sa-detail-title">{detailTitle[detail]}</strong>
+          <strong class="sa-detail-title">{COURSE_AGENT_DETAIL_TITLES[detail]}</strong>
           {#if detailCount !== null}<span class="sa-detail-count">{detailCount}</span>{/if}
           {#if detail === "documents" && analyzedDocs.length}
             <button class="sa-detail-action" class:spin={reanalyzingAll} type="button" disabled={busy || running || reanalyzingIds.length > 0} onclick={reanalyzeAll}>
               <Icon name="arrow.clockwise" size={13} />
               <span>全て再分析</span>
             </button>
+          {:else if detail === "seat" && seat}
+            <button class="sa-detail-action" class:spin={rebuildingMemory} type="button" disabled={busy || rebuildingMemory || running || reanalyzingIds.length > 0} onclick={rebuildMemory}>
+              <Icon name="arrow.clockwise" size={13} />
+              <span>座席を再生成</span>
+            </button>
           {:else if detail === "standing"}
             <button class="sa-detail-action" class:spin={rebuildingMemory} type="button" disabled={busy || running || reanalyzingIds.length > 0} onclick={rebuildMemory}>
               <Icon name="arrow.clockwise" size={13} />
               <span>記憶を再構築</span>
             </button>
+          {:else if detail === "organize"}
+            <div class="sa-detail-actions">
+              {#if organizeCanUndo}
+                <button class="sa-detail-action" class:spin={undoingOrganize} type="button" disabled={busy} onclick={undoOrganize}>
+                  <Icon name="arrow.clockwise" size={13} />
+                  <span>元に戻す</span>
+                </button>
+              {/if}
+              <button class="sa-detail-action" class:spin={organizingNow} type="button" disabled={busy} onclick={organizeNow}>
+                <Icon name="folder.open" size={13} />
+                <span>今すぐ整理</span>
+              </button>
+            </div>
           {/if}
         </header>
 
@@ -523,30 +354,38 @@
 
         <!-- Fixed-height body; content scrolls within when it overflows. -->
         <div class="sa-detail-body">
-          {#if detail === "findings"}
+          {#if detail === "pending"}
             <ol class="sa-rows">
-              {#each findings as finding, i}
-                <li class="sa-row sa-row-find">
+              {#each pendingItems as item, i}
+                <li class="sa-row sa-row-pending" data-tone={item.tone ?? "info"}>
                   <span class="sa-row-ix">{i + 1}</span>
                   <p class="sa-row-text">
-                    {#if finding.flags?.action}<span class="sa-row-flag sa-row-flag-do">要対応</span>{/if}
-                    {finding.text}
-                    {#if finding.expiresAt}<span class="sa-row-until">〜{finding.expiresAt}</span>{/if}
+                    <span class="sa-row-flag">{item.kind === "print" ? "印刷" : item.kind === "seat" ? "座席" : "通知"}</span>
+                    {item.text}
+                    {#if item.detail}<span class="sa-row-note">{item.detail}</span>{/if}
+                    {#if item.expiresAt}<span class="sa-row-until">〜{item.expiresAt}</span>{/if}
                   </p>
-                  <button
-                    class="sa-find-done"
-                    type="button"
-                    disabled={acknowledging === finding.id}
-                    onclick={() => acknowledgeFinding(finding)}
-                    title="完了 / 既知にする"
-                    aria-label="完了 / 既知にする"
-                  >
-                    <Icon name="check" size={14} />
-                  </button>
+                  {#if item.target}
+                    <button class="sa-row-open" type="button" onclick={() => (detail = item.target ?? null)}>
+                      <span>開く</span>
+                      <Icon name="chevron.right" size={13} />
+                    </button>
+                  {:else}
+                    <button
+                      class="sa-pending-done"
+                      type="button"
+                      disabled={acknowledging === item.sourceId}
+                      onclick={() => acknowledgePending(item)}
+                      title="確認済みにする"
+                      aria-label="確認済みにする"
+                    >
+                      <Icon name="check" size={14} />
+                    </button>
+                  {/if}
                 </li>
               {/each}
-              {#if findings.length === 0}
-                <li class="sa-row sa-row-dim"><p class="sa-row-text">確認事項はありません。</p></li>
+              {#if pendingItems.length === 0}
+                <li class="sa-row sa-row-dim"><p class="sa-row-text">保留中の項目はありません。</p></li>
               {/if}
             </ol>
           {:else if detail === "standing"}
@@ -619,7 +458,43 @@
                   {/if}
                 </li>
               {/each}
+              {#each printCandidates as item}
+                <li class="sa-row sa-row-print sa-row-print-candidate">
+                  <span class="sa-row-text sa-row-name">{item.filename}</span>
+                  <span class="sa-print-detail">{item.reason}</span>
+                  <span class="sa-print-tag" data-tone="info">候補 {Math.round(Math.max(0, Math.min(1, item.confidence)) * 100)}%</span>
+                </li>
+              {/each}
+              {#if printResults.length === 0 && printCandidates.length === 0}
+                <li class="sa-row sa-row-dim"><p class="sa-row-text">印刷対象はありません。</p></li>
+              {/if}
             </ul>
+          {:else if detail === "organize"}
+            <!-- Files the agent auto-filed into theme folders. Each group is one
+                 theme/session; the whole batch can be reverted in one tap. -->
+            {#each organizeGroups as group (group.id)}
+              <p class="sa-arch-label">
+                <Icon name="folder.open" size={12} />
+                {group.label}
+                <span class="sa-organize-count">{group.files.length}</span>
+              </p>
+              <ul class="sa-rows">
+                {#each group.files as file}
+                  <li class="sa-row sa-row-organize">
+                    <span class="sa-row-dot"></span>
+                    <p class="sa-row-text sa-row-name">{file.title || file.filename}</p>
+                    {#if group.folder}<span class="sa-organize-folder">{group.folder}/</span>{/if}
+                  </li>
+                {/each}
+              </ul>
+            {/each}
+            {#if organizeGroups.length === 0}
+              <ul class="sa-rows">
+                <li class="sa-row sa-row-dim">
+                  <p class="sa-row-text">資料がたまると、テーマ(同じ回・課題など)ごとに自動で整理します。</p>
+                </li>
+              </ul>
+            {/if}
           {:else if detail === "documents"}
             <ul class="sa-rows">
               {#each analyzedDocs as doc}
@@ -634,6 +509,13 @@
                   <p class="sa-doc-summary">{doc.summary}</p>
                 </li>
               {/each}
+              {#if analyzedDocs.length === 0 && pendingDocumentCount > 0}
+                <li class="sa-row sa-row-dim">
+                  <p class="sa-row-text">{pendingDocumentCount}件の新しい資料を最終摘要に反映中です。</p>
+                </li>
+              {:else if analyzedDocs.length === 0}
+                <li class="sa-row sa-row-dim"><p class="sa-row-text">分析済みの資料はまだありません。</p></li>
+              {/if}
             </ul>
           {:else if detail === "log"}
             <!-- Control capsule's log: recent run history. The current error (if
@@ -658,8 +540,8 @@
       </div>
     {:else}
       <div class="sa-home" bind:clientHeight={homeHeight}>
-      <!-- Capsule row above the cards: control (carries status + errors) and
-           compact entries. Each pill hugs its content; no borders, one style. -->
+      <!-- Capsule row: control (carries status + errors) and compact entries.
+           Each pill hugs its content; no borders, one style. -->
       <div class="sa-pills">
         <div class="sa-pill sa-pill-ctl" data-state={barState}>
           <button class="sa-pill-ctl-open" type="button" onclick={() => (detail = "log")} title="ログを見る">
@@ -670,9 +552,16 @@
             <Icon name="arrow.clockwise" size={13} />
           </button>
         </div>
+        {#if summary}
+          <div class="sa-pill sa-pill-highlight" aria-label="highlight" title={summary}>
+            <Icon name="star" size={13} />
+            <span class="sa-hl-text">{summary}</span>
+            <b class="sa-highlight-when">{lastChecked}</b>
+          </div>
+        {/if}
         {#each pills as pill (pill.key)}
           <button
-            class="sa-pill sa-pill-go {pill.pillClass ?? ''}"
+            class="sa-pill sa-pill-go"
             data-cat={pill.key}
             type="button"
             onclick={() => (detail = pill.key)}
@@ -686,65 +575,18 @@
         {/each}
       </div>
 
-      {#if summary}
-        <div class="sa-bento">
-          <!-- Highlight — the single most important thing right now. Content
-               leads at a large size; a quiet italic caption names it at the
-               foot, so the eye reads the message before the label. -->
-          <article class="sa-card sa-hl" data-attn={immediateCount > 0}>
-            <p class="sa-hl-text">{summary}</p>
-            <footer class="sa-cap" data-cat="highlight">
-              <Icon name="star" size={13} />
-              <em>highlight</em>
-              <span class="sa-cap-end">{lastChecked}</span>
-            </footer>
-          </article>
-
-          {#if findings.length}
-            <!-- Confirmations — a banner that plays the items one at a time:
-                 each line cross-slides in, advancing on a timer. Hover pauses.
-                 The caption shows position and opens the full list. -->
-            <section
-              class="sa-card sa-find"
-              data-cat="findings"
-              onmouseenter={() => (findingsPaused = true)}
-              onmouseleave={() => (findingsPaused = false)}
-              role="group"
-              aria-label="確認事項"
-            >
-              <div class="sa-find-view">
-                {#key safeFindingIndex}
-                  <p
-                    class="sa-find-line"
-                    in:fly={{ y: 14, duration: reduceMotion ? 0 : 340 }}
-                    out:fly={{ y: -14, duration: reduceMotion ? 0 : 340 }}
-                  >
-                    {currentFinding}
-                  </p>
-                {/key}
-              </div>
-              <button class="sa-cap sa-cap-btn" type="button" onclick={() => (detail = "findings")}>
-                <Icon name="list.checks" size={13} />
-                <em>確認事項</em>
-                <b>{findings.length > 1 ? `${safeFindingIndex + 1}/${findings.length}` : findings.length}</b>
-                <Icon name="chevron.right" size={13} />
-              </button>
-            </section>
-          {/if}
-
-        </div>
-      {:else if !running}
+      {#if !summary && !running}
         <p class="sa-empty">確認後、ここに今知るべき要点が表示されます。</p>
       {/if}
       </div>
     {/if}
   {:else}
-    <p class="sa-empty">資料・お知らせの変更を見張り、必要な時だけ知らせます。</p>
+    <p class="sa-empty">自動検知は必要な変化だけを知らせます。</p>
   {/if}
 </section>
 
 <style>
-  /* SenseA dock — no outer card; just a layout for dispersed bento cards that
+  /* 自動検知 dock — no outer card; just a layout for dispersed bento cards that
      sit directly on the surface. Aligned with the Luna surface tokens. */
   .sa {
     display: grid;
@@ -758,7 +600,7 @@
   }
 
   /* Home view wrapper — measured (bind:clientHeight) to drive the detail
-     page's height. Keeps the pills→bento spacing the section used to provide. */
+     page's height. Keeps the capsule stack spacing stable. */
   .sa-home {
     display: grid;
     gap: 9px;
@@ -778,10 +620,8 @@
     gap: 9px;
     margin-bottom: 2px;
   }
-  /* The detail page is locked to the home view's measured height (inline
-     style), so the body just fills whatever space is left under the header and
-     the two levels share an identical footprint. Items lay out in responsive
-     columns to fill the width rather than running down one tall list. */
+  /* The detail page matches the home view's measured height so the two levels
+     keep the same footprint inside the default hero rhythm. */
   .sa-detail { min-height: 132px; }
   .sa-detail-body {
     flex: 1;
@@ -937,23 +777,29 @@
     margin-right: 6px;
     padding: 1px 7px;
     border-radius: 999px;
-    background: color-mix(in srgb, var(--detail-warn) 18%, transparent);
-    color: var(--detail-warn);
+    background: color-mix(in srgb, var(--detail-accent) 18%, transparent);
+    color: var(--detail-accent);
     font-size: 10px;
     font-weight: 800;
     letter-spacing: 0.02em;
     white-space: nowrap;
     vertical-align: 1px;
   }
-  /* Action 確認事項 (pushed to TODO) flag — accent rather than warn. */
-  .sa-row-flag-do {
-    background: color-mix(in srgb, var(--detail-accent) 18%, transparent);
-    color: var(--detail-accent);
+  .sa-row-pending { align-items: center; }
+  .sa-row-pending[data-tone="warn"] .sa-row-flag {
+    background: color-mix(in srgb, var(--detail-warn) 18%, transparent);
+    color: var(--detail-warn);
   }
-  /* 確認事項 rows carry a trailing done/known toggle. */
-  .sa-row-find { align-items: center; }
-  .sa-row-find .sa-row-text { flex: 1; min-width: 0; }
-  .sa-find-done {
+  .sa-row-pending .sa-row-text { flex: 1; min-width: 0; }
+  .sa-row-note {
+    display: block;
+    margin-top: 2px;
+    color: var(--detail-muted);
+    font-size: 12px;
+    font-weight: 550;
+    line-height: 1.45;
+  }
+  .sa-pending-done {
     flex: none;
     width: 26px;
     height: 26px;
@@ -967,12 +813,33 @@
     cursor: pointer;
     transition: background 0.14s ease, color 0.14s ease, transform 0.1s ease;
   }
-  .sa-find-done:hover:not(:disabled) {
+  .sa-pending-done:hover:not(:disabled) {
     background: color-mix(in srgb, #34c759 22%, transparent);
     color: #1a7f37;
   }
-  .sa-find-done:active:not(:disabled) { transform: scale(0.9); }
-  .sa-find-done:disabled { opacity: 0.5; cursor: default; }
+  .sa-pending-done:active:not(:disabled) { transform: scale(0.9); }
+  .sa-pending-done:disabled { opacity: 0.5; cursor: default; }
+  .sa-row-open {
+    flex: none;
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    padding: 5px 10px;
+    border: 0;
+    border-radius: 999px;
+    background: color-mix(in srgb, var(--detail-text) 7%, transparent);
+    color: var(--detail-muted);
+    font: inherit;
+    font-size: 11px;
+    font-weight: 800;
+    cursor: pointer;
+    transition: background 0.14s ease, color 0.14s ease, transform 0.1s ease;
+  }
+  .sa-row-open:hover {
+    background: color-mix(in srgb, var(--detail-text) 11%, transparent);
+    color: var(--detail-text);
+  }
+  .sa-row-open:active { transform: scale(0.96); }
   .sa-row-until {
     margin-left: 6px;
     font-size: 12px;
@@ -1000,6 +867,42 @@
     font-size: 12px;
     font-weight: 800;
     letter-spacing: 0.01em;
+  }
+
+  /* ── Organize (整理) detail ───────────────────────────────────────────
+     A theme-folder header per group + the filed documents under it, and an
+     undo control for the whole last batch. */
+  /* Group the 整理 header actions together on the right (a single margin-left
+     auto on the wrapper, so the two buttons sit side by side instead of each
+     claiming half the free space and drifting to opposite ends). */
+  .sa-detail-actions {
+    margin-left: auto;
+    display: inline-flex;
+    align-items: center;
+    gap: 7px;
+  }
+  .sa-detail-actions .sa-detail-action { margin-left: 0; }
+
+  /* The group header carries a folder glyph + the theme name + a count chip. */
+  .sa-arch-label:has(.sa-organize-count) {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    margin-top: 10px;
+  }
+  .sa-arch-label > :global(.icon) { flex: none; color: var(--detail-faint); }
+  .sa-organize-count {
+    margin-left: auto;
+    color: var(--detail-faint);
+    font-size: 11px;
+    font-weight: 800;
+    font-variant-numeric: tabular-nums;
+  }
+  .sa-organize-folder {
+    flex: none;
+    color: var(--detail-faint);
+    font-size: 11px;
+    font-weight: 650;
   }
 
   /* Seat detail: two columns — the prominent value block beside its 根拠
@@ -1066,11 +969,24 @@
 
   /* Print rows: filename then a status tag pill. */
   .sa-row-print { align-items: center; }
+  .sa-row-print-candidate {
+    gap: 8px;
+  }
   .sa-row-name {
     flex: 1;
     min-width: 0;
     overflow: hidden;
     font-weight: 700;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .sa-print-detail {
+    flex: 1;
+    min-width: 80px;
+    overflow: hidden;
+    color: var(--detail-muted);
+    font-size: 11.5px;
+    font-weight: 600;
     text-overflow: ellipsis;
     white-space: nowrap;
   }
@@ -1200,7 +1116,7 @@
     min-height: 28px;
     /* Cap every pill so a long value can't stretch the row; the variable part
        inside (status text / seat value) ellipsis-truncates within this width. */
-    max-width: 480px;
+    max-width: 400px;
     margin: 0;
     padding: 0 12px;
     border: 0;
@@ -1225,6 +1141,7 @@
   .sa-pill-val {
     min-width: 0;
     overflow: hidden;
+    color: var(--detail-text) !important;
     text-overflow: ellipsis;
     white-space: nowrap;
   }
@@ -1303,96 +1220,30 @@
   .sa-pill :global(.icon) { flex: none; }
   .sa-pill-go :global(.icon:first-child) { color: var(--detail-muted); }
   .sa-pill-go :global(.icon:last-child) { color: var(--detail-faint); }
-  /* A pill carrying its own failure feedback (印刷): warn-tinted fill + icon. */
-  .sa-pill-attn {
-    background: color-mix(in srgb, var(--detail-warn) 16%, transparent);
-  }
-  .sa-pill-attn :global(.icon:first-child) { color: var(--detail-warn); }
+  .sa-pill-go[data-cat="seat"] > span { color: var(--detail-muted); }
+  /* Semantic pills keep the shared neutral capsule background and icons. */
   .sa-pill-warn { color: var(--detail-warn) !important; }
-  /* A pill awaiting user confirmation (印刷の許可待ち): accent-tinted, not an error. */
-  .sa-pill-info {
-    background: color-mix(in srgb, var(--detail-accent) 16%, transparent);
-  }
-  .sa-pill-info :global(.icon:first-child) { color: var(--detail-accent); }
   .sa-pill-accent { color: var(--detail-accent) !important; }
 
-  /* ── Bento cards ─────────────────────────────────────────────────────
-     Same visual language as the capsules above: borderless, the same neutral
-     translucent fill, no hard card chrome — just larger, rounded panels.
-     Content-first: substance leads at a readable size, a quiet italic caption
-     names the facet at the foot. */
-  /* Responsive two-up: highlight and 確認事項 sit side by side and fill the
-     width when there's room, then stack below ~620px. The row stretches both
-     to equal height, so they stay a unified pair at any width. A min-height
-     floor keeps short content from collapsing; content grows past it instead
-     of being clipped. */
-  .sa-bento {
-    display: grid;
-    grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
-    gap: 9px;
+  .sa-pill-highlight {
+    min-width: 0;
   }
-  .sa-card {
-    display: flex;
-    flex-direction: column;
-    gap: 10px;
-    width: 100%;
-    min-height: 132px;
-    margin: 0;
-    padding: var(--sa-pad);
-    border: 0;
-    border-radius: 16px;
-    background: color-mix(in srgb, var(--detail-text) 5%, transparent);
-    font: inherit;
-    color: inherit;
-    text-align: left;
-  }
-
-  /* The 確認事項 footer entry is the only tappable surface on the cards. */
-  .sa-cap-btn { transition: background 0.14s ease; }
-
-  /* ── Highlight ───────────────────────────────────────────────────────
-     The single most important thing now: large lead text, caption beneath. */
-  .sa-hl-text {
+  .sa-pill-highlight > :global(.icon:first-child) { color: var(--detail-muted); }
+  .sa-pill-highlight > .sa-hl-text {
     flex: 1;
+    min-width: 0;
     min-height: 0;
-    margin: 0;
-    color: var(--detail-text);
-    font-size: clamp(16px, 2.6vw, 19px);
-    font-weight: 700;
-    line-height: 1.45;
-  }
-
-  /* ── Confirmations banner ────────────────────────────────────────────
-     One item shown at a time, like a widget/banner. The line is absolutely
-     positioned so the outgoing and incoming lines overlap during the
-     cross-slide instead of pushing the layout. */
-  .sa-find { gap: 8px; }
-  .sa-find-view {
-    flex: 1;
-    min-height: 0;
-    position: relative;
     overflow: hidden;
-  }
-  .sa-find-line {
-    position: absolute;
-    inset: 0;
-    display: flex;
-    align-items: center;
-    margin: 0;
     color: var(--detail-text);
-    font-size: clamp(15px, 2.4vw, 18px);
-    font-weight: 680;
-    line-height: 1.4;
+    font-size: 11.5px;
+    font-weight: 700;
+    line-height: 1.2;
+    text-overflow: ellipsis;
+    white-space: nowrap;
   }
-  .sa-cap-btn {
-    margin-top: 8px;
-    padding: 9px 0 0;
-    border: 0;
-    border-top: 0.5px solid color-mix(in srgb, var(--detail-text) 10%, transparent);
-    background: transparent;
-    cursor: pointer;
+  .sa-pill b.sa-highlight-when {
+    color: var(--detail-faint);
   }
-  .sa-cap-btn:hover em { color: var(--detail-text); }
 
   /* Confidence figure under the seat value (no bar). */
   .sa-seat-conf {
@@ -1401,45 +1252,6 @@
     font-weight: 700;
     font-variant-numeric: tabular-nums;
   }
-
-  /* ── Foot caption (shared) ───────────────────────────────────────────
-     Small italic label, a category dot for brand identity, and trailing
-     count / figure / chevron. Anchored to the card foot via margin-top. */
-  .sa-cap {
-    margin-top: auto;
-    display: flex;
-    align-items: center;
-    gap: 7px;
-    width: 100%;
-    font: inherit;
-    text-align: left;
-  }
-  .sa-cap em {
-    font-style: italic;
-    font-size: 11px;
-    font-weight: 640;
-    color: var(--detail-muted);
-    letter-spacing: 0.01em;
-  }
-  .sa-cap b {
-    color: var(--detail-faint);
-    font-size: 11px;
-    font-weight: 800;
-    font-variant-numeric: tabular-nums;
-  }
-  .sa-cap-end {
-    margin-left: auto;
-    color: var(--detail-faint);
-    font-size: 11px;
-    font-weight: 650;
-    font-variant-numeric: tabular-nums;
-  }
-  /* Leading icon names the facet; trailing chevron (findings) hugs the end. */
-  .sa-cap > :global(.icon:first-child) { flex: none; color: var(--detail-muted); }
-  .sa-cap-btn :global(.icon:last-child) { margin-left: auto; color: var(--detail-faint); }
-  /* Attention tints the highlight caption (icon + label) without any extra word. */
-  .sa-hl[data-attn="true"] .sa-cap > :global(.icon:first-child),
-  .sa-hl[data-attn="true"] .sa-cap em { color: var(--detail-warn); }
 
   /* ── Empty state ────────────────────────────────────────────────────── */
   .sa-empty {

@@ -47,12 +47,17 @@ still owns action permissions, idempotency, retries, and verification.
 
 Working memory is rewritten, not appended. Expired, completed, superseded, and
 duplicate items must disappear. Audit memory is never used as a prompt dump.
+When working memory grows, the prompt layer sends a bounded projection:
+summary, current seat, print candidates, urgent/action items, and as much
+archived context as fits. The full archive remains persisted outside the prompt
+and is merged back during normalization, so omitted history is not erased.
 
 ## Token Budget Rules
 
 1. Individual analysis receives one document and a whitelisted student profile.
 2. Individual output is a compact index, not prose suitable for display.
-3. Comprehensive analysis receives only working memory plus new deltas.
+3. Comprehensive analysis receives only a bounded prompt projection of working
+   memory plus new deltas.
 4. Large delta sets are folded recursively in bounded batches.
 5. Model output is normalized before persistence, so verbose violations are not
    replayed forever.
@@ -65,7 +70,23 @@ duplicate items must disappear. Audit memory is never used as a prompt dump.
 
 Normal checks are delta-first. A cycle indexes the current Luna source list, but
 only new, changed, retryable, or explicitly selected documents enter the AI
-document loop. A full sweep requires the explicit re-analyze-all command.
+document loop. Same-source successful downloads remain in the artifact ledger
+for printing and provenance, but are not re-materialized as analysis documents
+unless a legacy identity needs one migration pass. A full sweep requires the
+explicit re-analyze-all command.
+Activity details and attachments are discovered from the current course page,
+not from stale activity rows in the local database. The database can preserve
+evidence and artifact paths, but it must not keep removed activities alive as
+fresh input.
+Unchanged activity detail pages can reuse a short-lived detail cache so
+deferred follow-up cycles do not re-fetch every announcement or assignment. The
+cache is keyed by the current course-list fingerprint and expires on the next
+normal check window; forced re-analysis bypasses it. If revalidation fails but a
+matching stale detail cache exists, the stale cache can preserve source
+continuity without extending its lifetime. A transient fetch error must not
+create a synthetic source change. Retryable activity attachment failures bypass
+the detail cache so the attachment list is refreshed and the failed download can
+retry immediately.
 When multiple pending deltas are folded, `immediate` items are sent before
 `observe` and routine backlog so urgent updates cannot be trapped behind older
 low-impact summaries.
@@ -113,7 +134,9 @@ design.
 - A changed document version can trigger a new notification.
 - A source removal or replacement is detected from the current Luna source list,
   not from transient download or detail-fetch failures. The event is kept as a
-  pending delta until a comprehensive summary consumes it.
+  pending delta until a comprehensive summary consumes it. When the source list
+  exposes a new source fingerprint, replacement can be recorded even if the new
+  file body was not successfully downloaded in that cycle.
 - A failed notification or print remains retryable.
 - A dispatched print whose final receipt is unknown remains visible but is not
   treated as retryable.
@@ -162,6 +185,38 @@ The model classifies impact; configuration decides whether a class of action is
 permitted. An action the student has disabled is never taken regardless of what
 the model concludes, which keeps the impact decision and the action permission
 strictly separated.
+
+## Dock Module Contract
+
+The 自動検知/SenseA dock is a set of independently derived modules, not one blended
+summary card. `courseAgentModules.ts` is the contract layer between persisted
+course status and Svelte rendering. Each module owns the smallest display model
+it needs and a signature of the fields that can change it; the dock only assigns
+a module when that signature changes.
+
+| Module | Displays | Updates from |
+|---|---|---|
+| `control` | current stage, progress, error tone, manual refresh | `running`, `stage`, progress counters, local/backend error |
+| `highlight` | current overall summary and last checked time | `analysis.summary`, `lastRun`, immediate document decisions |
+| `pending` | non-TODO notices and shortcuts to blocked module actions | `analysis.findings`, `itemStates`, `printResults`, seat notification state, current date |
+| `standing` | active long-lived memory plus expired/reference archive | `analysis.standingContext`, `analysis.archivedContext`, current date |
+| `seat` | seat assignment, confidence, evidence | `analysis.seat`, seat notification state |
+| `print` | print results, approval waits, unresolved candidates | `analysis.printCandidates`, `printResults` |
+| `documents` | per-document summaries and pending final-summary count | `documentAnalyses`, `pendingSummaryIds`, `sourceEvents` |
+| `log` | recent run log and current error detail | `runLog`, local/backend error |
+| `navigation` | visible drill-in pills and detail counts | the module signatures above |
+
+This gives the UI atomic render boundaries today. The backend still emits a full
+`CourseAutomationStatus` snapshot for compatibility; a future payload-saving
+step can emit module patches keyed by the same signatures without redesigning
+the dock.
+
+`analysis.findings` remains the backend working-memory field, but the dock does
+not present it as a general "confirmations" list. Action findings are reconciled
+to TODO and intentionally hidden from `pending`; non-action findings appear only
+when they are short-lived notices the student must explicitly know. Print
+approval/failure and seat-notification retry states enter `pending` as shortcuts
+to their owner modules rather than duplicating those modules' full content.
 
 ## Platform Support
 

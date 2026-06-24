@@ -14,6 +14,7 @@ use tauri::{AppHandle, Emitter, Manager, State};
 
 mod context;
 mod items;
+mod organize;
 
 use items::Item;
 
@@ -33,6 +34,7 @@ const PLUS_AI_TIMEOUT_SECS: u64 = 180;
 /// on the next cycle, so this can be generous without losing work.
 const RUN_TIMEOUT_SECS: u64 = 600;
 const PLUS_DOCUMENT_MAX_TOKENS: u32 = 4096;
+const ACTIVITY_DETAIL_REVALIDATE_AFTER_SECS: i64 = 30 * 60;
 /// Internal sentinel placed on `AnalysisDocument.load_error` when a PDF yields
 /// neither a text layer nor extractable images: it is skipped as a terminal,
 /// non-retryable outcome rather than counted as a failure.
@@ -258,6 +260,18 @@ pub struct CourseArtifactRecord {
     pub error: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ActivityDetailCacheRecord {
+    pub id: String,
+    pub kind: String,
+    pub title: String,
+    pub detail_path: String,
+    pub list_fingerprint: String,
+    pub source_fingerprint: String,
+    pub checked_at: i64,
+}
+
 /// One entry in the run log shown on the control capsule's detail page. Each
 /// entry describes a single operation (file + what happened). `level` is one of
 /// "ok" / "warn" / "error" and drives the dot colour; `message` is ready-to-show
@@ -339,6 +353,8 @@ pub struct CourseAutomationStatus {
     pub document_analyses: Vec<DocumentAnalysis>,
     #[serde(default)]
     pub artifacts: Vec<CourseArtifactRecord>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub activity_detail_cache: Vec<ActivityDetailCacheRecord>,
     #[serde(default)]
     pub pending_summary_ids: Vec<String>,
     #[serde(default)]
@@ -359,6 +375,20 @@ pub struct CourseAutomationStatus {
     pub analysis: AgentCourseAnalysis,
     #[serde(default)]
     pub print_results: Vec<PrintResult>,
+    /// Theme groups the agent auto-filed the downloaded documents into. Display
+    /// only — the disk is the source of truth via the per-document paths.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub organize_groups: Vec<organize::OrganizeGroup>,
+    /// The last organize batch's moves, kept so it can be reverted in one step.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub organize_undo: Vec<organize::OrganizeMove>,
+    /// Whether an organize batch is available to undo (mirrors `organize_undo`
+    /// for the dock, which doesn't receive the raw move log).
+    #[serde(default)]
+    pub organize_can_undo: bool,
+    /// When the documents were last auto-filed (epoch seconds).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_organized: Option<i64>,
     /// Per-course user-state overlay keyed by item id (e.g. "done" / "known").
     /// Unified across facets; survives the model regenerating items because the
     /// id is a stable content fingerprint. Pruned to currently-present ids.
@@ -402,6 +432,7 @@ struct SourceDocumentInfo {
     kind: String,
     title: String,
     filename: String,
+    source_fingerprint: String,
 }
 
 pub fn start_course_automation_loop(app: &AppHandle) {
@@ -658,6 +689,58 @@ pub async fn course_automation_set_item_state(
     }
     // Keep the TODO page in sync immediately (done → complete its task).
     sync_action_todos(&app, &db, &status);
+    save_status_and_emit(&app, &db, &status)?;
+    Ok(load_view(&db, &luna_id, &course_name))
+}
+
+/// Re-runs the theme filing on demand (the AI grouping over the per-document
+/// summaries, heuristic fallback) without waiting for the next cycle. Mutates
+/// status directly, guarded against overlapping a running cycle.
+#[tauri::command]
+pub async fn course_automation_organize_now(
+    app: AppHandle,
+    luna_id: String,
+    course_name: String,
+) -> Result<CourseAutomationView, String> {
+    let db = app.state::<Database>();
+    if !load_config(&db, &luna_id, &course_name).enabled {
+        return Err("このコースの SenseA を先に有効にしてください".into());
+    }
+    let automation = app.state::<CourseAutomationState>();
+    let _shared = automation.cycle_lock.read().await;
+    let _write = automation.status_write.lock().await;
+    let mut status = load_status(&db, &luna_id, &course_name);
+    let schedule = course_schedule_text(&db, &course_name);
+    let filed = organize_course_documents(&luna_id, &mut status, &schedule).await;
+    if filed > 0 {
+        status.last_organized = Some(epoch_secs());
+        push_run_log(&mut status, "ok", format!("{filed}件の資料をテーマ別に整理"));
+    }
+    save_status_and_emit(&app, &db, &status)?;
+    Ok(load_view(&db, &luna_id, &course_name))
+}
+
+/// Reverts the most recent auto-organize batch: moves the filed documents back
+/// and removes the empty theme folders. Mutates status directly (not a Job),
+/// guarded against overlapping a running cycle's status rewrite.
+#[tauri::command]
+pub async fn course_automation_undo_organize(
+    app: AppHandle,
+    luna_id: String,
+    course_name: String,
+) -> Result<CourseAutomationView, String> {
+    let db = app.state::<Database>();
+    let automation = app.state::<CourseAutomationState>();
+    let _shared = automation.cycle_lock.read().await;
+    let _write = automation.status_write.lock().await;
+    let mut status = load_status(&db, &luna_id, &course_name);
+    if status.organize_undo.is_empty() {
+        return Ok(load_view(&db, &luna_id, &course_name));
+    }
+    let restored = organize::undo_organize(&mut status);
+    if restored > 0 {
+        push_run_log(&mut status, "ok", format!("{restored}件の整理を元に戻しました"));
+    }
     save_status_and_emit(&app, &db, &status)?;
     Ok(load_view(&db, &luna_id, &course_name))
 }
@@ -1078,6 +1161,7 @@ async fn run_course_inner(
     let config = load_config(&db, luna_id, course_name_hint);
     let mut previous = load_status(&db, luna_id, course_name_hint);
     migrate_legacy_artifacts(&mut previous);
+    let run_started_at = epoch_secs();
     let mut status = CourseAutomationStatus {
         luna_id: luna_id.to_string(),
         course_name: course_name_hint.to_string(),
@@ -1106,9 +1190,11 @@ async fn run_course_inner(
         save_status_and_emit(app, &db, &status)?;
         let mut downloaded = Vec::<(String, String, String, PathBuf, String)>::new();
         let mut artifacts = previous.artifacts.clone();
+        let mut activity_detail_cache = previous.activity_detail_cache.clone();
         let mut external_links = Vec::new();
         let mut activity_documents = Vec::new();
         let mut current_source_infos = Vec::<SourceDocumentInfo>::new();
+        let mut current_activity_detail_cache_ids = HashSet::new();
         let mut seen_paths = HashSet::new();
         for material in contents
             .materials
@@ -1129,6 +1215,7 @@ async fn run_course_inner(
                     kind: "material".into(),
                     title: material.title.clone(),
                     filename: filename.to_string(),
+                    source_fingerprint: source_fingerprint.clone(),
                 });
                 if let Some((path, persisted_source_fingerprint)) = reusable_artifact_path(
                     &artifacts,
@@ -1229,6 +1316,9 @@ async fn run_course_inner(
             }
         }
         let reusable_activity_paths = reusable_activity_downloads(&artifacts);
+        let reusable_activity_details = reusable_activity_details(&activity_detail_cache);
+        let force_activity_detail_fetch =
+            force_all || has_retryable_activity_artifact_failure(&artifacts);
         let mut activity_kinds = Vec::new();
         if config.monitor_announcements {
             activity_kinds.push("announcement");
@@ -1245,6 +1335,10 @@ async fn run_course_inner(
                 &contents,
                 &activity_kinds,
                 &reusable_activity_paths,
+                &reusable_activity_details,
+                ACTIVITY_DETAIL_REVALIDATE_AFTER_SECS,
+                run_started_at,
+                force_activity_detail_fetch,
             )
             .await?
         };
@@ -1254,14 +1348,15 @@ async fn run_course_inner(
                 .filter(|value| {
                     matches!(
                         value.get("status").and_then(Value::as_str),
-                        Some("detail" | "detail_error")
+                        Some("detail" | "detail_error" | "detail_cached")
                     )
                 })
-                .cloned()
+                .map(activity_detail_snapshot_value)
                 .collect(),
         );
         let fingerprint = sha256_json(&source_snapshot)?;
         for value in activity_values {
+            let value_status = value.get("status").and_then(Value::as_str).unwrap_or("");
             let kind = value
                 .get("kind")
                 .and_then(Value::as_str)
@@ -1272,15 +1367,18 @@ async fn run_course_inner(
                 .or_else(|| value.get("attachment_name"))
                 .and_then(Value::as_str)
                 .unwrap_or("");
+            if matches!(value_status, "detail" | "detail_error" | "detail_cached") {
+                if let Some(cache_id) = activity_detail_cache_id_from_value(&value) {
+                    current_activity_detail_cache_ids.insert(cache_id);
+                }
+            }
             current_source_infos.push(SourceDocumentInfo {
                 kind: kind.to_string(),
                 title: title.to_string(),
                 filename: filename.to_string(),
+                source_fingerprint: activity_source_fingerprint_for_source_info(&value),
             });
-            if matches!(
-                value.get("status").and_then(Value::as_str),
-                Some("downloaded" | "reused" | "error")
-            ) {
+            if matches!(Some(value_status), Some("downloaded" | "reused" | "error")) {
                 let source_fingerprint = value
                     .get("source_fingerprint")
                     .and_then(Value::as_str)
@@ -1303,7 +1401,12 @@ async fn run_course_inner(
                 status.artifacts = artifacts.clone();
                 save_status_and_emit(app, &db, &status)?;
             }
-            if value.get("status").and_then(Value::as_str) == Some("detail") {
+            if value_status == "detail" {
+                if let Some(cache_record) =
+                    activity_detail_cache_record_from_value(&value, run_started_at)
+                {
+                    upsert_activity_detail_cache(&mut activity_detail_cache, cache_record);
+                }
                 let content = value.get("content").and_then(Value::as_str).unwrap_or("");
                 let meta = value.get("meta").cloned().unwrap_or_else(|| json!([]));
                 activity_documents.push(AnalysisDocument {
@@ -1322,11 +1425,8 @@ async fn run_course_inner(
                 });
                 continue;
             }
-            if matches!(
-                value.get("status").and_then(Value::as_str),
-                Some("detail_error" | "error")
-            ) {
-                if value.get("status").and_then(Value::as_str) == Some("detail_error") {
+            if matches!(Some(value_status), Some("detail_error" | "error")) {
+                if value_status == "detail_error" {
                     activity_documents.push(failed_analysis_document(
                         kind,
                         title,
@@ -1356,6 +1456,9 @@ async fn run_course_inner(
                 &value,
             );
         }
+        activity_detail_cache
+            .retain(|record| current_activity_detail_cache_ids.contains(&record.id));
+        status.activity_detail_cache = activity_detail_cache.clone();
         status.downloaded_files = merge_unique_ids(
             &previous.downloaded_files,
             downloaded
@@ -1364,8 +1467,17 @@ async fn run_course_inner(
         );
         status.external_links = merge_unique_ids(&previous.external_links, external_links);
         status.stage = "analyzing".into();
+        let analysis_downloads = if force_all {
+            downloaded.clone()
+        } else {
+            downloaded
+                .iter()
+                .filter(|entry| should_process_downloaded_delta(&previous, entry))
+                .cloned()
+                .collect()
+        };
         let mut documents = activity_documents;
-        documents.extend(build_analysis_documents(&downloaded, &previous));
+        documents.extend(build_analysis_documents(&analysis_downloads, &previous));
         let current_source_documents = documents.clone();
         let detected_source_events = detect_source_events(
             &previous,
@@ -1708,7 +1820,7 @@ async fn run_course_inner(
             let pending_ids = status.pending_notification_ids.clone();
             match crate::ai::send_native_notification(
                 app,
-                &format!("{}: SenseA から確認事項", status.course_name),
+                &format!("{}: Plus からのお知らせ", status.course_name),
                 &proactive_notification_body(&status.analysis),
             ) {
                 Ok(_) => {
@@ -1803,6 +1915,17 @@ async fn run_course_inner(
         // Per-operation entries are logged inline during the run; here we add a
         // single run-level entry only when the whole run failed.
         push_run_log(&mut status, "error", error.clone());
+    }
+    // After a run that actually changed something, file the documents into theme
+    // folders (AI grouping over the per-document summaries, heuristic fallback).
+    // Gated on a real change so steady "unchanged" cycles cost no extra request.
+    if outcome.is_ok() && status.stage == "done" {
+        let schedule = course_schedule_text(&db, &status.course_name);
+        let filed = organize_course_documents(luna_id, &mut status, &schedule).await;
+        if filed > 0 {
+            status.last_organized = Some(epoch_secs());
+            push_run_log(&mut status, "ok", format!("{filed}件の資料をテーマ別に整理"));
+        }
     }
     save_status_and_emit(app, &db, &status)?;
     if should_queue_deferred_delta_followup(outcome.is_ok(), deferred_delta_followup) {
@@ -1900,6 +2023,35 @@ fn build_analysis_documents(
         documents.push(document);
     }
     documents
+}
+
+fn analysis_document_from_download_entry(
+    kind: &str,
+    title: &str,
+    filename: &str,
+    path: &Path,
+    source_fingerprint: &str,
+) -> AnalysisDocument {
+    AnalysisDocument {
+        kind: kind.to_string(),
+        title: title.to_string(),
+        filename: filename.to_string(),
+        path: path.to_string_lossy().to_string(),
+        content: String::new(),
+        source_fingerprint: source_fingerprint.to_string(),
+        load_error: String::new(),
+        images: Vec::new(),
+    }
+}
+
+fn should_process_downloaded_delta(
+    previous: &CourseAutomationStatus,
+    entry: &(String, String, String, PathBuf, String),
+) -> bool {
+    let (kind, title, filename, path, source_fingerprint) = entry;
+    let document =
+        analysis_document_from_download_entry(kind, title, filename, path, source_fingerprint);
+    should_process_document_delta(previous, &document)
 }
 
 /// When text extraction fails for a PDF, fall back to its embedded page images
@@ -2020,6 +2172,137 @@ fn reusable_activity_downloads(
         }
     }
     paths
+}
+
+fn reusable_activity_details(
+    records: &[ActivityDetailCacheRecord],
+) -> HashMap<String, crate::agent_tools::ReusableActivityDetail> {
+    records
+        .iter()
+        .filter(|record| {
+            !record.detail_path.trim().is_empty()
+                && !record.list_fingerprint.trim().is_empty()
+                && !record.source_fingerprint.trim().is_empty()
+        })
+        .map(|record| {
+            (
+                record.detail_path.clone(),
+                crate::agent_tools::ReusableActivityDetail {
+                    list_fingerprint: record.list_fingerprint.clone(),
+                    source_fingerprint: record.source_fingerprint.clone(),
+                    checked_at: record.checked_at,
+                },
+            )
+        })
+        .collect()
+}
+
+fn has_retryable_activity_artifact_failure(artifacts: &[CourseArtifactRecord]) -> bool {
+    artifacts.iter().any(|artifact| {
+        artifact.status == "error"
+            && matches!(artifact.kind.as_str(), "announcement" | "report" | "legacy")
+    })
+}
+
+fn activity_detail_cache_id(kind: &str, detail_path: &str) -> String {
+    format!(
+        "{:x}",
+        Sha256::digest(format!("activity-detail|{}|{}", kind, detail_path))
+    )
+}
+
+fn activity_detail_cache_id_from_value(value: &Value) -> Option<String> {
+    let kind = value
+        .get("kind")
+        .and_then(Value::as_str)
+        .unwrap_or("activity");
+    let detail_path = value
+        .get("detail_path")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    if detail_path.trim().is_empty() {
+        None
+    } else {
+        Some(activity_detail_cache_id(kind, detail_path))
+    }
+}
+
+fn activity_detail_cache_record_from_value(
+    value: &Value,
+    checked_at: i64,
+) -> Option<ActivityDetailCacheRecord> {
+    if value.get("status").and_then(Value::as_str) != Some("detail") {
+        return None;
+    }
+    let kind = value
+        .get("kind")
+        .and_then(Value::as_str)
+        .unwrap_or("activity");
+    let title = value.get("title").and_then(Value::as_str).unwrap_or("");
+    let detail_path = value
+        .get("detail_path")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    let list_fingerprint = value
+        .get("list_fingerprint")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    let source_fingerprint = value
+        .get("source_fingerprint")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    if detail_path.trim().is_empty()
+        || list_fingerprint.trim().is_empty()
+        || source_fingerprint.trim().is_empty()
+    {
+        return None;
+    }
+    Some(ActivityDetailCacheRecord {
+        id: activity_detail_cache_id(kind, detail_path),
+        kind: kind.to_string(),
+        title: title.to_string(),
+        detail_path: detail_path.to_string(),
+        list_fingerprint: list_fingerprint.to_string(),
+        source_fingerprint: source_fingerprint.to_string(),
+        checked_at,
+    })
+}
+
+fn upsert_activity_detail_cache(
+    records: &mut Vec<ActivityDetailCacheRecord>,
+    record: ActivityDetailCacheRecord,
+) {
+    if let Some(existing) = records.iter_mut().find(|item| item.id == record.id) {
+        *existing = record;
+    } else {
+        records.push(record);
+    }
+}
+
+fn activity_source_fingerprint_for_source_info(value: &Value) -> String {
+    if value.get("status").and_then(Value::as_str) == Some("detail_error") {
+        return String::new();
+    }
+    value
+        .get("source_fingerprint")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string()
+}
+
+fn activity_detail_snapshot_value(value: &Value) -> Value {
+    let status = match value.get("status").and_then(Value::as_str).unwrap_or("") {
+        "detail_cached" => "detail",
+        other => other,
+    };
+    json!({
+        "status": status,
+        "kind": value.get("kind").and_then(Value::as_str).unwrap_or(""),
+        "title": value.get("title").and_then(Value::as_str).unwrap_or(""),
+        "detailPath": value.get("detail_path").and_then(Value::as_str).unwrap_or(""),
+        "listFingerprint": value.get("list_fingerprint").and_then(Value::as_str).unwrap_or(""),
+        "sourceFingerprint": value.get("source_fingerprint").and_then(Value::as_str).unwrap_or(""),
+    })
 }
 
 fn artifact_id(kind: &str, filename: &str) -> String {
@@ -2477,12 +2760,13 @@ async fn summarize_batch_with_agent(
     configured_max_tokens: u32,
     batch_index: usize,
 ) -> Result<(AgentCourseAnalysis, AiUsageEstimate), String> {
+    let prompt_memory = context::prompt_course_analysis(working_memory);
     let input = context::SummaryInput {
         current_local_time: chrono::Local::now().format("%Y-%m-%d %H:%M").to_string(),
         course_id: luna_id,
         course_name,
         student,
-        previous_course_analysis: working_memory,
+        previous_course_analysis: &prompt_memory,
         new_or_changed_documents: batch
             .iter()
             .copied()
@@ -2495,6 +2779,7 @@ async fn summarize_batch_with_agent(
             .collect(),
     };
     let label = format!("最終まとめ batch {}", batch_index + 1);
+    let gen_id = summary_generation_id(luna_id, batch_index, batch, source_events, &prompt_memory);
     let response: PlusJsonResponse<AgentCourseAnalysis> = request_plus_json(
         provider,
         context::SUMMARY_SYSTEM_PROMPT,
@@ -2502,7 +2787,7 @@ async fn summarize_batch_with_agent(
         Vec::new(),
         configured_max_tokens,
         20,
-        &format!("course-automation-{}-summary-{}", luna_id, batch_index),
+        &gen_id,
         &label,
     )
     .await?;
@@ -2514,6 +2799,311 @@ async fn summarize_batch_with_agent(
         ),
         response.usage,
     ))
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct OrganizeInput<'a> {
+    course_name: &'a str,
+    #[serde(skip_serializing_if = "str::is_empty")]
+    course_schedule: &'a str,
+    documents: Vec<OrganizeDocInput<'a>>,
+}
+
+/// Best-effort 授業計画 for the course as compact "第NN回: テーマ" lines, drawn
+/// from the cached KGC syllabus (matched to the luna course by simplified name).
+/// Empty when no syllabus is on hand — the grouping then works from titles and
+/// summaries alone. DB-only, no network.
+fn course_schedule_text(db: &Database, course_name: &str) -> String {
+    let target = crate::commands::simplify_course_name(course_name);
+    if target.trim().is_empty() {
+        return String::new();
+    }
+    let Ok(by_name) = db.get_planned_sessions_by_name() else {
+        return String::new();
+    };
+    let plan = by_name
+        .into_iter()
+        .filter(|(name, sessions)| {
+            !sessions.is_empty() && crate::commands::simplify_course_name(name) == target
+        })
+        .max_by_key(|(_, sessions)| sessions.len());
+    let Some((_, mut sessions)) = plan else {
+        return String::new();
+    };
+    sessions.sort_by_key(|(num, _, _)| *num);
+    sessions
+        .iter()
+        .filter(|(num, topic, _)| *num > 0 && !topic.trim().is_empty())
+        .map(|(num, topic, _)| format!("第{:02}回: {}", num, topic.trim()))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct OrganizeDocInput<'a> {
+    id: &'a str,
+    kind: &'a str,
+    title: &'a str,
+    summary: &'a str,
+}
+
+#[derive(Deserialize, Default)]
+struct OrganizeAgentOutput {
+    #[serde(default)]
+    groups: Vec<OrganizeAgentGroup>,
+}
+
+#[derive(Deserialize, Default)]
+struct OrganizeAgentGroup {
+    #[serde(default)]
+    label: String,
+    #[serde(default, alias = "ids", alias = "documentIds", alias = "docIds")]
+    file_ids: Vec<String>,
+}
+
+/// Files the course's documents into theme folders after a successful cycle.
+/// Prefers an AI grouping over the per-document summaries (the "smart" filing
+/// the user asked for); falls back to the deterministic heuristic if the model
+/// is unavailable or returns nothing usable. Best-effort: failures are silent
+/// and leave the files where they are. Returns how many files were moved.
+async fn organize_course_documents(
+    luna_id: &str,
+    status: &mut CourseAutomationStatus,
+    schedule: &str,
+) -> usize {
+    // Candidates = tracked ledger documents + loose Live notes physically in the
+    // course folder. Nothing to do for fewer than two (no grouping possible).
+    let candidates = build_organize_candidates(status);
+    if candidates.len() < 2 {
+        return 0;
+    }
+
+    // AI does the smart semantic grouping over the summaries / note previews
+    // (aligning to the syllabus); then a heuristic sweep files whatever the model
+    // left out (into the same session folders where possible) so nothing is
+    // stranded loose at the top level.
+    let ai_plan = match plan_organize_with_agent(luna_id, &candidates, &status.course_name, schedule).await {
+        Ok(plan) => plan,
+        Err(error) => {
+            log::warn!("[course_automation] organize planning failed, using heuristic: {error}");
+            Vec::new()
+        }
+    };
+    let assigned: HashSet<String> = ai_plan
+        .iter()
+        .flat_map(|group| group.doc_ids.iter().cloned())
+        .collect();
+    let sweep = organize::heuristic_plan(&candidates, &assigned);
+    let combined = organize::merge_plans(ai_plan, sweep);
+    organize::apply_groups(status, &candidates, &combined)
+}
+
+/// Builds the unified candidate set: every analysed ledger document still on
+/// disk, plus loose text notes (Live whiteboard exports etc.) sitting in the
+/// course folder that the agent never tracked — so the organizer can file those
+/// too instead of leaving them stranded at the top level.
+fn build_organize_candidates(
+    status: &CourseAutomationStatus,
+) -> std::collections::BTreeMap<String, organize::OrganizeCandidate> {
+    let mut candidates: std::collections::BTreeMap<String, organize::OrganizeCandidate> =
+        std::collections::BTreeMap::new();
+    let mut tracked_paths: HashSet<String> = HashSet::new();
+    for doc in &status.document_analyses {
+        if doc.status != "done" || doc.path.trim().is_empty() || !Path::new(&doc.path).is_file() {
+            continue;
+        }
+        tracked_paths.insert(doc.path.clone());
+        candidates.insert(
+            doc.id.clone(),
+            organize::OrganizeCandidate {
+                path: doc.path.clone(),
+                filename: doc.filename.clone(),
+                title: doc.title.clone(),
+                summary: doc.summary.clone(),
+                kind: doc.kind.clone(),
+            },
+        );
+    }
+
+    let course_dir = crate::commands::resolve_download_dir(Some(&status.course_name));
+    if let Ok(entries) = std::fs::read_dir(&course_dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if !path.is_file() {
+                continue;
+            }
+            let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+                continue;
+            };
+            // Skip hidden cache files (.{date}_..._live.cache.json etc.).
+            if name.starts_with('.') {
+                continue;
+            }
+            let ext = path
+                .extension()
+                .and_then(|e| e.to_str())
+                .unwrap_or("")
+                .to_ascii_lowercase();
+            // Only sweep text notes; binaries here are usually tracked downloads.
+            if ext != "md" && ext != "txt" {
+                continue;
+            }
+            let path_str = path.to_string_lossy().to_string();
+            if tracked_paths.contains(&path_str) {
+                continue;
+            }
+            let id = format!("loose:{name}");
+            candidates.entry(id).or_insert_with(|| organize::OrganizeCandidate {
+                path: path_str,
+                filename: name.to_string(),
+                title: name.to_string(),
+                summary: read_text_preview(&path),
+                kind: "ライブノート".to_string(),
+            });
+        }
+    }
+    candidates
+}
+
+/// A compact, whitespace-collapsed preview of a text note for the AI prompt.
+fn read_text_preview(path: &Path) -> String {
+    let Ok(bytes) = std::fs::read(path) else {
+        return String::new();
+    };
+    String::from_utf8_lossy(&bytes)
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .chars()
+        .take(400)
+        .collect()
+}
+
+/// Asks the model to cluster the already-summarised documents into theme groups,
+/// then maps the returned ids back to a `PlannedGroup` list (dropping ids the
+/// model invented or duplicated).
+async fn plan_organize_with_agent(
+    luna_id: &str,
+    candidates: &std::collections::BTreeMap<String, organize::OrganizeCandidate>,
+    course_name: &str,
+    schedule: &str,
+) -> Result<Vec<organize::PlannedGroup>, String> {
+    let provider = AgentProvider::resolve().map_err(|error| error.to_string())?;
+    let documents: Vec<OrganizeDocInput> = candidates
+        .iter()
+        .map(|(id, cand)| OrganizeDocInput {
+            id: id.as_str(),
+            kind: cand.kind.as_str(),
+            title: cand.title.as_str(),
+            summary: cand.summary.as_str(),
+        })
+        .collect();
+    let kind_by_id: HashMap<&str, &str> = candidates
+        .iter()
+        .map(|(id, cand)| (id.as_str(), cand.kind.as_str()))
+        .collect();
+    let known_ids: HashSet<&str> = candidates.keys().map(|id| id.as_str()).collect();
+
+    let input = OrganizeInput {
+        course_name,
+        course_schedule: schedule,
+        documents,
+    };
+    let mut hasher = Sha256::new();
+    hasher.update(b"course-automation-organize");
+    hasher.update([0]);
+    hasher.update(luna_id.as_bytes());
+    hasher.update([0]);
+    hasher.update(schedule.as_bytes());
+    for doc in &input.documents {
+        hasher.update([0]);
+        hasher.update(doc.id.as_bytes());
+    }
+    let gen_id = format!("course-organize-{:x}", hasher.finalize());
+
+    let response: PlusJsonResponse<OrganizeAgentOutput> = request_plus_json(
+        &provider,
+        context::ORGANIZE_SYSTEM_PROMPT,
+        serde_json::to_string(&input).map_err(|error| error.to_string())?,
+        Vec::new(),
+        PLUS_DOCUMENT_MAX_TOKENS,
+        10,
+        &gen_id,
+        "資料のテーマ整理",
+    )
+    .await?;
+
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut plan: Vec<organize::PlannedGroup> = Vec::new();
+    for group in response.value.groups {
+        let label = group.label.trim().to_string();
+        if label.is_empty() {
+            continue;
+        }
+        let doc_ids: Vec<String> = group
+            .file_ids
+            .into_iter()
+            .filter(|id| known_ids.contains(id.as_str()) && seen.insert(id.clone()))
+            .collect();
+        if doc_ids.len() < 2 {
+            continue;
+        }
+        let kind = doc_ids
+            .first()
+            .and_then(|id| kind_by_id.get(id.as_str()).copied())
+            .unwrap_or("")
+            .to_string();
+        plan.push(organize::PlannedGroup {
+            label,
+            kind,
+            doc_ids,
+        });
+    }
+    Ok(plan)
+}
+
+fn summary_generation_id(
+    luna_id: &str,
+    batch_index: usize,
+    batch: &[&DocumentAnalysis],
+    source_events: &[&SourceEvent],
+    working_memory: &AgentCourseAnalysis,
+) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(b"course-automation-summary");
+    hasher.update([0]);
+    hasher.update(luna_id.as_bytes());
+    hasher.update([0]);
+    hasher.update(batch_index.to_string().as_bytes());
+    hasher.update([0]);
+    for analysis in batch {
+        hasher.update(b"document");
+        hasher.update([0]);
+        hasher.update(analysis.id.as_bytes());
+        hasher.update([0]);
+        hasher.update(analysis.fingerprint.as_bytes());
+        hasher.update([0]);
+    }
+    for event in source_events {
+        hasher.update(b"source-event");
+        hasher.update([0]);
+        hasher.update(event.id.as_bytes());
+        hasher.update([0]);
+    }
+    if let Ok(memory_hash) = sha256_json(working_memory) {
+        hasher.update(b"memory");
+        hasher.update([0]);
+        hasher.update(memory_hash.as_bytes());
+    }
+    let digest = format!("{:x}", hasher.finalize());
+    format!(
+        "course-automation-{}-summary-{}-{}",
+        luna_id,
+        batch_index,
+        &digest[..16]
+    )
 }
 
 struct PlusJsonResponse<T> {
@@ -2709,6 +3299,19 @@ fn should_process_document_delta(
         Some(previous_analysis)
             if matches!(previous_analysis.status.as_str(), "done" | "skipped") =>
         {
+            if !document.source_fingerprint.is_empty() {
+                let same_version = previous_analysis.id == document_id(document)
+                    || previous_analysis.source_fingerprint == document.source_fingerprint;
+                if same_version {
+                    return false;
+                }
+                // Legacy success records without a source fingerprint still
+                // get one migration pass so future cycles can skip by source
+                // identity without re-reading the file.
+                if previous_analysis.source_fingerprint.is_empty() {
+                    return true;
+                }
+            }
             document_fingerprint(document)
                 .map(|fingerprint| fingerprint != previous_analysis.fingerprint)
                 .unwrap_or(true)
@@ -2798,6 +3401,11 @@ fn detect_source_events(
         .iter()
         .map(source_info_key)
         .collect::<HashSet<_>>();
+    let current_source_by_key = current_sources
+        .iter()
+        .filter(|source| !source.source_fingerprint.is_empty())
+        .map(|source| (source_info_key(source), source))
+        .collect::<HashMap<_, _>>();
     let current_document_ids = current_documents
         .iter()
         .map(document_id)
@@ -2835,6 +3443,17 @@ fn detect_source_events(
                 (
                     "changed",
                     current_id,
+                    "同じ題名/ファイル名の資料が新しい版に置き換わりました".to_string(),
+                )
+            } else if let Some(current_source) = current_source_by_key.get(&source_key) {
+                if analysis.source_fingerprint.is_empty()
+                    || analysis.source_fingerprint == current_source.source_fingerprint
+                {
+                    continue;
+                }
+                (
+                    "changed",
+                    current_source.source_fingerprint.clone(),
                     "同じ題名/ファイル名の資料が新しい版に置き換わりました".to_string(),
                 )
             } else if !current_source_keys.contains(&source_key) {
@@ -3091,7 +3710,7 @@ fn sync_action_todos(app: &AppHandle, db: &Database, status: &CourseAutomationSt
             course_name: status.course_name.clone(),
             content_type: "課題".into(),
             deadline: item.expires_at.clone(),
-            note: "SenseA 自動検知".into(),
+            note: "Plus".into(),
             created_at: now.clone(),
             ..Default::default()
         });
@@ -3237,14 +3856,8 @@ async fn process_print_candidates(
             });
             continue;
         }
-        let Some((_, _, filename, path, source_fingerprint)) =
-            downloaded.iter().find(|(_, _, filename, path, _)| {
-                filename == &candidate.filename
-                    || path
-                        .file_name()
-                        .and_then(|name| name.to_str())
-                        .is_some_and(|name| name == candidate.filename)
-            })
+        let Some((filename, path, source_fingerprint)) =
+            locate_print_candidate(downloaded, &status.artifacts, &candidate.filename)
         else {
             results.push(PrintResult {
                 filename: candidate.filename.clone(),
@@ -3256,7 +3869,7 @@ async fn process_print_candidates(
             continue;
         };
         let path_text = path.to_string_lossy().to_string();
-        let action_key = print_action_key(filename, &path_text, source_fingerprint, &category);
+        let action_key = print_action_key(&filename, &path_text, &source_fingerprint, &category);
         let candidate_result = PrintResult {
             action_key: action_key.clone(),
             filename: filename.clone(),
@@ -3290,7 +3903,7 @@ async fn process_print_candidates(
         if status.print_results.iter().any(|item| {
             item.status == "dispatching" && print_results_match(item, &candidate_result)
         }) {
-            let unknown = unknown_print_result(filename, path_text, category, action_key);
+            let unknown = unknown_print_result(&filename, path_text, category, action_key);
             status.print_results =
                 merge_print_results(&status.print_results, vec![unknown.clone()]);
             save_status_and_emit(app, db, status)?;
@@ -3316,19 +3929,63 @@ async fn process_print_candidates(
             continue;
         }
         let dispatching = dispatching_print_result(
-            filename,
+            &filename,
             path_text.clone(),
             category.clone(),
             action_key.clone(),
         );
         status.print_results = merge_print_results(&status.print_results, vec![dispatching]);
         save_status_and_emit(app, db, status)?;
-        let result = print_one(filename, path, path_text, category, action_key).await;
+        let result = print_one(&filename, &path, path_text, category, action_key).await;
         status.print_results = merge_print_results(&status.print_results, vec![result.clone()]);
         save_status_and_emit(app, db, status)?;
         results.push(result);
     }
     Ok(results)
+}
+
+fn locate_print_candidate(
+    downloaded: &[(String, String, String, PathBuf, String)],
+    artifacts: &[CourseArtifactRecord],
+    candidate_filename: &str,
+) -> Option<(String, PathBuf, String)> {
+    downloaded
+        .iter()
+        .find(|(_, _, filename, path, _)| {
+            print_candidate_matches(filename, path, candidate_filename)
+        })
+        .map(|(_, _, filename, path, source_fingerprint)| {
+            (filename.clone(), path.clone(), source_fingerprint.clone())
+        })
+        .or_else(|| {
+            artifacts
+                .iter()
+                .find(|artifact| {
+                    artifact.status == "downloaded"
+                        && !artifact.path.is_empty()
+                        && print_candidate_matches(
+                            &artifact.filename,
+                            Path::new(&artifact.path),
+                            candidate_filename,
+                        )
+                        && Path::new(&artifact.path).is_file()
+                })
+                .map(|artifact| {
+                    (
+                        artifact.filename.clone(),
+                        PathBuf::from(&artifact.path),
+                        artifact.source_fingerprint.clone(),
+                    )
+                })
+        })
+}
+
+fn print_candidate_matches(filename: &str, path: &Path, candidate_filename: &str) -> bool {
+    filename == candidate_filename
+        || path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name == candidate_filename)
 }
 
 /// Sends one already-located file to the printer and maps the outcome to a
@@ -3624,6 +4281,7 @@ mod tests {
             document_analyses: vec![DocumentAnalysis {
                 id: id.clone(),
                 fingerprint: fingerprint.clone(),
+                source_fingerprint: "remote-v1".into(),
                 status: "done".into(),
                 ..Default::default()
             }],
@@ -3635,6 +4293,7 @@ mod tests {
             document_analyses: vec![DocumentAnalysis {
                 id: id.clone(),
                 fingerprint: fingerprint.clone(),
+                source_fingerprint: "remote-v1".into(),
                 status: "skipped".into(),
                 ..Default::default()
             }],
@@ -3646,6 +4305,7 @@ mod tests {
             document_analyses: vec![DocumentAnalysis {
                 id,
                 fingerprint,
+                source_fingerprint: "remote-v1".into(),
                 status: "error".into(),
                 ..Default::default()
             }],
@@ -3654,7 +4314,158 @@ mod tests {
         assert!(should_process_document_delta(&previous_error, &document));
 
         document.content = "changed".into();
+        document.source_fingerprint = "remote-v2".into();
         assert!(should_process_document_delta(&previous_done, &document));
+    }
+
+    #[test]
+    fn downloaded_delta_skips_same_source_success_without_rehashing_content() {
+        let entry: (String, String, String, PathBuf, String) = (
+            "material".to_string(),
+            "Week 1".to_string(),
+            "notes.pdf".to_string(),
+            PathBuf::from("/tmp/notes.pdf"),
+            "remote-v1".to_string(),
+        );
+        let document =
+            analysis_document_from_download_entry(&entry.0, &entry.1, &entry.2, &entry.3, &entry.4);
+        let previous = CourseAutomationStatus {
+            document_analyses: vec![DocumentAnalysis {
+                id: document_id(&document),
+                fingerprint: "old-content-fingerprint".into(),
+                source_fingerprint: "remote-v1".into(),
+                status: "done".into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+
+        assert!(!should_process_downloaded_delta(&previous, &entry));
+    }
+
+    #[test]
+    fn downloaded_delta_allows_legacy_success_identity_migration() {
+        let entry: (String, String, String, PathBuf, String) = (
+            "material".to_string(),
+            "Week 1".to_string(),
+            "notes.pdf".to_string(),
+            PathBuf::from("/tmp/notes.pdf"),
+            "remote-v1".to_string(),
+        );
+        let previous = CourseAutomationStatus {
+            document_analyses: vec![DocumentAnalysis {
+                id: "legacy-id".into(),
+                kind: "material".into(),
+                title: "Week 1".into(),
+                filename: "notes.pdf".into(),
+                status: "done".into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+
+        assert!(should_process_downloaded_delta(&previous, &entry));
+    }
+
+    #[test]
+    fn activity_detail_cache_records_only_successful_detail_fetches() {
+        let value = json!({
+            "status": "detail",
+            "kind": "announcement",
+            "title": "LUNA告知",
+            "detail_path": "/lms/coursetop/information/listdetail?idnumber=6072&informationId=A1",
+            "list_fingerprint": "list-v1",
+            "source_fingerprint": "detail-v1",
+        });
+
+        let record = activity_detail_cache_record_from_value(&value, 1200)
+            .expect("successful detail should become cache record");
+        assert_eq!(record.kind, "announcement");
+        assert_eq!(record.list_fingerprint, "list-v1");
+        assert_eq!(record.source_fingerprint, "detail-v1");
+        assert_eq!(record.checked_at, 1200);
+
+        let reusable = reusable_activity_details(std::slice::from_ref(&record));
+        let cached = reusable
+            .get("/lms/coursetop/information/listdetail?idnumber=6072&informationId=A1")
+            .expect("cache should be keyed by detail path");
+        assert_eq!(cached.list_fingerprint, "list-v1");
+        assert_eq!(cached.source_fingerprint, "detail-v1");
+
+        let cached_marker = json!({
+            "status": "detail_cached",
+            "kind": "announcement",
+            "title": "LUNA告知",
+            "detail_path": record.detail_path,
+            "list_fingerprint": "list-v1",
+            "source_fingerprint": "detail-v1",
+        });
+        assert!(activity_detail_cache_record_from_value(&cached_marker, 1300).is_none());
+    }
+
+    #[test]
+    fn activity_detail_snapshot_treats_cached_and_fetched_detail_as_same_source() {
+        let fetched = json!({
+            "status": "detail",
+            "kind": "announcement",
+            "title": "LUNA告知",
+            "detail_path": "/lms/coursetop/information/listdetail?idnumber=6072&informationId=A1",
+            "list_fingerprint": "list-v1",
+            "source_fingerprint": "detail-v1",
+        });
+        let cached = json!({
+            "status": "detail_cached",
+            "stale": true,
+            "kind": "announcement",
+            "title": "LUNA告知",
+            "detail_path": "/lms/coursetop/information/listdetail?idnumber=6072&informationId=A1",
+            "list_fingerprint": "list-v1",
+            "source_fingerprint": "detail-v1",
+            "error": "temporary fetch failure",
+        });
+
+        assert_eq!(
+            activity_detail_snapshot_value(&fetched),
+            activity_detail_snapshot_value(&cached)
+        );
+        assert_eq!(
+            sha256_json(&activity_detail_snapshot_value(&fetched)).expect("fetched hash"),
+            sha256_json(&activity_detail_snapshot_value(&cached)).expect("cached hash"),
+        );
+    }
+
+    #[test]
+    fn activity_attachment_failures_force_detail_revalidation() {
+        let material_failure = failed_artifact(
+            "material",
+            "Week 1",
+            "notes.pdf",
+            "material-v1",
+            "download failed",
+        );
+        assert!(!has_retryable_activity_artifact_failure(&[
+            material_failure
+        ]));
+
+        let announcement_failure = failed_artifact(
+            "announcement",
+            "LUNA告知",
+            "worksheet.pdf",
+            "attachment-v1",
+            "download failed",
+        );
+        assert!(has_retryable_activity_artifact_failure(&[
+            announcement_failure
+        ]));
+
+        let report_failure = failed_artifact(
+            "report",
+            "提出課題",
+            "submission.pdf",
+            "attachment-v2",
+            "download failed",
+        );
+        assert!(has_retryable_activity_artifact_failure(&[report_failure]));
     }
 
     #[test]
@@ -3932,6 +4743,38 @@ mod tests {
         let mut pending = vec!["a".into(), "b".into(), "c".into(), "d".into()];
         remove_consumed_ids(&mut pending, &["b".into(), "d".into()]);
         assert_eq!(pending, vec!["a", "c"]);
+    }
+
+    #[test]
+    fn summary_generation_id_tracks_actual_delta_content() {
+        let memory = AgentCourseAnalysis {
+            summary: "current memory".into(),
+            ..Default::default()
+        };
+        let first = DocumentAnalysis {
+            id: "doc-1".into(),
+            fingerprint: "v1".into(),
+            ..Default::default()
+        };
+        let changed = DocumentAnalysis {
+            id: "doc-1".into(),
+            fingerprint: "v2".into(),
+            ..Default::default()
+        };
+        let event = SourceEvent {
+            id: "event-1".into(),
+            ..Default::default()
+        };
+
+        let stable_a = summary_generation_id("course", 0, &[&first], &[], &memory);
+        let stable_b = summary_generation_id("course", 0, &[&first], &[], &memory);
+        let changed_doc = summary_generation_id("course", 0, &[&changed], &[], &memory);
+        let changed_event = summary_generation_id("course", 0, &[&first], &[&event], &memory);
+
+        assert_eq!(stable_a, stable_b);
+        assert_ne!(stable_a, changed_doc);
+        assert_ne!(stable_a, changed_event);
+        assert!(stable_a.starts_with("course-automation-course-summary-0-"));
     }
 
     #[test]
@@ -4480,6 +5323,7 @@ mod tests {
                 kind: "material".into(),
                 title: "Week 1".into(),
                 filename: "worksheet.pdf".into(),
+                source_fingerprint: "remote-v2".into(),
             }],
             &[new_doc],
             &config,
@@ -4500,6 +5344,7 @@ mod tests {
                 kind: "material".into(),
                 title: "Week 1".into(),
                 filename: "worksheet.pdf".into(),
+                source_fingerprint: "remote-v1".into(),
             }],
             &[],
             &config,
@@ -4507,6 +5352,21 @@ mod tests {
         assert!(transient
             .iter()
             .all(|event| !(event.event == "removed" && event.filename == "worksheet.pdf")));
+
+        let changed_without_document = detect_source_events(
+            &previous,
+            &[SourceDocumentInfo {
+                kind: "material".into(),
+                title: "Week 1".into(),
+                filename: "worksheet.pdf".into(),
+                source_fingerprint: "remote-v2".into(),
+            }],
+            &[],
+            &config,
+        );
+        assert!(changed_without_document
+            .iter()
+            .any(|event| event.event == "changed" && event.filename == "worksheet.pdf"));
     }
 
     #[test]
@@ -4541,8 +5401,49 @@ mod tests {
                 kind: "material".into(),
                 title: "Week 1".into(),
                 filename: "notes.pdf".into(),
+                source_fingerprint: "remote-v1".into(),
             }],
             &[current],
+            &config,
+        );
+
+        assert!(events.is_empty());
+    }
+
+    #[test]
+    fn detail_error_source_presence_does_not_emit_changed_or_removed_event() {
+        let config = CourseAutomationConfig::new("course".into(), "Course".into());
+        let previous = CourseAutomationStatus {
+            document_analyses: vec![DocumentAnalysis {
+                id: "announcement-id".into(),
+                kind: "announcement".into(),
+                title: "LUNA告知".into(),
+                filename: String::new(),
+                source_fingerprint: "detail-v1".into(),
+                status: "done".into(),
+                summary: "previous detail".into(),
+                trigger_decision: "observe".into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let detail_error = json!({
+            "status": "detail_error",
+            "kind": "announcement",
+            "title": "LUNA告知",
+            "detail_path": "/lms/coursetop/information/listdetail?idnumber=6072&informationId=A1",
+            "source_fingerprint": "list-only-v2",
+        });
+
+        let events = detect_source_events(
+            &previous,
+            &[SourceDocumentInfo {
+                kind: "announcement".into(),
+                title: "LUNA告知".into(),
+                filename: String::new(),
+                source_fingerprint: activity_source_fingerprint_for_source_info(&detail_error),
+            }],
+            &[],
             &config,
         );
 
@@ -4656,6 +5557,28 @@ mod tests {
 
         assert_eq!(first, same);
         assert_ne!(first, revised);
+    }
+
+    #[test]
+    fn print_candidate_can_resolve_from_artifact_ledger_without_current_download() {
+        let path = std::env::temp_dir().join(format!("course-plus-{}.pdf", uuid::Uuid::new_v4()));
+        std::fs::write(&path, b"worksheet").expect("write cached file");
+        let artifacts = vec![CourseArtifactRecord {
+            kind: "material".into(),
+            filename: "worksheet.pdf".into(),
+            path: path.to_string_lossy().to_string(),
+            status: "downloaded".into(),
+            source_fingerprint: "remote-v1".into(),
+            ..Default::default()
+        }];
+
+        let located = locate_print_candidate(&[], &artifacts, "worksheet.pdf")
+            .expect("print candidate should resolve from persisted artifact ledger");
+
+        assert_eq!(located.0, "worksheet.pdf");
+        assert_eq!(located.1, path);
+        assert_eq!(located.2, "remote-v1");
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]

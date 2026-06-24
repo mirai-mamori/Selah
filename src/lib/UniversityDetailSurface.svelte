@@ -71,7 +71,7 @@
   // Split child panes have targets like "…-ct-s1" / "…-ct-s2".
   const isChildPane = /-s\d+$/.test(target);
   let splitMode = $state(true);
-  // The toolbar "自動検知" control is the on/off switch; the dock is shown only
+  // The toolbar 自動検知 control is the on/off switch; the dock is shown only
   // while enabled, so visibility tracks the enabled state directly.
   let agentEnabled = $state(false);
   const agentDockOpen = $derived(agentEnabled);
@@ -355,7 +355,7 @@
     updateControls();
   }
 
-  // The toolbar control directly enables/disables SenseA; the dock follows.
+  // The toolbar control directly enables/disables 自動検知; the dock follows.
   async function toggleAgentEnabled(): Promise<void> {
     const next = !agentEnabled;
     try {
@@ -637,12 +637,12 @@
         if (!agentSynced) {
           agentSynced = true;
           try {
-            const plus = await invoke<{ config: { enabled: boolean } }>("course_automation_get", {
+            const agent = await invoke<{ config: { enabled: boolean } }>("course_automation_get", {
               lunaId: idnumberParam,
               courseName: course.course_name,
             });
-            agentEnabled = plus.config.enabled;
-          } catch { /* SenseA is optional; ignore lookup failures */ }
+            agentEnabled = agent.config.enabled;
+          } catch { /* 自動検知 is optional; ignore lookup failures */ }
         }
       } else if (mode === "material") {
         detail = {

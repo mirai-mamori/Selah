@@ -59,7 +59,13 @@
   let attendanceError = $state("");
   let attendanceMeta = $state<{ open_start?: string; open_end?: string; late_start?: string; late_end?: string; content?: string } | null>(null);
   let attendancePassInput = $state<HTMLInputElement | null>(null);
+  let agentDetailOpen = $state(false);
   const courseHeading = $derived(splitLunaCourseHeading(course.course_name));
+
+  function setAgentDetailOpen(open: boolean): void {
+    if (agentDetailOpen === open) return;
+    agentDetailOpen = open;
+  }
 
   function shortDate(value: string): string {
     const match = String(value || "").match(/(\d{4})\/(\d{1,2})\/(\d{1,2})/);
@@ -347,7 +353,7 @@
           </div>
         {/if}
       </div>
-      {#if courseHeading.subtitle || course.ta_info || course.la_info}
+      {#if !agentDetailOpen && (courseHeading.subtitle || course.ta_info || course.la_info)}
         <div class="course-subtitle">
           {#if courseHeading.subtitle}<span class="course-affiliation">{courseHeading.subtitle}</span>{/if}
           {#if course.ta_info}<span class="course-staff"><strong>TA</strong><span>{course.ta_info}</span></span>{/if}
@@ -355,7 +361,7 @@
         </div>
       {/if}
     </div>
-    {#if heroTools.length}
+    {#if !agentDetailOpen && heroTools.length}
       <div class="hero-actions">
         {#each heroTools as tool}
           <button class="hero-action default" type="button" onclick={() => openExternal(tool.url, tool.name)}>
@@ -366,7 +372,11 @@
       </div>
     {/if}
     {#if agentDockOpen}
-      <CourseAgentDock lunaId={idnumberParam} courseName={course.course_name} />
+      <CourseAgentDock
+        lunaId={idnumberParam}
+        courseName={course.course_name}
+        ondetailchange={setAgentDetailOpen}
+      />
     {/if}
   </section>
 {/if}

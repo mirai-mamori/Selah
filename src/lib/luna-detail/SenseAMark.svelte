@@ -1,8 +1,4 @@
-<!--
-  Brand mark for SenseA: a gradient tile carrying a heartbeat/ECG pulse. The
-  pulse is the product signature — continuous monitoring that beats while active
-  — and keeps it distinct from a plain monochrome icon.
--->
+<!-- Brand mark for 自動検知: a gradient tile carrying a pulse line. -->
 <script lang="ts" module>
   let seq = 0;
 </script>
@@ -10,7 +6,7 @@
 <script lang="ts">
   interface Props {
     size?: number;
-    // When true the mark beats (lub-dub), signalling SenseA is live.
+    // When true the mark beats, signalling 自動検知 is active.
     beat?: boolean;
   }
   let { size = 16, beat = false }: Props = $props();
@@ -36,7 +32,6 @@
     </linearGradient>
   </defs>
   <rect x="1.5" y="1.5" width="21" height="21" rx="6.5" fill={`url(#${gid})`} />
-  <!-- heartbeat / ECG pulse = continuous monitoring that reacts to change. -->
   <path
     d="M4 12.4h3.4l1.7-4.2 2.2 7.6 2-9 1.7 5.6 1.1-2h2.9"
     stroke="#ffffff"
@@ -57,7 +52,7 @@
     transform-origin: center;
   }
 
-  /* Signature lub-dub beat while SenseA is live. */
+  /* Subtle active beat while 自動検知 is live. */
   .sensea-mark.beat {
     animation: sensea-beat 2.6s ease-in-out infinite;
   }

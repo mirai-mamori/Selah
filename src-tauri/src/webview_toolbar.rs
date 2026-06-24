@@ -1134,6 +1134,7 @@ pub fn set_owner_active_target(owner_label: &str, target: &str, title: &str, kin
         .insert(owner_label.to_string(), kind.to_string());
 }
 
+#[cfg(debug_assertions)]
 fn browser_popup_title(url: &url::Url) -> String {
     url.host_str()
         .filter(|host| !host.trim().is_empty())
@@ -1141,6 +1142,7 @@ fn browser_popup_title(url: &url::Url) -> String {
         .to_string()
 }
 
+#[cfg(debug_assertions)]
 fn open_browser_popup_window(
     app: &tauri::AppHandle,
     url: url::Url,
@@ -1311,6 +1313,7 @@ pub struct BrowserMouseSelftestReport {
 }
 
 /// Create a standalone content window used only by the browser mouse selftest.
+#[cfg(debug_assertions)]
 pub fn create_browser_window(
     app: &tauri::AppHandle,
     label: &str,
