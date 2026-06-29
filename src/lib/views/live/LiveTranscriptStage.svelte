@@ -8,9 +8,6 @@
     hasContent: boolean;
     snapshot: LiveSessionSnapshot;
     partialText: string;
-    saveProgress: string;
-    sttBooting: boolean;
-    sttBootMessage: string;
     lastSaved: LiveSaveResult | null;
     showSaveNotif: boolean;
     visibleLines: TranscriptLine[];
@@ -24,9 +21,6 @@
     hasContent,
     snapshot,
     partialText,
-    saveProgress,
-    sttBooting,
-    sttBootMessage,
     lastSaved,
     showSaveNotif,
     visibleLines,
@@ -41,17 +35,7 @@
     <div class="lyrics-empty">読み込み中…</div>
   {:else if !hasContent}
     <div class="lyrics-empty">
-      {#if snapshot.active && saveProgress}
-        <div class="save-capsule saving">
-          <span class="save-capsule-spinner"></span>
-          <span class="save-capsule-text">{saveProgress}</span>
-        </div>
-      {:else if snapshot.active && sttBooting}
-        <div class="save-capsule saving">
-          <span class="save-capsule-spinner"></span>
-          <span class="save-capsule-text">{sttBootMessage}</span>
-        </div>
-      {:else if snapshot.active}
+      {#if snapshot.active}
         <div class="waiting-vis">
           <span class="vis-bar"></span>
           <span class="vis-bar"></span>
@@ -60,31 +44,21 @@
           <span class="vis-bar"></span>
         </div>
         <span>音声待機中…</span>
+      {:else if showSaveNotif && lastSaved}
+        <!-- Saved-note preview (content). The 保存完了 *status* lives only in the
+             top island now — not repeated here. -->
+        <div class="empty-hero">
+          <div class="save-summary md">{@html renderMd(extractOverallSummary(lastSaved.markdown))}</div>
+        </div>
       {:else}
         <div class="empty-hero">
-          {#if saveProgress}
-            <div class="save-capsule saving">
-              <span class="save-capsule-spinner"></span>
-              <span class="save-capsule-text">{saveProgress}</span>
-            </div>
-          {:else if showSaveNotif && lastSaved}
-            <div class="save-capsule done">
-              <svg class="save-capsule-icon" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="url(#notif-grad)" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-                <defs><linearGradient id="notif-grad" x1="0%" y1="0%" x2="100%" y2="100%"><stop offset="0%" stop-color="#c480e8"/><stop offset="100%" stop-color="#6bacf0"/></linearGradient></defs>
-                <path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"/><polyline points="22 4 12 14.01 9 11.01"/>
-              </svg>
-              <span class="save-capsule-text">保存完了</span>
-            </div>
-            <div class="save-summary md">{@html renderMd(extractOverallSummary(lastSaved.markdown))}</div>
-          {:else}
-            <svg width="52" height="52" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1" stroke-linecap="round" stroke-linejoin="round" opacity="0.18">
-              <path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z"/>
-              <path d="M19 10v2a7 7 0 0 1-14 0v-2"/>
-              <line x1="12" y1="19" x2="12" y2="23"/>
-              <line x1="8" y1="23" x2="16" y2="23"/>
-            </svg>
-            <p>授業または自由ノートを開始すると<br/>リアルタイム文字起こしがここに表示されます</p>
-          {/if}
+          <svg width="52" height="52" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1" stroke-linecap="round" stroke-linejoin="round" opacity="0.18">
+            <path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z"/>
+            <path d="M19 10v2a7 7 0 0 1-14 0v-2"/>
+            <line x1="12" y1="19" x2="12" y2="23"/>
+            <line x1="8" y1="23" x2="16" y2="23"/>
+          </svg>
+          <p>授業または自由ノートを開始すると<br/>リアルタイム文字起こしがここに表示されます</p>
         </div>
       {/if}
     </div>
@@ -274,45 +248,6 @@
     border-radius: 999px;
   }
 
-  .save-capsule {
-    display: inline-flex;
-    align-items: center;
-    gap: 8px;
-    padding: 8px 14px;
-    border-radius: 999px;
-    font-size: 13px;
-    font-weight: 600;
-  }
-  .save-capsule.saving {
-    background: color-mix(in srgb, var(--accent) 8%, var(--bg-card));
-    border: 0.5px solid color-mix(in srgb, var(--accent) 18%, var(--glass-border));
-    color: var(--text-primary);
-  }
-  .save-capsule.done {
-    background: linear-gradient(135deg, rgba(196, 128, 232, 0.08), rgba(107, 172, 240, 0.08));
-    border: 0.5px solid rgba(175, 82, 222, 0.22);
-    color: var(--text-primary);
-  }
-  .save-capsule-icon {
-    flex: 0 0 auto;
-  }
-  .save-capsule-text {
-    color: var(--text-primary);
-  }
-  .save-capsule.done .save-capsule-text {
-    background: linear-gradient(135deg, #c480e8, #6bacf0);
-    -webkit-background-clip: text;
-    -webkit-text-fill-color: transparent;
-    background-clip: text;
-  }
-  .save-capsule-spinner {
-    width: 14px;
-    height: 14px;
-    border-radius: 50%;
-    border: 2px solid color-mix(in srgb, var(--accent) 25%, transparent);
-    border-top-color: var(--accent);
-    animation: spin 0.8s linear infinite;
-  }
   .save-summary {
     max-width: min(620px, 90%);
     padding: 12px 16px;
@@ -323,9 +258,5 @@
     font-size: 13px;
     line-height: 1.6;
     text-align: left;
-  }
-
-  @keyframes spin {
-    to { transform: rotate(360deg); }
   }
 </style>

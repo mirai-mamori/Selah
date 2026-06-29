@@ -1131,10 +1131,10 @@
       sttPhase = "idle";
       partialText = "";
       markLivePaused();
+      // Manual pause needs no toast — the island already shows the 一時停止
+      // state. The automated case keeps a warning that explains *why* it paused.
       if (automated) {
         setNotice("warning", "10分間有効な音声が認識されなかったため、LIVEを一時停止しました。");
-      } else {
-        setMessage("success", `LIVEを一時停止: ${snapshot.course?.course_name ?? "録音"}`);
       }
     } catch (e: any) {
       setMessage("error", e?.message || String(e));
@@ -1503,9 +1503,6 @@
       {hasContent}
       {snapshot}
       {partialText}
-      {saveProgress}
-      {sttBooting}
-      {sttBootMessage}
       {lastSaved}
       {showSaveNotif}
       {visibleLines}

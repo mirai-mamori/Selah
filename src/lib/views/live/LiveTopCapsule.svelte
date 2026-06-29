@@ -418,20 +418,24 @@
     overflow: visible;
   }
 
-  /* Transient notices live inside the island now (no separate banner). A thin
-     row under the main content, tinted by kind. */
+  /* Transient notices are the bottom banner of the island, tinted by kind.
+     z-index keeps them above the course menu (z 70) so an open dropdown can't
+     cover them; the full message is shown (no truncation). */
   .capsule-notice {
+    position: relative;
+    z-index: 80;
     display: flex;
     align-items: flex-start;
     gap: 7px;
-    min-width: 220px;
-    max-width: min(420px, calc(100vw - 48px));
-    padding: 7px 12px 8px;
+    max-width: min(460px, calc(100vw - 48px));
+    padding: 8px 13px 9px;
     border-top: 0.5px solid var(--glass-border);
+    border-radius: 0 0 22px 22px;
+    background: color-mix(in srgb, var(--tone, var(--text-secondary)) 9%, transparent);
     color: var(--tone, var(--text-secondary));
     font-size: 11.5px;
     font-weight: 750;
-    line-height: 1.35;
+    line-height: 1.4;
     animation: island-in 0.18s cubic-bezier(0.22, 1, 0.36, 1) both;
   }
   .capsule-notice[data-kind="error"] { --tone: var(--red); }
@@ -441,7 +445,7 @@
     flex: 0 0 auto;
     width: 6px;
     height: 6px;
-    margin-top: 4px;
+    margin-top: 5px;
     border-radius: 50%;
     background: var(--tone, currentColor);
     box-shadow: 0 0 0 1px color-mix(in srgb, var(--tone, currentColor) 24%, transparent);
@@ -449,11 +453,7 @@
   .capsule-notice-text {
     min-width: 0;
     flex: 1 1 auto;
-    display: -webkit-box;
-    -webkit-line-clamp: 2;
-    line-clamp: 2;
-    -webkit-box-orient: vertical;
-    overflow: hidden;
+    word-break: break-word;
   }
   .capsule-notice-action {
     flex: 0 0 auto;

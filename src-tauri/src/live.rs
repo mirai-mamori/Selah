@@ -328,6 +328,13 @@ fn format_full_history_for_whiteboard(summaries: &[LiveSummaryChunk]) -> String 
     if summaries.is_empty() {
         return "なし".to_string();
     }
+    // Every chunk keeps its segment summary (body) so coverage/ordering and the
+    // running narrative stay intact. Only the heavier per-term notes are trimmed
+    // for older chunks — those terms are already present as nodes in the
+    // cumulative board JSON passed alongside, so re-sending their explanations
+    // each time just grows the prompt linearly over a long session.
+    const TERMS_DETAIL_RECENT: usize = 4;
+    let cutoff = summaries.len().saturating_sub(TERMS_DETAIL_RECENT);
     let mut out = String::new();
     for (idx, chunk) in summaries.iter().enumerate() {
         if idx > 0 {
@@ -341,13 +348,24 @@ fn format_full_history_for_whiteboard(summaries: &[LiveSummaryChunk]) -> String 
             chunk.body
         ));
         if !chunk.terms.is_empty() {
-            out.push_str("\n用語:\n");
-            for term in &chunk.terms {
-                out.push_str(&format!("- {}: {}", term.term, term.explanation));
-                if !term.external_source.is_empty() {
-                    out.push_str(&format!("（出典: {}）", term.external_source));
+            if idx < cutoff {
+                // Older chunk: list term names only (explanations live on the board).
+                let names = chunk
+                    .terms
+                    .iter()
+                    .map(|term| term.term.as_str())
+                    .collect::<Vec<_>>()
+                    .join("、");
+                out.push_str(&format!("\n用語: {}", names));
+            } else {
+                out.push_str("\n用語:\n");
+                for term in &chunk.terms {
+                    out.push_str(&format!("- {}: {}", term.term, term.explanation));
+                    if !term.external_source.is_empty() {
+                        out.push_str(&format!("（出典: {}）", term.external_source));
+                    }
+                    out.push('\n');
                 }
-                out.push('\n');
             }
         }
     }
