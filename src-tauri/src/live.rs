@@ -70,6 +70,15 @@ struct LiveSession {
 
 impl LiveSession {
     fn snapshot(&self) -> LiveSessionSnapshot {
+        // Next scheduled periodic summary: the interval measured from the
+        // effective batch start (last covered line / batch start). It's an
+        // estimate — the actual flush also waits for ≥3 pending lines — but
+        // good enough to drive a countdown.
+        let next_summary_at_ms = Some(
+            (effective_batch_started_at(self)
+                + ChronoDuration::minutes(live_summary_interval_minutes()))
+            .timestamp_millis(),
+        );
         // All three Vec<...> are Arc-wrapped, so cloning is a refcount bump.
         LiveSessionSnapshot {
             active: true,
@@ -78,6 +87,8 @@ impl LiveSession {
             transcript_lines: Arc::clone(&self.transcript_lines),
             pending_lines: Arc::clone(&self.pending_lines),
             summaries: Arc::clone(&self.summaries),
+            next_summary_at_ms,
+            summarizing: self.flush_in_flight,
         }
     }
 }
@@ -104,6 +115,8 @@ fn empty_snapshot() -> LiveSessionSnapshot {
         transcript_lines: Arc::new(Vec::new()),
         pending_lines: Arc::new(Vec::new()),
         summaries: Arc::new(Vec::new()),
+        next_summary_at_ms: None,
+        summarizing: false,
     }
 }
 
@@ -1641,6 +1654,8 @@ pub fn live_peek_day_cache(course: LiveCourseInfo) -> LiveSessionSnapshot {
             transcript_lines: Arc::new(cache.transcript_lines),
             pending_lines: Arc::new(Vec::new()),
             summaries: Arc::new(cache.summaries),
+            next_summary_at_ms: None,
+            summarizing: false,
         },
         None => empty_snapshot(),
     }

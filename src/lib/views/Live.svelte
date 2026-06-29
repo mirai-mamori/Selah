@@ -4,7 +4,6 @@
   import { invoke } from "@tauri-apps/api/core";
   import { getCurrentWindow } from "@tauri-apps/api/window";
   import { onCacheUpdate, activeTab, liveTodoPending } from "../stores";
-  import LiveNotice from "./live/LiveNotice.svelte";
   import LiveRightRail from "./live/LiveRightRail.svelte";
   import LiveScrollToBottomButton from "./live/LiveScrollToBottomButton.svelte";
   import LiveSummaryDetailPage from "./live/LiveSummaryDetailPage.svelte";
@@ -45,7 +44,15 @@
   import { PERIOD_TIMES } from "../types";
   import { buildCourseSlots, type CourseSlot } from "../schedule";
   import { computeWhiteboardLayout, whiteboardTopics } from "../whiteboardLayout";
-  import type { NoticeAction, NoticeKind, NoticeSource, NoticeState, SttPhase, WhiteboardStagePreset } from "./live/liveTypes";
+  import type {
+    LiveControlModel,
+    NoticeAction,
+    NoticeKind,
+    NoticeSource,
+    NoticeState,
+    SttPhase,
+    WhiteboardStagePreset,
+  } from "./live/liveTypes";
 
   let scheduleData = $state<ScheduleResponse | null>(null);
   let allCourseOptions = $state<CourseSlot[]>([]);
@@ -66,9 +73,37 @@
   let pageLoading = $state(true);
   let notice = $state<NoticeState>(null);
   let liveReady = $state(false);
+  let readinessMessage = $state("");
   let lastSaved = $state<LiveSaveResult | null>(null);
   let showSaveNotif = $state(false);
   let saveProgress = $state("");
+  // Structured progress for the LIVE 終了/要約 pipeline so the capsule can show a
+  // step counter + progress bar + "next step" hint instead of a single label.
+  let saveSteps = $state<string[]>([]);
+  let saveStepIndex = $state(0);
+
+  const STOP_STEP = "録音を停止中";
+  const AUTO_STOP_STEP = "自動終了の準備中";
+  const SUMMARY_STEP = "AI要約を生成中";
+  const WRITE_STEP = "ファイルに書き出し中";
+  const TODO_STEP = "やること・締切を抽出中";
+  const OVERALL_STEP = "全体要約を生成中";
+
+  function beginSave(steps: string[], index = 0) {
+    saveSteps = steps;
+    saveStepIndex = Math.min(Math.max(index, 0), steps.length - 1);
+    saveProgress = steps[saveStepIndex] ? `${steps[saveStepIndex]}…` : "";
+  }
+  function gotoSave(label: string) {
+    const i = saveSteps.indexOf(label);
+    if (i >= 0) saveStepIndex = i;
+    saveProgress = `${label}…`;
+  }
+  function endSave() {
+    saveSteps = [];
+    saveStepIndex = 0;
+    saveProgress = "";
+  }
   let summaryViewIndex = $state(-1); // -1 = auto (latest)
   let summaryDetailOpen = $state(false); // full secondary page (not a popup)
   let overallSummary = $state("");
@@ -83,7 +118,6 @@
   const NO_EFFECTIVE_SPEECH_AUTO_PAUSE_MS = 10 * 60 * 1000;
   const PAUSED_AUTO_FINISH_MS = 20 * 60 * 1000;
   const LIVE_AUTO_GUARD_INTERVAL_MS = 60 * 1000;
-  let pendingActivationMode: "start" | "resume" | null = null;
   let cancelSessionOnStartFailure = false;
   let lastEffectiveSpeechAtMs: number | null = null;
   let pausedSinceMs: number | null = null;
@@ -109,7 +143,20 @@
   }
 
   function openSummaryDetail() {
+    // Open the detail on the segment the rail is currently showing (not the
+    // overall), so tapping a card stays in context.
+    if (activeSegmentIdx >= 0) summaryViewIndex = activeSegmentIdx;
     summaryDetailOpen = true;
+  }
+
+  function openOverallSummary() {
+    // 全体要約 is always the trailing entry when present; jump straight into it.
+    summaryViewIndex = summaryEntries.length - 1;
+    summaryDetailOpen = true;
+  }
+
+  function selectRailSegment(idx: number) {
+    summaryViewIndex = idx;
   }
 
   function closeSummaryDetail() {
@@ -148,12 +195,35 @@
       ? summaryEntries.length - 1
       : summaryViewIndex
   );
-  // Chunk index used for term annotations and the whiteboard. When the overall
-  // entry is the active one there is no backing chunk, so this is -1 and the
-  // rail simply shows nothing for it.
-  const activeSummaryIdx = $derived(
-    activeEntryIdx >= 0 && activeEntryIdx < snapshot.summaries.length ? activeEntryIdx : -1
+  // The right-rail cards (summary / terms / whiteboard) always reflect a real
+  // SEGMENT — the 全体要約 never drives them (全体要約不参与卡片显示). When the
+  // overall entry happens to be the selected one (e.g. auto = trailing entry),
+  // the rail falls back to the latest segment so the cards still load.
+  const segmentCount = $derived(snapshot.summaries.length);
+  const activeSegmentIdx = $derived(
+    segmentCount === 0
+      ? -1
+      : activeEntryIdx >= 0 && activeEntryIdx < segmentCount
+        ? activeEntryIdx
+        : segmentCount - 1,
   );
+  // Chunk index used for term annotations and the whiteboard.
+  const activeSummaryIdx = $derived(activeSegmentIdx);
+
+  // Rail control-strip status: either "generating" or a countdown to the next
+  // scheduled periodic summary (both backed by snapshot.next_summary_at_ms /
+  // .summarizing — see live.rs). `now` ticks every 30s, so minute resolution.
+  const summarizing = $derived(!!snapshot.summarizing);
+  const summaryStatusLabel = $derived.by(() => {
+    if (summarizing) return "要約を生成中…";
+    if (!snapshot.active) return "";
+    const at = snapshot.next_summary_at_ms;
+    if (!at) return "";
+    const diff = at - now.getTime();
+    if (diff < 60_000) return "まもなく次の要約";
+    return `次の要約まで約${Math.ceil(diff / 60_000)}分`;
+  });
+
   const activeSummaryTerms = $derived.by(() => {
     const chunk = snapshot.summaries[activeSummaryIdx];
     return (chunk?.terms ?? []).filter((term) => term.term?.trim() && term.explanation?.trim());
@@ -479,13 +549,6 @@
         return "";
     }
   });
-  const liveBadgeLabel = $derived.by(() => {
-    if (!snapshot.active) return "LIVE";
-    if (sttBooting) return "準備中";
-    if (sttPhase === "listening") return "REC";
-    return saveProgress ? "処理中" : "一時停止";
-  });
-
   const remainingLabel = $derived.by(() => {
     if (!snapshot.active || !snapshot.course) return "";
     if (snapshot.course.is_free_note) return "";
@@ -505,6 +568,14 @@
     }
     return now.toLocaleTimeString("ja-JP", { hour: "2-digit", minute: "2-digit" });
   });
+
+  function formatDuration(ms: number): string {
+    const totalMinutes = Math.max(0, Math.floor(ms / 60_000));
+    const hours = Math.floor(totalMinutes / 60);
+    const minutes = totalMinutes % 60;
+    if (hours <= 0) return `${minutes}分`;
+    return `${hours}:${String(minutes).padStart(2, "0")}`;
+  }
 
   let autoFollow = $state(true);
   let showScrollBtn = $derived(sttListening && !autoFollow);
@@ -597,10 +668,149 @@
     return courseOptions.filter((course) => course.day === day);
   });
 
-  const canStart = $derived(!snapshot.active && !!selectedCourse && liveReady && !busy);
-  const canStartFreeNote = $derived(!snapshot.active && liveReady && !busy);
+  // Free-note is now an option inside the mode selector, not a separate button.
+  const FREE_NOTE_KEY = "__free_note__";
+  const freeNoteSelected = $derived(selectedKey === FREE_NOTE_KEY);
+  const canStart = $derived(
+    !snapshot.active && liveReady && !busy && (freeNoteSelected || !!selectedCourse),
+  );
   const canStop = $derived(snapshot.active && !busy);
   const canGenerateOverallSummary = $derived(snapshot.active && snapshot.transcript_lines.length > 0 && !busy);
+
+  const activeTargetLabel = $derived.by(() => {
+    if (snapshot.course) {
+      return snapshot.course.is_free_note ? "自由ノート" : snapshot.course.course_name;
+    }
+    if (freeNoteSelected) return "自由ノート";
+    return selectedCourse?.name ?? "録音対象";
+  });
+
+  const selectedTargetMeta = $derived.by(() => {
+    if (pageLoading) return "読み込み中";
+    if (freeNoteSelected) return "自由入力";
+    if (!selectedCourse) return "授業候補なし";
+    const room = selectedCourse.room?.trim();
+    return `${selectedCourse.period}限${room ? `・${room}` : ""}`;
+  });
+
+  const elapsedLabel = $derived.by(() => {
+    if (!snapshot.active || !snapshot.started_at) return "";
+    const startedAt = snapshotStartedAtMs(snapshot.started_at);
+    if (startedAt == null) return "";
+    return `経過 ${formatDuration(now.getTime() - startedAt)}`;
+  });
+
+  const pausedDurationLabel = $derived.by(() => {
+    if (!snapshot.active || sttListening || sttBooting || !pausedSinceMs) return "";
+    return `停止 ${formatDuration(now.getTime() - pausedSinceMs)}`;
+  });
+
+  const pauseHintLabel = $derived.by(() => {
+    if (!snapshot.active || sttListening || sttBooting || !pausedSinceMs) return "";
+    const remainingMs = Math.max(0, PAUSED_AUTO_FINISH_MS - (now.getTime() - pausedSinceMs));
+    return `自動保存まで ${formatDuration(remainingMs)}`;
+  });
+
+  const lineCountLabel = $derived(`${snapshot.transcript_lines.length}行`);
+  const summaryCountLabel = $derived(
+    snapshot.summaries.length > 0 ? `${snapshot.summaries.length}要約` : "要約待ち",
+  );
+
+  const liveControl = $derived.by((): LiveControlModel => {
+    const saved = !snapshot.active && showSaveNotif && !!lastSaved;
+    const blocked = !snapshot.active && !pageLoading && !liveReady;
+    const thinking = !!saveProgress;
+    const phase = thinking
+      ? "thinking"
+      : snapshot.active && sttBooting
+        ? "booting"
+        : snapshot.active && sttListening
+          ? "recording"
+          : snapshot.active
+            ? "paused"
+            : saved
+              ? "saved"
+              : blocked
+                ? "blocked"
+                : "idle";
+
+    const statusLabel =
+      phase === "recording" ? "REC"
+      : phase === "booting" ? "準備中"
+      : phase === "paused" ? "一時停止"
+      : phase === "thinking" ? "処理中"
+      : phase === "saved" ? "保存完了"
+      : phase === "blocked" ? "要設定"
+      : "LIVE";
+
+    const targetMeta = snapshot.active
+      ? (phase === "paused" ? pausedDurationLabel : remainingLabel || elapsedLabel)
+      : selectedTargetMeta;
+
+    const detailLabel =
+      phase === "thinking" ? saveProgress
+      : phase === "booting" ? sttBootMessage
+      : phase === "paused" ? pauseHintLabel || "転写は一時停止中です"
+      : phase === "blocked" ? readinessMessage || "AI設定を確認してください"
+      : phase === "saved" ? "ノートを書き出しました"
+      : phase === "recording" ? "文字起こし中"
+      : hasContent && selectedCourse ? "保存済みの内容があります" : "録音対象を選んで開始";
+
+    const primaryAction =
+      phase === "blocked" ? "settings"
+      : phase === "recording" ? "pause"
+      : phase === "paused" ? "resume"
+      : phase === "idle" || phase === "saved" ? "start"
+      : "none";
+
+    const primaryLabel =
+      primaryAction === "settings" ? "AI設定"
+      : primaryAction === "pause" ? "一時停止"
+      : primaryAction === "resume" ? "再開"
+      : primaryAction === "start" ? "開始"
+      : "処理中";
+
+    const primaryDisabled =
+      primaryAction === "settings" ? false
+      : primaryAction === "pause" || primaryAction === "resume" ? busy
+      : primaryAction === "start" ? !canStart
+      : true;
+
+    return {
+      phase,
+      tone:
+        phase === "recording" ? "recording"
+        : phase === "booting" || phase === "thinking" ? "thinking"
+        : phase === "paused" ? "paused"
+        : phase === "blocked" ? "blocked"
+        : phase === "saved" ? "saved"
+        : canStart ? "ready" : "neutral",
+      statusLabel,
+      targetLabel: activeTargetLabel,
+      targetMeta,
+      progressLabel: phase === "thinking" ? saveProgress : "",
+      saveSteps: phase === "thinking" ? saveSteps : [],
+      saveStepIndex,
+      detailLabel,
+      elapsedLabel,
+      lineCountLabel,
+      summaryCountLabel,
+      pauseHintLabel,
+      primaryAction,
+      primaryLabel,
+      primaryDisabled,
+      primaryTitle:
+        primaryAction === "settings" ? "AI設定を開く"
+        : primaryAction === "pause" ? "録音を一時停止"
+        : primaryAction === "resume" ? "録音を再開"
+        : primaryAction === "start" ? "録音を開始"
+        : detailLabel,
+      showModeSelect: !snapshot.active && phase !== "thinking",
+      showSummaryAction: snapshot.active && (phase === "recording" || phase === "paused"),
+      showSaveAction: snapshot.active && (phase === "recording" || phase === "paused"),
+      showClearAction: !snapshot.active && hasContent && !!selectedCourse,
+    };
+  });
 
   // When the selected course changes (and session not active), load cached history
   $effect(() => {
@@ -685,10 +895,10 @@
     }
   }
 
-  function setSttNotice(message: string) {
-    if (notice?.source === "readiness" && notice.kind === "error") return;
-    setNotice("warning", message, { source: "stt" });
-  }
+  // STT init progress (確認中 / 起動中 / 初期化中) is surfaced by the top capsule
+  // itself (準備中 + boot message), so the redundant inline notice bar is gone.
+  // Kept as a no-op so the call sites + clearSttNotice stay structurally intact.
+  function setSttNotice(_message: string) {}
 
   function clearSttNotice() {
     if (notice?.source === "stt") {
@@ -744,10 +954,16 @@
         return;
       }
     }
-    if (preserveSelection && courseOptions.some((course) => courseKey(course) === selectedKey)) {
+    if (
+      preserveSelection &&
+      (selectedKey === FREE_NOTE_KEY ||
+        courseOptions.some((course) => courseKey(course) === selectedKey))
+    ) {
       return;
     }
-    selectedKey = defaultSelectedCourseKey(courseOptions, date);
+    // Fall back to free-note when there are no course candidates, so the mode
+    // selector always has a valid selection.
+    selectedKey = defaultSelectedCourseKey(courseOptions, date) || FREE_NOTE_KEY;
   }
 
   async function refreshSchedule(preserveSelection = true) {
@@ -767,16 +983,18 @@
     const ready = await isAiReady();
     liveReady = ready;
     if (liveReady) {
+      readinessMessage = "";
       clearReadinessNotice();
       return;
     }
-    setReadinessNotice(buildReadinessMessage(cfg, ready));
+    readinessMessage = buildReadinessMessage(cfg, ready);
+    setReadinessNotice(readinessMessage);
   }
 
   async function ensureReadyToStart() {
     await refreshReadiness();
     if (!liveReady) {
-      throw new Error(notice?.source === "readiness" ? notice.text : "AIの準備ができていません");
+      throw new Error(readinessMessage || (notice?.source === "readiness" ? notice.text : "AIの準備ができていません"));
     }
   }
 
@@ -847,7 +1065,6 @@
     sttListening = false;
     sttPhase = "checking";
     setSttNotice("音声入力モデルを確認中…");
-    pendingActivationMode = "start";
     cancelSessionOnStartFailure = true;
     try {
       await ensureReadyToStart();
@@ -867,7 +1084,6 @@
       }
       autoFollow = true;
     } catch (e: any) {
-      pendingActivationMode = null;
       cancelSessionOnStartFailure = false;
       sttPhase = "idle";
       clearSttNotice();
@@ -891,11 +1107,19 @@
     await startSession(createFreeNoteCourse());
   }
 
+  // Dispatch by the unified mode selector: free-note option vs a course.
+  async function startSelected() {
+    if (freeNoteSelected) {
+      await startFreeNote();
+    } else {
+      await startLive();
+    }
+  }
+
   async function pauseLiveInternal(automated = false) {
     busy = true;
     clearNotice();
     clearSttNotice();
-    pendingActivationMode = null;
     cancelSessionOnStartFailure = false;
     try {
       if (!isDemoActive()) {
@@ -930,7 +1154,6 @@
     sttListening = false;
     sttPhase = "checking";
     setSttNotice("音声入力モデルを確認中…");
-    pendingActivationMode = "resume";
     cancelSessionOnStartFailure = false;
     try {
       await ensureReadyToStart();
@@ -946,7 +1169,6 @@
       }
       autoFollow = true;
     } catch (e: any) {
-      pendingActivationMode = null;
       cancelSessionOnStartFailure = false;
       sttPhase = "idle";
       markLivePaused();
@@ -961,10 +1183,11 @@
     busy = true;
     clearNotice();
     clearSttNotice();
-    pendingActivationMode = null;
     cancelSessionOnStartFailure = false;
     sttPhase = "idle";
-    saveProgress = automated ? "自動終了の準備中…" : "録音を停止中…";
+    const stopLabel = automated ? AUTO_STOP_STEP : STOP_STEP;
+    // Provisional full pipeline; corrected once we know empty/skip below.
+    beginSave([stopLabel, SUMMARY_STEP, WRITE_STEP, TODO_STEP]);
     try {
       if (!isDemoActive()) {
         try {
@@ -975,29 +1198,32 @@
       partialText = "";
       snapshot = await liveGetSession();
       if (snapshot.transcript_lines.length === 0) {
+        beginSave([stopLabel, WRITE_STEP], 1);
         const ended = await liveFinishSession();
         lastSaved = ended.saved ? ended : null;
         snapshot = await liveGetSession();
         clearLiveAutoLifecycle();
-        saveProgress = "";
+        endSave();
         if (!ended.saved) {
           setMessage("success", automated ? "20分間再開されなかったため、LIVEを自動終了しました" : "LIVEを終了しました");
         }
         return;
       }
       const skipAiSummarization = shouldSkipAiSummarizationForSnapshot(snapshot);
-      if (!skipAiSummarization) {
-        saveProgress = "AI要約を生成中…";
+      if (skipAiSummarization) {
+        beginSave([stopLabel, WRITE_STEP, TODO_STEP], 1);
+      } else {
+        gotoSave(SUMMARY_STEP);
         const flushed = await liveFlushSummary(true);
         snapshot = flushed;
       }
-      saveProgress = "ファイルに書き出し中…";
+      gotoSave(WRITE_STEP);
       const saved = await liveFinishSession();
       lastSaved = saved.saved ? saved : null;
       overallSummary = "";
       snapshot = await liveGetSession();
       clearLiveAutoLifecycle();
-      saveProgress = "";
+      endSave();
       if (saved.saved) {
         showSaveNotif = true;
         setTimeout(() => { showSaveNotif = false; }, 6000);
@@ -1014,7 +1240,7 @@
         setMessage("success", automated ? "20分間再開されなかったため、LIVEを自動終了しました" : "LIVEを終了しました");
       }
     } catch (e: any) {
-      saveProgress = "";
+      endSave();
       setMessage("error", e?.message || String(e));
     } finally {
       busy = false;
@@ -1029,7 +1255,7 @@
     if (!canGenerateOverallSummary) return;
     busy = true;
     clearNotice();
-    saveProgress = "全体要約を生成中…";
+    beginSave([OVERALL_STEP]);
     try {
       overallSummary = await liveGenerateOverallSummary();
       const at = new Date();
@@ -1041,33 +1267,7 @@
     } catch (e: any) {
       setMessage("error", e?.message || String(e));
     } finally {
-      saveProgress = "";
-      busy = false;
-    }
-  }
-
-  async function cancelLive() {
-    busy = true;
-    try {
-      clearSttNotice();
-      pendingActivationMode = null;
-      cancelSessionOnStartFailure = false;
-      sttPhase = "idle";
-      if (!isDemoActive()) {
-        try {
-          await invoke("stt_stop_stream");
-        } catch {}
-      }
-      await liveCancelSession();
-      snapshot = await liveGetSession();
-      overallSummary = "";
-      partialText = "";
-      sttListening = false;
-      clearLiveAutoLifecycle();
-      setMessage("success", "LIVEセッションを破棄しました");
-    } catch (e: any) {
-      setMessage("error", e?.message || String(e));
-    } finally {
+      endSave();
       busy = false;
     }
   }
@@ -1161,7 +1361,6 @@
       unlistenState = await listen<{ state: string; caller: string }>("stt-state", (event) => {
         if (event.payload.caller !== "live") return;
         const wasListening = sttListening;
-        const previousPhase = sttPhase;
         sttListening = event.payload.state === "initializing" || event.payload.state === "listening";
         if (event.payload.state === "initializing") {
           sttPhase = "initializing";
@@ -1170,11 +1369,7 @@
           sttPhase = "listening";
           clearSttNotice();
           cancelSessionOnStartFailure = false;
-          if (previousPhase !== "listening") {
-            const verb = pendingActivationMode === "resume" ? "LIVEを再開" : "LIVEを開始";
-            setMessage("success", `${verb}: ${snapshot.course?.course_name ?? selectedCourse?.name ?? "録音"}`);
-          }
-          pendingActivationMode = null;
+          // No green "開始/再開" confirmation bar — the capsule flips to REC.
           if (!wasListening) markLiveListeningStarted();
         } else {
           sttPhase = "idle";
@@ -1188,7 +1383,6 @@
         const wasStarting = sttPhase === "starting" || sttPhase === "initializing";
         sttListening = false;
         sttPhase = "idle";
-        pendingActivationMode = null;
         clearSttNotice();
         if (snapshot.active) markLivePaused();
         setMessage("error", event.payload.message);
@@ -1231,7 +1425,8 @@
       unlistenAiConfig = await listen("ai-config-changed", () => {
         refreshReadiness().catch((e: any) => {
           liveReady = false;
-          setReadinessNotice(e?.message || "LIVEにはAIの準備が必要です。AI設定を確認してください。");
+          readinessMessage = e?.message || "LIVEにはAIの準備が必要です。AI設定を確認してください。";
+          setReadinessNotice(readinessMessage);
         });
       });
       // Automatic Live summary/whiteboard flushing is owned by the backend.
@@ -1276,28 +1471,19 @@
 
 <div class="live-root view" class:board-expanded={whiteboardExpanded || summaryDetailOpen}>
   <LiveTopCapsule
-    {snapshot}
-    {sttPhase}
-    {liveBadgeLabel}
-    {remainingLabel}
-    {saveProgress}
+    control={liveControl}
+    {notice}
     {renderedCourseOptions}
     bind:selectedKey
     {pageLoading}
-    {hasContent}
-    {selectedCourse}
     {busy}
-    {canStart}
-    {canStartFreeNote}
     {canStop}
     {canGenerateOverallSummary}
-    {sttListening}
-    {sttBooting}
     {confirmClear}
+    freeNoteKey={FREE_NOTE_KEY}
     {courseKey}
     {courseLabel}
-    onStartLive={startLive}
-    onStartFreeNote={startFreeNote}
+    onStart={startSelected}
     onClearCourseData={clearCourseData}
     onCancelClear={cancelClearCourseData}
     onConfirmClear={confirmClearCourseData}
@@ -1305,13 +1491,12 @@
     onGenerateOverallSummary={generateOverallSummary}
     onPauseLive={pauseLive}
     onResumeLive={resumeLive}
+    onOpenAiSettings={() => openSettingsWindow("ai")}
   />
 
   <!-- ─── Main scrollable area ─── -->
   <div class="main-scroll" bind:this={scrollEl} use:bindManualScroll role="region" aria-label="LIVE transcript">
     <div class="scroll-spacer-top"></div>
-
-    <LiveNotice {notice} onOpenAiSettings={() => openSettingsWindow("ai")} />
 
     <LiveTranscriptStage
       {pageLoading}
@@ -1338,10 +1523,14 @@
 
   <LiveRightRail
     summaryEntries={summaryEntries}
-    activeSummaryIdx={activeEntryIdx}
+    activeSummaryIdx={activeSegmentIdx}
     summarySegmentCount={snapshot.summaries.length}
     {renderMd}
     onOpenSummaryDetail={openSummaryDetail}
+    onSelectSegment={selectRailSegment}
+    onOpenOverall={openOverallSummary}
+    {summarizing}
+    {summaryStatusLabel}
     previewLayout={previewWhiteboardLayout}
     {activeSummaryTerms}
     {termsCollapsed}

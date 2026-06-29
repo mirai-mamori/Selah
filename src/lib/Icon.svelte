@@ -54,6 +54,8 @@
     | "doc.search"
     | "star"
     | "list.checks"
+    | "play"
+    | "pause"
     | "stop";
 </script>
 
@@ -194,9 +196,8 @@
     <polyline points="3 6 5 6 21 6" />
     <path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2" />
   {:else if name === "sparkles"}
-    <path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z" />
-    <circle cx="18" cy="6" r="1" fill="currentColor" stroke="none" />
-    <circle cx="20.5" cy="9.5" r="0.5" fill="currentColor" stroke="none" />
+    <path d="M11 3l1.5 4.9a3 3 0 0 0 2 2L19 11.5l-4.5 1.6a3 3 0 0 0-2 2L11 20l-1.5-4.9a3 3 0 0 0-2-2L3 11.5l4.5-1.6a3 3 0 0 0 2-2z" />
+    <path d="M18.5 3.5l.5 1.7 1.7.5-1.7.5-.5 1.7-.5-1.7-1.7-.5 1.7-.5z" fill="currentColor" stroke="none" />
   {:else if name === "scales"}
     <!-- Scales of justice — top knob, crossbeam, two suspended pans, base. -->
     <circle cx="12" cy="4" r="0.9" fill="currentColor" stroke="none" />
@@ -277,6 +278,11 @@
     <path d="m3 16.5 1.8 1.8L8 15" />
     <line x1="12" y1="7" x2="21" y2="7" />
     <line x1="12" y1="17" x2="21" y2="17" />
+  {:else if name === "play"}
+    <path d="M8 5v14l11-7z" fill="currentColor" stroke="none" />
+  {:else if name === "pause"}
+    <rect x="7" y="5" width="4" height="14" rx="1" fill="currentColor" stroke="none" />
+    <rect x="13" y="5" width="4" height="14" rx="1" fill="currentColor" stroke="none" />
   {:else if name === "stop"}
     <rect x="6" y="6" width="12" height="12" rx="2" fill="currentColor" stroke="none" />
   {:else if name === "copilot"}

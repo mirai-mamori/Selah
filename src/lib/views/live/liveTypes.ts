@@ -4,6 +4,40 @@ export type NoticeKind = "error" | "success" | "warning";
 export type NoticeSource = "general" | "readiness" | "stt";
 export type NoticeAction = "open-ai-settings";
 export type SttPhase = "idle" | "checking" | "starting" | "initializing" | "listening";
+export type LiveControlPhase =
+  | "idle"
+  | "blocked"
+  | "booting"
+  | "recording"
+  | "paused"
+  | "thinking"
+  | "saved";
+export type LiveControlTone = "neutral" | "ready" | "recording" | "paused" | "thinking" | "blocked" | "saved";
+export type LivePrimaryAction = "start" | "pause" | "resume" | "settings" | "none";
+
+export type LiveControlModel = {
+  phase: LiveControlPhase;
+  tone: LiveControlTone;
+  statusLabel: string;
+  targetLabel: string;
+  targetMeta: string;
+  progressLabel: string;
+  saveSteps: string[];
+  saveStepIndex: number;
+  detailLabel: string;
+  elapsedLabel: string;
+  lineCountLabel: string;
+  summaryCountLabel: string;
+  pauseHintLabel: string;
+  primaryAction: LivePrimaryAction;
+  primaryLabel: string;
+  primaryDisabled: boolean;
+  primaryTitle: string;
+  showModeSelect: boolean;
+  showSummaryAction: boolean;
+  showSaveAction: boolean;
+  showClearAction: boolean;
+};
 
 export type NoticeState = {
   kind: NoticeKind;

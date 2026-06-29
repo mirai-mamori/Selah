@@ -8,10 +8,15 @@
 
   interface Props {
     summaryEntries: SummaryEntry[];
+    /** Index of the active SEGMENT (into the non-overall entries). */
     activeSummaryIdx: number;
     summarySegmentCount: number;
     renderMd: (text: string) => string;
     onOpenSummaryDetail: () => void;
+    onSelectSegment: (idx: number) => void;
+    onOpenOverall: () => void;
+    summarizing: boolean;
+    summaryStatusLabel: string;
     previewLayout: WhiteboardLayoutResult | null;
     activeSummaryTerms: LiveTermExplanation[];
     termsCollapsed: boolean;
@@ -32,6 +37,10 @@
     summarySegmentCount,
     renderMd,
     onOpenSummaryDetail,
+    onSelectSegment,
+    onOpenOverall,
+    summarizing,
+    summaryStatusLabel,
     previewLayout,
     activeSummaryTerms,
     termsCollapsed,
@@ -54,10 +63,46 @@
       ? `0 0 ${previewLayout.stage.width} ${previewLayout.stage.height}`
       : "0 0 100 100",
   );
+
+  // The overall summary is a separate quick-entry, not a card-driving segment.
+  const segments = $derived(summaryEntries.filter((e) => !e.isOverall));
+  const hasOverall = $derived(summaryEntries.some((e) => e.isOverall));
+
+  const canPrevSegment = $derived(activeSummaryIdx > 0);
+  const canNextSegment = $derived(activeSummaryIdx < segments.length - 1);
+  function prevSegment() {
+    if (canPrevSegment) onSelectSegment(activeSummaryIdx - 1);
+  }
+  function nextSegment() {
+    if (canNextSegment) onSelectSegment(activeSummaryIdx + 1);
+  }
 </script>
 
-{#if summaryEntries.length > 0 || previewLayout || activeSummaryTerms.length > 0}
+{#if summaryEntries.length > 0 || previewLayout || activeSummaryTerms.length > 0 || summaryStatusLabel}
   <div class="right-rail">
+    {#if segments.length > 0 || summaryStatusLabel}
+      <div class="seg-bar" class:status-only={segments.length === 0} aria-label="区間切替">
+        {#if segments.length > 0}
+          <div class="seg-nav">
+            <button type="button" class="seg-nav-btn" onclick={prevSegment} disabled={!canPrevSegment} aria-label="前の区間" title="前の区間">
+              <svg width="9" height="9" viewBox="0 0 10 10" fill="none"><path d="M6.5 2L3 5l3.5 3" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>
+            </button>
+            <button type="button" class="seg-nav-btn" onclick={nextSegment} disabled={!canNextSegment} aria-label="次の区間" title="次の区間">
+              <svg width="9" height="9" viewBox="0 0 10 10" fill="none"><path d="M3.5 2L7 5l-3.5 3" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>
+            </button>
+          </div>
+        {/if}
+        {#if summaryStatusLabel}
+          <div class="seg-status" class:generating={summarizing} role="status">
+            {#if summarizing}<span class="mini-spinner" aria-hidden="true"></span>{/if}
+            <span>{summaryStatusLabel}</span>
+          </div>
+        {/if}
+        {#if hasOverall}
+          <button type="button" class="seg-overall" onclick={onOpenOverall} title="全体要約を開く">全体</button>
+        {/if}
+      </div>
+    {/if}
     {#if summaryEntries.length > 0}
       <LiveSummaryCard
         entries={summaryEntries}
@@ -200,6 +245,115 @@
   .right-rail > * {
     pointer-events: auto;
   }
+
+  /* Integrated control strip above the cards: segment ◀▶ nav, 全体 quick-entry,
+     and the next-summary countdown / generating status. */
+  /* No shared background — each control is its own floating chip. */
+  .seg-bar {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    width: 100%;
+    animation: term-stack-in 0.32s cubic-bezier(0.22, 1, 0.36, 1) both;
+  }
+  .seg-bar.status-only {
+    width: max-content;
+    max-width: 100%;
+    align-self: flex-end;
+  }
+  .seg-nav {
+    flex: 0 0 auto;
+    display: flex;
+    align-items: center;
+    gap: 4px;
+  }
+  .seg-nav-btn {
+    flex: 0 0 auto;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 28px;
+    height: 28px;
+    padding: 0;
+    border: 0.5px solid var(--glass-border);
+    border-radius: 999px;
+    background: color-mix(in srgb, var(--glass-bg) 58%, var(--bg-primary));
+    box-shadow: var(--shadow-glass);
+    backdrop-filter: var(--glass-blur) var(--glass-saturate);
+    -webkit-backdrop-filter: var(--glass-blur) var(--glass-saturate);
+    color: var(--text-secondary);
+    cursor: pointer;
+    transition: background 0.15s ease, color 0.15s ease, border-color 0.15s ease;
+  }
+  .seg-nav-btn:hover:not(:disabled) {
+    color: var(--text-primary);
+    border-color: color-mix(in srgb, var(--accent) 30%, var(--glass-border));
+  }
+  .seg-nav-btn:disabled {
+    opacity: 0.4;
+    cursor: default;
+  }
+  .seg-overall {
+    flex: 0 0 auto;
+    padding: 6px 12px;
+    border-radius: 999px;
+    border: 0.5px solid color-mix(in srgb, var(--accent) 30%, var(--glass-border));
+    background: color-mix(in srgb, var(--accent) 12%, var(--bg-input));
+    box-shadow: var(--shadow-glass);
+    backdrop-filter: var(--glass-blur) var(--glass-saturate);
+    -webkit-backdrop-filter: var(--glass-blur) var(--glass-saturate);
+    color: color-mix(in srgb, var(--accent) 82%, var(--text-primary));
+    font-family: inherit;
+    font-size: 11.5px;
+    font-weight: 800;
+    cursor: pointer;
+    transition: background 0.15s ease, color 0.15s ease;
+  }
+  .seg-overall:hover {
+    background: color-mix(in srgb, var(--accent) 18%, var(--bg-input));
+    color: color-mix(in srgb, var(--accent) 92%, var(--text-primary));
+  }
+  .seg-status {
+    flex: 0 1 auto;
+    min-width: 0;
+    margin-left: auto;
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    padding: 5px 11px;
+    border-radius: 999px;
+    border: 0.5px solid var(--glass-border);
+    background: color-mix(in srgb, var(--glass-bg) 58%, var(--bg-primary));
+    box-shadow: var(--shadow-glass);
+    backdrop-filter: var(--glass-blur) var(--glass-saturate);
+    -webkit-backdrop-filter: var(--glass-blur) var(--glass-saturate);
+    color: var(--text-tertiary);
+    font-size: 10.5px;
+    font-weight: 700;
+  }
+  .seg-status > span:last-child {
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .seg-status.generating {
+    color: color-mix(in srgb, var(--accent) 80%, var(--text-primary));
+  }
+  .mini-spinner {
+    flex: 0 0 auto;
+    width: 10px;
+    height: 10px;
+    border-radius: 50%;
+    border: 1.6px solid color-mix(in srgb, currentColor 26%, transparent);
+    border-top-color: currentColor;
+    animation: spin 0.8s linear infinite;
+  }
+  @keyframes spin { to { transform: rotate(360deg); } }
+  @media (prefers-reduced-motion: reduce) {
+    .mini-spinner { animation: none; }
+  }
+
   .board-stack {
     animation: term-stack-in 0.32s cubic-bezier(0.22, 1, 0.36, 1) both;
   }
@@ -210,11 +364,11 @@
     text-align: left;
     font-family: inherit;
     border-radius: 13px;
-    border: 0.5px solid color-mix(in srgb, var(--accent) 18%, var(--glass-border));
-    background: color-mix(in srgb, var(--bg-primary) 90%, transparent);
-    box-shadow: 0 4px 12px rgba(0, 0, 0, 0.08);
-    backdrop-filter: blur(18px) saturate(1.25);
-    -webkit-backdrop-filter: blur(18px) saturate(1.25);
+    border: 0.5px solid var(--glass-border);
+    background: color-mix(in srgb, var(--glass-bg) 58%, var(--bg-primary));
+    box-shadow: var(--shadow-glass), 0 6px 18px rgba(0, 0, 0, 0.08);
+    backdrop-filter: var(--glass-blur) var(--glass-saturate);
+    -webkit-backdrop-filter: var(--glass-blur) var(--glass-saturate);
     cursor: pointer;
     overflow: hidden;
     transition: transform 0.18s cubic-bezier(0.22, 1, 0.36, 1),
@@ -222,8 +376,8 @@
   }
   .board-preview-card:hover {
     transform: translateY(-1px);
-    box-shadow: 0 6px 16px rgba(0, 0, 0, 0.1);
-    border-color: color-mix(in srgb, var(--accent) 32%, var(--glass-border));
+    box-shadow: var(--shadow-glass), 0 10px 24px rgba(0, 0, 0, 0.1);
+    border-color: color-mix(in srgb, var(--text-primary) 16%, var(--glass-border));
   }
   .board-preview-card:active {
     transform: translateY(0);
@@ -353,15 +507,15 @@
     color: var(--text-primary);
     text-align: left;
     border-radius: 999px;
-    border: 0.5px solid color-mix(in srgb, var(--accent) 20%, var(--glass-border));
-    background: color-mix(in srgb, var(--bg-primary) 90%, transparent);
-    box-shadow: 0 4px 12px rgba(0, 0, 0, 0.08);
-    backdrop-filter: blur(18px) saturate(1.2);
-    -webkit-backdrop-filter: blur(18px) saturate(1.2);
+    border: 0.5px solid var(--glass-border);
+    background: color-mix(in srgb, var(--glass-bg) 58%, var(--bg-primary));
+    box-shadow: var(--shadow-glass), 0 6px 18px rgba(0, 0, 0, 0.08);
+    backdrop-filter: var(--glass-blur) var(--glass-saturate);
+    -webkit-backdrop-filter: var(--glass-blur) var(--glass-saturate);
     cursor: pointer;
   }
   .term-stack-collapsed:hover {
-    background: color-mix(in srgb, var(--bg-primary) 84%, transparent);
+    background: color-mix(in srgb, var(--glass-bg) 68%, var(--bg-primary));
   }
   .term-stack-preview {
     min-width: 0;
@@ -401,9 +555,9 @@
     font-family: inherit;
     padding: 11px 13px 10px;
     border-radius: 13px;
-    border: 0.5px solid color-mix(in srgb, var(--accent) 18%, var(--glass-border));
-    background: color-mix(in srgb, var(--bg-primary) 96%, transparent);
-    box-shadow: 0 2px 8px rgba(0, 0, 0, 0.06);
+    border: 0.5px solid var(--glass-border);
+    background: color-mix(in srgb, var(--glass-bg) 40%, var(--bg-primary));
+    box-shadow: var(--shadow-glass);
     overflow: hidden;
     cursor: pointer;
     transform-origin: 50% 0;
@@ -415,16 +569,16 @@
     inset: auto;
     min-height: 92px;
     cursor: pointer;
-    background: color-mix(in srgb, var(--bg-primary) 90%, transparent);
-    backdrop-filter: blur(18px) saturate(1.25);
-    -webkit-backdrop-filter: blur(18px) saturate(1.25);
-    box-shadow: 0 4px 12px rgba(0, 0, 0, 0.08);
+    background: color-mix(in srgb, var(--glass-bg) 58%, var(--bg-primary));
+    backdrop-filter: var(--glass-blur) var(--glass-saturate);
+    -webkit-backdrop-filter: var(--glass-blur) var(--glass-saturate);
+    box-shadow: var(--shadow-glass), 0 6px 18px rgba(0, 0, 0, 0.08);
   }
   .term-card.active:hover {
     border-color: color-mix(in srgb, var(--text-primary) 16%, var(--glass-border));
   }
   .term-card.peek:hover {
-    background: color-mix(in srgb, var(--bg-primary) 94%, transparent);
+    background: color-mix(in srgb, var(--glass-bg) 50%, var(--bg-primary));
   }
   .term-card:focus-visible {
     outline: 2px solid var(--accent);

@@ -103,7 +103,7 @@
       {#if partialText.trim()}
         <div class="lyric-line active partial">
           <span class="lyric-time">now</span>
-          <span class="lyric-text">{partialText.trim()}<span class="typing-cursor"></span></span>
+          <span class="lyric-text">{partialText.trim()}</span>
         </div>
       {/if}
     </div>
@@ -228,12 +228,7 @@
   }
 
   .lyric-line.partial {
-    opacity: 0.75;
     animation: none;
-  }
-  .lyric-line.partial .lyric-text {
-    color: var(--accent);
-    font-style: italic;
   }
 
   .lyric-time {
@@ -254,20 +249,6 @@
     color: var(--text-secondary);
     word-break: break-word;
     transition: font-size 0.3s, font-weight 0.3s, color 0.3s;
-  }
-
-  .typing-cursor {
-    display: inline-block;
-    width: 2px;
-    height: 1em;
-    background: var(--accent);
-    margin-left: 3px;
-    vertical-align: middle;
-    animation: cursor-blink 1s steps(2) infinite;
-  }
-  @keyframes cursor-blink {
-    0%, 45% { opacity: 1; }
-    46%, 100% { opacity: 0; }
   }
 
   .lyrics-hidden-hint {

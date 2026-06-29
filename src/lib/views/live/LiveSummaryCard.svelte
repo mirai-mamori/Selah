@@ -150,8 +150,8 @@
     padding: 11px 13px 10px;
     border-radius: 13px;
     border: 0.5px solid var(--glass-border);
-    background: color-mix(in srgb, var(--bg-primary) 96%, transparent);
-    box-shadow: 0 2px 8px rgba(0, 0, 0, 0.06);
+    background: color-mix(in srgb, var(--glass-bg) 40%, var(--bg-primary));
+    box-shadow: var(--shadow-glass);
     overflow: hidden;
     transform-origin: 50% 0;
     transition: transform 0.45s cubic-bezier(0.22, 1, 0.36, 1),
@@ -161,10 +161,10 @@
     position: relative;
     inset: auto;
     min-height: 54px;
-    background: color-mix(in srgb, var(--bg-primary) 90%, transparent);
-    backdrop-filter: blur(18px) saturate(1.25);
-    -webkit-backdrop-filter: blur(18px) saturate(1.25);
-    box-shadow: 0 4px 12px rgba(0, 0, 0, 0.08);
+    background: color-mix(in srgb, var(--glass-bg) 58%, var(--bg-primary));
+    backdrop-filter: var(--glass-blur) var(--glass-saturate);
+    -webkit-backdrop-filter: var(--glass-blur) var(--glass-saturate);
+    box-shadow: var(--shadow-glass), 0 6px 18px rgba(0, 0, 0, 0.08);
   }
   .summary-stack:hover .summary-pt-card.front {
     border-color: color-mix(in srgb, var(--text-primary) 16%, var(--glass-border));

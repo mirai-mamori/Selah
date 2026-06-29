@@ -1781,6 +1781,10 @@ export interface LiveSessionSnapshot {
   transcript_lines: LiveTranscriptLine[];
   pending_lines: LiveTranscriptLine[];
   summaries: LiveSummaryChunk[];
+  /** Epoch millis when the next periodic summary is due. */
+  next_summary_at_ms?: number | null;
+  /** True while a periodic summary is being generated. */
+  summarizing?: boolean;
 }
 
 export interface LiveSaveResult {

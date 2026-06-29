@@ -106,6 +106,13 @@ pub struct LiveSessionSnapshot {
     pub transcript_lines: Arc<Vec<LiveTranscriptLine>>,
     pub pending_lines: Arc<Vec<LiveTranscriptLine>>,
     pub summaries: Arc<Vec<LiveSummaryChunk>>,
+    /// Epoch millis when the next scheduled periodic summary is due
+    /// (effective batch start + interval). `None` when no session is active.
+    #[serde(default)]
+    pub next_summary_at_ms: Option<i64>,
+    /// True while a periodic summary is being generated (flush in flight).
+    #[serde(default)]
+    pub summarizing: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
