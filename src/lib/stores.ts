@@ -1,6 +1,7 @@
 import { writable } from "svelte/store";
 import { invoke } from "@tauri-apps/api/core";
 import { initializeThemePreference, type ThemePreference } from "./themePreference";
+import type { LiveTodoSuggestion } from "./api";
 import {
   DETAIL_GENERATED_TODO_KEY,
   LIVE_GENERATED_TODO_KEY,
@@ -309,6 +310,14 @@ syllabusSearchState.subscribe((state) => {
 });
 
 export const activeTab = writable<string>("home");
+
+// ============ Live → TODO handoff ============
+// When a LIVE session is saved, TODO/DDL judgment runs in the background. The
+// suggestions land here (via the `live-todo-suggestions` event) and the TODO
+// page renders them as drafts to add. `liveTodoPending` flags the in-between
+// "判定中" state so the page can show progress instead of looking empty.
+export const liveTodoDrafts = writable<{ suggestions: LiveTodoSuggestion[]; sourcePath: string } | null>(null);
+export const liveTodoPending = writable<boolean>(false);
 export type SettingsPanel = "ai" | "session" | "mail" | "calendar" | "notification" | "download" | "about" | "debug";
 export const activeSettingsPanel = writable<SettingsPanel>("ai");
 export const unreadNotifCount = writable<number>(0);

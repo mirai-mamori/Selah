@@ -9,10 +9,11 @@
     deleteDetailGeneratedTodo,
     getDetailGeneratedTodos,
     saveDetailGeneratedTodos,
+    saveLiveGeneratedTodos,
     openLunaTodoItem,
   } from "../api";
-  import type { DetailTodoSuggestion } from "../api";
-  import { cachedBackendFetch, refreshBackendManagedCache, onCacheUpdate, lunaAuthState, aiTodoStore, aiReady } from "../stores";
+  import type { DetailTodoSuggestion, LiveTodoSuggestion } from "../api";
+  import { cachedBackendFetch, refreshBackendManagedCache, onCacheUpdate, lunaAuthState, aiTodoStore, aiReady, liveTodoDrafts, liveTodoPending } from "../stores";
   import { reopenOnboarding } from "../onboarding/onboardingState";
   import { get } from "svelte/store";
   import ViewLoader from "../ViewLoader.svelte";
@@ -39,6 +40,16 @@
   let detailExtracting = $state(false);
   let detailSaving = $state(false);
   let detailError = $state("");
+
+  // Live → TODO drafts (fed by the background `live-todo-suggestions` event via
+  // the store). The judgment runs after a LIVE session is saved, so they arrive
+  // here for the user to add without ever blocking the save.
+  type LiveDraft = LiveTodoSuggestion & { selected: boolean };
+  let liveDrafts = $state<LiveDraft[]>([]);
+  let liveSourcePath = $state("");
+  let liveSaving = $state(false);
+  let liveError = $state("");
+  let liveJudging = $state(false);
 
   // Drop tasks that are more than 7 days overdue — at that point Luna almost
   // always disallows submission, so they only clutter the list and counts.
@@ -271,12 +282,49 @@
     }
   }
 
+  function toggleLiveDraft(idx: number) {
+    liveDrafts = liveDrafts.map((d, i) => i === idx ? { ...d, selected: !d.selected } : d);
+  }
+
+  function closeLiveDrafts() {
+    if (liveSaving) return;
+    liveError = "";
+    liveTodoDrafts.set(null);
+  }
+
+  async function confirmLiveDrafts() {
+    const selected = liveDrafts.filter(d => d.selected);
+    if (selected.length === 0) {
+      closeLiveDrafts();
+      return;
+    }
+    liveSaving = true;
+    liveError = "";
+    try {
+      await saveLiveGeneratedTodos(selected.map(({ selected: _s, ...rest }) => rest), liveSourcePath);
+      liveTodoDrafts.set(null);
+      refreshBackendManagedCache("luna_todo").catch(() => {});
+    } catch (e: any) {
+      liveError = e?.message || String(e);
+    } finally {
+      liveSaving = false;
+    }
+  }
+
   const unsubTodo = onCacheUpdate<LunaTodoItem[]>("luna_todo", (fresh) => { todoItems = fresh; });
   // Subscribe to AI scheduler updates
   const unsubAiTodo = aiTodoStore.subscribe((val) => {
     if (val?.result) aiResult = val.result;
   });
-  onDestroy(() => { unsubTodo(); unsubAiTodo(); });
+  // Live → TODO handoff: drafts and the in-between "判定中" flag come from stores
+  // set by the always-mounted Dashboard listener, so nothing is missed if this
+  // page mounts after the event fired.
+  const unsubLiveDrafts = liveTodoDrafts.subscribe((val) => {
+    liveDrafts = val ? val.suggestions.map((s) => ({ ...s, selected: true })) : [];
+    liveSourcePath = val?.sourcePath ?? "";
+  });
+  const unsubLivePending = liveTodoPending.subscribe((v) => { liveJudging = v; });
+  onDestroy(() => { unsubTodo(); unsubAiTodo(); unsubLiveDrafts(); unsubLivePending(); });
 
   onMount(async () => {
     loading = true;
@@ -394,6 +442,27 @@
       onToggle={toggleDetailDraft}
       onClose={closeDetailDrafts}
       onConfirm={confirmDetailDrafts}
+    />
+  {/if}
+
+  {#if liveJudging && liveDrafts.length === 0}
+    <div class="live-judging">
+      <span class="live-judging-spinner"></span>
+      <span>LiveからTODO候補とDDLを判定中…</span>
+    </div>
+  {/if}
+
+  {#if liveDrafts.length > 0}
+    <TodoDraftCard
+      title="LiveからTODO候補を追加"
+      subtitle={`${liveDrafts.length}件見つかりました。必要なものを選んで追加してください。`}
+      drafts={liveDrafts}
+      saving={liveSaving}
+      courseFallback="(コース不明)"
+      errorMessage={liveError}
+      onToggle={toggleLiveDraft}
+      onClose={closeLiveDrafts}
+      onConfirm={confirmLiveDrafts}
     />
   {/if}
 
@@ -939,5 +1008,27 @@
     background: rgba(255, 59, 48, 0.08);
     color: var(--red);
     font-size: 12px;
+  }
+  .live-judging {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin-bottom: 10px;
+    padding: 9px 12px;
+    border-radius: 10px;
+    border: 0.5px solid var(--border);
+    background: color-mix(in srgb, var(--accent) 6%, transparent);
+    color: var(--text-secondary);
+    font-size: 12px;
+    font-weight: 500;
+  }
+  .live-judging-spinner {
+    width: 13px;
+    height: 13px;
+    flex-shrink: 0;
+    border-radius: 50%;
+    border: 1.6px solid color-mix(in srgb, var(--accent) 30%, transparent);
+    border-top-color: var(--accent);
+    animation: spin 0.8s linear infinite;
   }
 </style>

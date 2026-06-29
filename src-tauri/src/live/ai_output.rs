@@ -366,6 +366,127 @@ pub(super) fn extract_json_object(text: &str) -> Option<&str> {
     None
 }
 
+/// Best-effort repair of the first JSON object in a model reply. Two failure
+/// modes get common once a long lecture (80+ min) makes the reply large:
+///   1. literal control characters (newlines/tabs) inside string values — a
+///      markdown body routinely contains real newlines, which are invalid JSON;
+///   2. truncation — the reply hit the token ceiling mid-object, leaving
+///      strings/arrays/objects unclosed.
+/// We scan from the first `{`, escaping raw control chars inside strings and
+/// tracking the bracket stack, then close whatever is still open at the end.
+/// Already-valid JSON round-trips unchanged. Returns None when there is no `{`.
+pub(super) fn repair_json_object(text: &str) -> Option<String> {
+    let start = text.find('{')?;
+    let mut out = String::with_capacity(text.len() - start + 16);
+    let mut stack: Vec<char> = Vec::new();
+    let mut in_string = false;
+    let mut escaped = false;
+    for ch in text[start..].chars() {
+        if in_string {
+            if escaped {
+                out.push(ch);
+                escaped = false;
+                continue;
+            }
+            match ch {
+                '\\' => {
+                    out.push(ch);
+                    escaped = true;
+                }
+                '"' => {
+                    out.push(ch);
+                    in_string = false;
+                }
+                '\n' => out.push_str("\\n"),
+                '\r' => out.push_str("\\r"),
+                '\t' => out.push_str("\\t"),
+                // Drop other raw control chars; they are never valid in a string.
+                c if (c as u32) < 0x20 => {}
+                c => out.push(c),
+            }
+            continue;
+        }
+        match ch {
+            '"' => {
+                in_string = true;
+                out.push(ch);
+            }
+            '{' | '[' => {
+                stack.push(ch);
+                out.push(ch);
+            }
+            '}' | ']' => {
+                stack.pop();
+                out.push(ch);
+                if stack.is_empty() {
+                    // Completed the first top-level object — ignore any trailing junk.
+                    return Some(out);
+                }
+            }
+            c => out.push(c),
+        }
+    }
+
+    // Truncated mid-object: close everything that is still open.
+    if in_string {
+        // A lone trailing backslash would otherwise escape our closing quote.
+        if escaped {
+            out.push('\\');
+        }
+        out.push('"');
+    }
+    // Trim a dangling separator / empty key:value fragment so the synthetic
+    // close produces parseable JSON instead of `,}` or `:}`.
+    let trimmed_len = out.trim_end().len();
+    out.truncate(trimmed_len);
+    if out.ends_with(',') {
+        out.pop();
+    } else if out.ends_with(':') {
+        out.push_str("null");
+    }
+    while let Some(open) = stack.pop() {
+        out.push(if open == '{' { '}' } else { ']' });
+    }
+    Some(out)
+}
+
+/// Lift a single string field out of a JSON-ish blob by hand, for when the
+/// object can't be parsed even after [`repair_json_object`]. Unescapes the
+/// value so we render the real summary text rather than a raw JSON dump. Works
+/// even if the value was truncated before its closing quote.
+pub(super) fn salvage_json_string_field(text: &str, key: &str) -> Option<String> {
+    let needle = format!("\"{key}\"");
+    let key_pos = text.find(&needle)?;
+    let after = &text[key_pos + needle.len()..];
+    let colon = after.find(':')?;
+    let mut chars = after[colon + 1..].trim_start().chars();
+    if chars.next()? != '"' {
+        return None;
+    }
+    let mut out = String::new();
+    let mut escaped = false;
+    for ch in chars {
+        if escaped {
+            match ch {
+                'n' => out.push('\n'),
+                't' => out.push('\t'),
+                'r' => out.push('\r'),
+                // \" \\ \/ and any other escape: keep the literal char.
+                other => out.push(other),
+            }
+            escaped = false;
+            continue;
+        }
+        match ch {
+            '\\' => escaped = true,
+            '"' => return Some(out), // reached the closing quote
+            c => out.push(c),
+        }
+    }
+    // Truncated before the closing quote — keep what we recovered.
+    Some(out)
+}
+
 pub(super) fn value_to_trimmed_string(value: Option<&serde_json::Value>) -> String {
     match value {
         Some(serde_json::Value::String(s)) => s.trim().to_string(),
@@ -462,16 +583,35 @@ fn is_low_value_live_term(term: &str) -> bool {
 
 pub(super) fn parse_chunk_ai_result(raw: &str) -> LiveChunkAiResult {
     let sanitized = sanitize_model_output(raw);
-    let Some(json_text) = extract_json_object(&sanitized) else {
+    // Parse the first JSON object — strictly first, then with a repair pass that
+    // fixes the two things large replies break on: raw control chars inside
+    // strings and truncation. Repair leaves already-valid JSON untouched.
+    let value = extract_json_object(&sanitized)
+        .and_then(|t| serde_json::from_str::<serde_json::Value>(t).ok())
+        .or_else(|| {
+            repair_json_object(&sanitized)
+                .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok())
+        });
+    let Some(value) = value else {
+        // Unparseable even after repair. If the reply was a JSON object we just
+        // couldn't fix, try to lift the summary text out by hand rather than
+        // dumping raw braces into the note; only genuine plain prose (a reply
+        // that does not start with `{`) is kept verbatim. Otherwise leave the
+        // body empty so the caller's retry layers re-attempt the chunk.
+        let body = salvage_json_string_field(&sanitized, "summary_markdown")
+            .or_else(|| salvage_json_string_field(&sanitized, "summary"))
+            .or_else(|| salvage_json_string_field(&sanitized, "body"))
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| {
+                if sanitized.trim_start().starts_with('{') {
+                    String::new()
+                } else {
+                    sanitized.clone()
+                }
+            });
         return LiveChunkAiResult {
-            body: sanitized,
-            terms: Vec::new(),
-            whiteboard: None,
-        };
-    };
-    let Ok(value) = serde_json::from_str::<serde_json::Value>(json_text) else {
-        return LiveChunkAiResult {
-            body: sanitized,
+            body,
             terms: Vec::new(),
             whiteboard: None,
         };
@@ -792,6 +932,53 @@ mod tests {
             schema_version: 0,
             normalized_by: String::new(),
         }
+    }
+
+    #[test]
+    fn parse_chunk_recovers_raw_newlines_in_strings() {
+        // A markdown body with literal (unescaped) newlines is invalid JSON but
+        // is exactly what models emit for large summaries. Repair must recover it.
+        let raw = "{\"summary_markdown\": \"- 点1\n- 点2\n\n**用語**: 説明\", \"terms\": []}";
+        let parsed = parse_chunk_ai_result(raw);
+        assert!(parsed.body.contains("点1"));
+        assert!(parsed.body.contains("点2"));
+        assert!(parsed.body.contains("用語"));
+    }
+
+    #[test]
+    fn parse_chunk_recovers_truncated_object() {
+        // Reply cut off mid-term (token ceiling). Repair closes the open string,
+        // item, array and object so body + the completed term survive.
+        let raw = "{\"summary_markdown\": \"- 重点A\\n- 重点B\", \"terms\": [{\"term\": \"認知的不協和\", \"explanation\": \"矛盾する認知を同時に持つときの不快感。途中で切れた";
+        let parsed = parse_chunk_ai_result(raw);
+        assert!(parsed.body.contains("重点A"));
+        assert_eq!(parsed.terms.len(), 1);
+        assert_eq!(parsed.terms[0].term, "認知的不協和");
+    }
+
+    #[test]
+    fn parse_chunk_salvages_body_when_unrepairable() {
+        // Truncated mid-key: not validly closeable, but the body field is intact
+        // and must be salvaged instead of dumping raw JSON into the note.
+        let raw = "{\"summary_markdown\": \"本文は無事です\", \"ter";
+        let parsed = parse_chunk_ai_result(raw);
+        assert_eq!(parsed.body, "本文は無事です");
+        assert!(!parsed.body.contains('{'));
+    }
+
+    #[test]
+    fn parse_chunk_never_returns_raw_json_blob() {
+        // Whatever happens, a JSON-object reply must never surface its braces as
+        // the rendered summary.
+        let raw = "{\"summary_markdown\": broken json here, no quotes";
+        let parsed = parse_chunk_ai_result(raw);
+        assert!(!parsed.body.contains("broken json"));
+    }
+
+    #[test]
+    fn repair_json_object_leaves_valid_input_unchanged() {
+        let valid = "{\"a\": \"b\", \"n\": [1, 2]}";
+        assert_eq!(repair_json_object(valid).as_deref(), Some(valid));
     }
 
     #[test]

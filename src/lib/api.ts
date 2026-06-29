@@ -1789,6 +1789,15 @@ export interface LiveSaveResult {
   markdown: string;
   snapshot: LiveSessionSnapshot;
   suggested_todos?: LiveTodoSuggestion[];
+  /** TODO/DDL extraction is running in the background; suggestions arrive via
+   *  the `live-todo-suggestions` event. */
+  todos_pending?: boolean;
+}
+
+/** Payload of the `live-todo-suggestions` event. */
+export interface LiveTodoSuggestionsEvent {
+  suggestions: LiveTodoSuggestion[];
+  source_path: string;
 }
 
 export interface LiveTodoSuggestion {

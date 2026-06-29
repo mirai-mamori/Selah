@@ -1,9 +1,10 @@
 <script lang="ts">
   import { onMount, onDestroy } from "svelte";
   import { listen } from "@tauri-apps/api/event";
-  import { activeTab, unreadNotifCount, unreadMailCount, readIdsStore, onCacheUpdate, getCached, loadReadIds, notifKey } from "./stores";
+  import { activeTab, unreadNotifCount, unreadMailCount, readIdsStore, onCacheUpdate, getCached, loadReadIds, notifKey, liveTodoDrafts, liveTodoPending } from "./stores";
   import { get } from "svelte/store";
   import type { NotificationsData } from "./stores";
+  import type { LiveTodoSuggestionsEvent } from "./api";
   import Icon from "./Icon.svelte";
   import type { IconName } from "./Icon.svelte";
   import Titlebar from "./Titlebar.svelte";
@@ -170,7 +171,17 @@
     const unlistenAiCfg = await listen('ai-config-changed', () => {
       updateAiReadiness().catch(() => {});
     });
-    unlistenRefresh = () => { unlistenTrayTab(); unlistenOpenAgent(); unlistenAiCfg(); };
+    // Background TODO/DDL judgment from a saved LIVE session. Kept at this
+    // always-mounted level so the result is never missed if the TODO page
+    // hasn't been opened yet — the page reads it from the store.
+    const unlistenLiveTodos = await listen<LiveTodoSuggestionsEvent>('live-todo-suggestions', (event) => {
+      liveTodoPending.set(false);
+      const suggestions = event.payload?.suggestions ?? [];
+      liveTodoDrafts.set(suggestions.length > 0
+        ? { suggestions, sourcePath: event.payload.source_path }
+        : null);
+    });
+    unlistenRefresh = () => { unlistenTrayTab(); unlistenOpenAgent(); unlistenAiCfg(); unlistenLiveTodos(); };
   });
   onDestroy(() => { if (unlistenRefresh) unlistenRefresh(); unsubMail(); unsubNotif(); unsubLuna(); unsubKwicHome(); });
 </script>

@@ -116,6 +116,19 @@ pub struct LiveSaveResult {
     pub snapshot: LiveSessionSnapshot,
     #[serde(default)]
     pub suggested_todos: Vec<LiveTodoSuggestion>,
+    /// True when TODO/DDL extraction was kicked off in the background. The save
+    /// returns immediately; the suggestions arrive later via the
+    /// `live-todo-suggestions` event so the UI can move to the TODO page now.
+    #[serde(default)]
+    pub todos_pending: bool,
+}
+
+/// Payload of the `live-todo-suggestions` event emitted once the background
+/// TODO/DDL judgment finishes.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LiveTodoSuggestionsEvent {
+    pub suggestions: Vec<LiveTodoSuggestion>,
+    pub source_path: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -3,12 +3,11 @@
   import { listen } from "@tauri-apps/api/event";
   import { invoke } from "@tauri-apps/api/core";
   import { getCurrentWindow } from "@tauri-apps/api/window";
-  import { onCacheUpdate } from "../stores";
+  import { onCacheUpdate, activeTab, liveTodoPending } from "../stores";
   import LiveNotice from "./live/LiveNotice.svelte";
-  import LiveOverallSummaryCard from "./live/LiveOverallSummaryCard.svelte";
   import LiveRightRail from "./live/LiveRightRail.svelte";
   import LiveScrollToBottomButton from "./live/LiveScrollToBottomButton.svelte";
-  import LiveSummaryCard from "./live/LiveSummaryCard.svelte";
+  import LiveSummaryDetailPage from "./live/LiveSummaryDetailPage.svelte";
   import LiveTopCapsule from "./live/LiveTopCapsule.svelte";
   import LiveTranscriptStage from "./live/LiveTranscriptStage.svelte";
   import LiveWhiteboardPage from "./live/LiveWhiteboardPage.svelte";
@@ -38,7 +37,6 @@
     openSettingsWindow,
     openSubtitleOverlay,
     closeSubtitleOverlay,
-    saveLiveGeneratedTodos,
     type LiveCourseInfo,
     type LiveSaveResult,
     type LiveSessionSnapshot,
@@ -47,7 +45,7 @@
   import { PERIOD_TIMES } from "../types";
   import { buildCourseSlots, type CourseSlot } from "../schedule";
   import { computeWhiteboardLayout, whiteboardTopics } from "../whiteboardLayout";
-  import type { LiveTodoDraft, NoticeAction, NoticeKind, NoticeSource, NoticeState, SttPhase, WhiteboardStagePreset } from "./live/liveTypes";
+  import type { NoticeAction, NoticeKind, NoticeSource, NoticeState, SttPhase, WhiteboardStagePreset } from "./live/liveTypes";
 
   let scheduleData = $state<ScheduleResponse | null>(null);
   let allCourseOptions = $state<CourseSlot[]>([]);
@@ -71,12 +69,10 @@
   let lastSaved = $state<LiveSaveResult | null>(null);
   let showSaveNotif = $state(false);
   let saveProgress = $state("");
-  let todoDrafts = $state<LiveTodoDraft[]>([]);
-  let todoDraftSourcePath = $state("");
-  let todoDraftSaving = $state(false);
   let summaryViewIndex = $state(-1); // -1 = auto (latest)
-  let summaryExpanded = $state(false);
+  let summaryDetailOpen = $state(false); // full secondary page (not a popup)
   let overallSummary = $state("");
+  let overallSummaryAt = $state(""); // "HH:MM" the overall summary was generated
   let noticeTimer: ReturnType<typeof setTimeout> | null = null;
   let scheduleFocusTimer: ReturnType<typeof setInterval> | null = null;
   let aiReplyLanguage = $state("ja");
@@ -112,12 +108,12 @@
     return Date.now() - startedAtMs < MIN_AI_SUMMARIZATION_MS;
   }
 
-  function expandSummary() {
-    summaryExpanded = true;
+  function openSummaryDetail() {
+    summaryDetailOpen = true;
   }
 
-  function collapseSummary() {
-    summaryExpanded = false;
+  function closeSummaryDetail() {
+    summaryDetailOpen = false;
   }
 
   function selectSummaryView(event: MouseEvent, idx: number) {
@@ -125,34 +121,49 @@
     summaryViewIndex = idx;
   }
 
-  function handleSummaryOverlayClick(event: MouseEvent) {
-    const target = event.target;
-    if (target instanceof Element && target.closest("button, a")) return;
-    collapseSummary();
-  }
-
-  function bindSummaryOverlayDismiss(node: HTMLDivElement) {
-    const onDismiss = (event: Event) => {
-      if (event instanceof MouseEvent) {
-        handleSummaryOverlayClick(event);
-      }
-    };
-    node.addEventListener("click", onDismiss);
-    return {
-      destroy() {
-        node.removeEventListener("click", onDismiss);
-      }
-    };
-  }
-
-  const activeSummaryIdx = $derived(
-    summaryViewIndex < 0 || summaryViewIndex >= snapshot.summaries.length
-      ? snapshot.summaries.length - 1
+  // The stage-summary card shows the periodic chunks AND — when one has been
+  // generated — the "現在までの全体要約" as a trailing entry (no longer a
+  // separate floating card at the top of the history). The overall entry is
+  // always last, so auto-select (-1) surfaces it the moment it appears.
+  const summaryEntries = $derived([
+    ...snapshot.summaries.map((c) => ({
+      range_label: c.range_label,
+      body: c.body,
+      isOverall: false,
+      terms: c.terms ?? [],
+    })),
+    ...(overallSummary
+      ? [
+          {
+            range_label: `${overallSummaryAt}までの全体要約`,
+            body: overallSummary,
+            isOverall: true,
+            terms: [],
+          },
+        ]
+      : []),
+  ]);
+  const activeEntryIdx = $derived(
+    summaryViewIndex < 0 || summaryViewIndex >= summaryEntries.length
+      ? summaryEntries.length - 1
       : summaryViewIndex
+  );
+  // Chunk index used for term annotations and the whiteboard. When the overall
+  // entry is the active one there is no backing chunk, so this is -1 and the
+  // rail simply shows nothing for it.
+  const activeSummaryIdx = $derived(
+    activeEntryIdx >= 0 && activeEntryIdx < snapshot.summaries.length ? activeEntryIdx : -1
   );
   const activeSummaryTerms = $derived.by(() => {
     const chunk = snapshot.summaries[activeSummaryIdx];
     return (chunk?.terms ?? []).filter((term) => term.term?.trim() && term.explanation?.trim());
+  });
+
+  // Close the detail sub-page if its content goes away (session stopped/cleared).
+  $effect(() => {
+    if (summaryEntries.length === 0 && untrack(() => summaryDetailOpen)) {
+      summaryDetailOpen = false;
+    }
   });
 
   // Stacked-card pager state for term annotations.
@@ -453,7 +464,6 @@
   let unlistenWinBlur: (() => void) | null = null;
 
   const hasContent = $derived(snapshot.transcript_lines.length > 0 || partialText.trim().length > 0);
-  const todoDraftsWithDeadlineCount = $derived(todoDrafts.filter((item) => item.deadline.trim()).length);
   const sttBooting = $derived(
     sttPhase === "checking" || sttPhase === "starting" || sttPhase === "initializing"
   );
@@ -595,11 +605,11 @@
   // When the selected course changes (and session not active), load cached history
   $effect(() => {
     const course = selectedCourse;
-    // Use untrack for snapshot/showSaveNotif/todoDrafts reads: writing snapshot
-    // inside the async .then() would otherwise re-trigger this effect → infinite loop.
-    if (!course || untrack(() => snapshot.active || showSaveNotif || todoDrafts.length > 0)) return;
+    // Use untrack for snapshot/showSaveNotif reads: writing snapshot inside the
+    // async .then() would otherwise re-trigger this effect → infinite loop.
+    if (!course || untrack(() => snapshot.active || showSaveNotif)) return;
     livePeekDayCache(toLiveCourse(course)).then((cached) => {
-      if (untrack(() => snapshot.active || showSaveNotif || todoDrafts.length > 0)) return;
+      if (untrack(() => snapshot.active || showSaveNotif)) return;
       if (cached.transcript_lines.length > 0 || cached.summaries.length > 0) {
         snapshot = cached;
       } else if (untrack(() => snapshot.course)) {
@@ -981,16 +991,10 @@
         const flushed = await liveFlushSummary(true);
         snapshot = flushed;
       }
-      saveProgress = snapshot.course?.is_free_note || skipAiSummarization
-        ? "ファイルに書き出し中…"
-        : "TODO候補とDDLを判定中…";
+      saveProgress = "ファイルに書き出し中…";
       const saved = await liveFinishSession();
       lastSaved = saved.saved ? saved : null;
       overallSummary = "";
-      if (saved.saved && saved.suggested_todos?.length) {
-        todoDrafts = saved.suggested_todos.map((item) => ({ ...item, selected: true }));
-        todoDraftSourcePath = saved.path;
-      }
       snapshot = await liveGetSession();
       clearLiveAutoLifecycle();
       saveProgress = "";
@@ -1000,6 +1004,12 @@
         if (automated) {
           setMessage("success", "20分間再開されなかったため、LIVEを自動保存しました");
         }
+        // TODO/DDL judgment runs in the background; jump to the TODO page so the
+        // suggestions show up there to add once ready, instead of blocking here.
+        if (saved.todos_pending) {
+          liveTodoPending.set(true);
+          activeTab.set("todo");
+        }
       } else {
         setMessage("success", automated ? "20分間再開されなかったため、LIVEを自動終了しました" : "LIVEを終了しました");
       }
@@ -1008,37 +1018,6 @@
       setMessage("error", e?.message || String(e));
     } finally {
       busy = false;
-    }
-  }
-
-  function toggleTodoDraft(index: number) {
-    todoDrafts = todoDrafts.map((item, i) => i === index ? { ...item, selected: !item.selected } : item);
-  }
-
-  function closeTodoDrafts() {
-    if (todoDraftSaving) return;
-    todoDrafts = [];
-    todoDraftSourcePath = "";
-  }
-
-  async function confirmTodoDrafts() {
-    const selected = todoDrafts.filter((item) => item.selected);
-    if (selected.length === 0) {
-      closeTodoDrafts();
-      return;
-    }
-    todoDraftSaving = true;
-    saveProgress = "TODOを追加中…";
-    try {
-      const added = await saveLiveGeneratedTodos(selected, todoDraftSourcePath);
-      setMessage("success", added.length > 0 ? `${added.length}件のTODOを追加しました` : "既存のTODOと重複していたため追加はありません");
-      todoDrafts = [];
-      todoDraftSourcePath = "";
-    } catch (e: any) {
-      setMessage("error", e?.message || String(e));
-    } finally {
-      todoDraftSaving = false;
-      saveProgress = "";
     }
   }
 
@@ -1053,7 +1032,11 @@
     saveProgress = "全体要約を生成中…";
     try {
       overallSummary = await liveGenerateOverallSummary();
+      const at = new Date();
+      overallSummaryAt = `${String(at.getHours()).padStart(2, "0")}:${String(at.getMinutes()).padStart(2, "0")}`;
       snapshot = await liveGetSession();
+      // Reset to auto so the freshly-added overall entry (always last) is shown.
+      summaryViewIndex = -1;
       setMessage("success", "現在までの全体要約を生成しました");
     } catch (e: any) {
       setMessage("error", e?.message || String(e));
@@ -1291,7 +1274,7 @@
   });
 </script>
 
-<div class="live-root view" class:board-expanded={whiteboardExpanded}>
+<div class="live-root view" class:board-expanded={whiteboardExpanded || summaryDetailOpen}>
   <LiveTopCapsule
     {snapshot}
     {sttPhase}
@@ -1330,23 +1313,6 @@
 
     <LiveNotice {notice} onOpenAiSettings={() => openSettingsWindow("ai")} />
 
-    <LiveOverallSummaryCard
-      summary={overallSummary}
-      {renderMd}
-      onClose={() => { overallSummary = ""; }}
-    />
-
-    <LiveSummaryCard
-      summaries={snapshot.summaries}
-      {activeSummaryIdx}
-      {summaryExpanded}
-      {renderMd}
-      onSelectSummaryView={selectSummaryView}
-      onExpand={expandSummary}
-      onCollapse={collapseSummary}
-      {bindSummaryOverlayDismiss}
-    />
-
     <LiveTranscriptStage
       {pageLoading}
       {hasContent}
@@ -1355,18 +1321,12 @@
       {saveProgress}
       {sttBooting}
       {sttBootMessage}
-      {todoDrafts}
-      {todoDraftsWithDeadlineCount}
-      {todoDraftSaving}
       {lastSaved}
       {showSaveNotif}
       {visibleLines}
       {hiddenLineCount}
       {renderMd}
       {extractOverallSummary}
-      onToggleTodoDraft={toggleTodoDraft}
-      onCloseTodoDrafts={closeTodoDrafts}
-      onConfirmTodoDrafts={confirmTodoDrafts}
     />
 
 
@@ -1377,6 +1337,11 @@
   <LiveScrollToBottomButton visible={showScrollBtn && hasContent} onScrollToBottom={scrollToBottom} />
 
   <LiveRightRail
+    summaryEntries={summaryEntries}
+    activeSummaryIdx={activeEntryIdx}
+    summarySegmentCount={snapshot.summaries.length}
+    {renderMd}
+    onOpenSummaryDetail={openSummaryDetail}
     previewLayout={previewWhiteboardLayout}
     {activeSummaryTerms}
     {termsCollapsed}
@@ -1419,6 +1384,16 @@
       onPointerUp={handleWhiteboardPointerUp}
       onClearSelection={clearBoardSelection}
       onToggleNodeSelection={toggleBoardNodeSelection}
+    />
+  {/if}
+
+  {#if summaryDetailOpen && summaryEntries.length > 0}
+    <LiveSummaryDetailPage
+      entries={summaryEntries}
+      activeIdx={activeEntryIdx}
+      {renderMd}
+      onSelectSummaryView={selectSummaryView}
+      onClose={closeSummaryDetail}
     />
   {/if}
 

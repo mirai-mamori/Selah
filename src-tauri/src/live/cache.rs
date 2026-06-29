@@ -66,6 +66,20 @@ pub(super) struct LiveDayCacheRef<'a> {
     pub(super) summaries: &'a [LiveSummaryChunk],
 }
 
+/// A release build and a `tauri dev` build can run at the same time during
+/// development. They resolve the same download dir, so without a per-build tag
+/// they would read/write the same day-cache + deltas files — each process
+/// clobbering the other's transcript/summary state and making the periodic
+/// summary-flush timer oscillate. Give the debug build its own files so the two
+/// never share live state.
+fn build_cache_tag() -> &'static str {
+    if cfg!(debug_assertions) {
+        ".dev"
+    } else {
+        ""
+    }
+}
+
 fn day_cache_path(course: &LiveCourseInfo) -> Option<std::path::PathBuf> {
     if course.is_free_note {
         return None;
@@ -73,7 +87,12 @@ fn day_cache_path(course: &LiveCourseInfo) -> Option<std::path::PathBuf> {
     let dir = live_storage_dir(course);
     let date_str = Local::now().format("%Y%m%d").to_string();
     let safe_name = sanitize_filename_component(&course.course_name);
-    Some(dir.join(format!(".{}_{}_live.cache.json", date_str, safe_name)))
+    Some(dir.join(format!(
+        ".{}_{}_live{}.cache.json",
+        date_str,
+        safe_name,
+        build_cache_tag()
+    )))
 }
 
 /// Append-only NDJSON log of transcript lines not yet folded into the main
@@ -85,7 +104,12 @@ fn day_cache_deltas_path(course: &LiveCourseInfo) -> Option<std::path::PathBuf> 
     let dir = live_storage_dir(course);
     let date_str = Local::now().format("%Y%m%d").to_string();
     let safe_name = sanitize_filename_component(&course.course_name);
-    Some(dir.join(format!(".{}_{}_live.lines.ndjson", date_str, safe_name)))
+    Some(dir.join(format!(
+        ".{}_{}_live{}.lines.ndjson",
+        date_str,
+        safe_name,
+        build_cache_tag()
+    )))
 }
 
 pub(super) fn load_day_cache(course: &LiveCourseInfo) -> Option<LiveDayCache> {

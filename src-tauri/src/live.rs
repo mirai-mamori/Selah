@@ -24,7 +24,8 @@ use cache::{
 use types::LiveChunkAiResult;
 pub use types::{
     LiveCourseInfo, LiveSaveResult, LiveSessionSnapshot, LiveSummaryChunk, LiveTermExplanation,
-    LiveTodoSuggestion, LiveTranscriptLine, LiveWhiteboard, LiveWhiteboardEdge, LiveWhiteboardNode,
+    LiveTodoSuggestion, LiveTodoSuggestionsEvent, LiveTranscriptLine, LiveWhiteboard,
+    LiveWhiteboardEdge, LiveWhiteboardNode,
 };
 
 const MIN_AI_SUMMARIZATION_DURATION_SECS: i64 = 120;
@@ -1771,11 +1772,15 @@ pub async fn live_flush_summary(
 
 #[tauri::command]
 pub async fn live_generate_overall_summary(
-    app: tauri::AppHandle,
     state: tauri::State<'_, LiveState>,
 ) -> Result<String, String> {
-    live_flush_summary_with_side_effects(&app, state.inner(), true).await?;
-
+    // The overall summary is a quick "so far" snapshot: it reads the existing
+    // summary chunks plus the tail of the live transcript (which already holds
+    // every appended line, pending ones included). It must NOT force a chunk
+    // flush first — that ran the full per-chunk pipeline (summary + terms +
+    // whiteboard generation, several AI calls) and could block up to
+    // LIVE_FLUSH_FORCE_WAIT_ATTEMPTS while a scheduled flush was in flight,
+    // which is what made this button take abnormally long.
     let (course, started_at, transcript_lines, summaries) = {
         let guard = state
             .0
@@ -1934,6 +1939,7 @@ pub async fn live_finish_session(
                 markdown: String::new(),
                 snapshot,
                 suggested_todos: Vec::new(),
+                todos_pending: false,
             };
             emit_live_update(&app, &state);
             return Ok(result);
@@ -1960,12 +1966,14 @@ pub async fn live_finish_session(
         &summaries,
         &transcript_lines,
     );
-    let suggested_todos =
-        if should_skip_ai_summarization(started_at, ended_at) || !should_run_finish_ai {
-            Vec::new()
-        } else {
-            extract_todo_suggestions(&app, &course, &summaries, &transcript_lines, ended_at).await
-        };
+    // TODO/DDL judgment is the slowest AI step. It must NOT block saving — we
+    // run it in the background (after the file is written and the session is
+    // cleared) and push the result through the `live-todo-suggestions` event so
+    // the UI can jump straight to the TODO page and add them there.
+    let run_todos_in_background = !course.is_free_note
+        && !transcript_lines.is_empty()
+        && !should_skip_ai_summarization(started_at, ended_at)
+        && should_run_finish_ai;
 
     let dir = live_storage_dir(&course);
     let path = dir.join(formal_markdown_filename(&course, started_at));
@@ -2001,12 +2009,38 @@ pub async fn live_finish_session(
     };
     state.inner().notify_flush_driver();
 
+    // Kick off TODO/DDL judgment without blocking the return. Suggestions arrive
+    // via `live-todo-suggestions`; the frontend moves to the TODO page meanwhile.
+    if run_todos_in_background {
+        let app_bg = app.clone();
+        let course_bg = course.clone();
+        let summaries_bg = summaries.clone();
+        let transcript_bg = transcript_lines.clone();
+        let source_path = path_str.clone();
+        tauri::async_runtime::spawn(async move {
+            let suggestions = extract_todo_suggestions(
+                &app_bg,
+                &course_bg,
+                &summaries_bg,
+                &transcript_bg,
+                ended_at,
+            )
+            .await;
+            let payload = LiveTodoSuggestionsEvent {
+                suggestions,
+                source_path,
+            };
+            let _ = app_bg.emit("live-todo-suggestions", &payload);
+        });
+    }
+
     let result = LiveSaveResult {
         saved: true,
         path: path_str.clone(),
         markdown,
         snapshot,
-        suggested_todos,
+        suggested_todos: Vec::new(),
+        todos_pending: run_todos_in_background,
     };
     let _ = app.emit("live-session-saved", &result);
     emit_live_update(&app, &state);

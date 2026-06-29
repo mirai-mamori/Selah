@@ -76,6 +76,12 @@ pub struct CourseAutomationState {
     /// Serialises the brief status read-modify-write of concurrent document
     /// jobs so their upserts merge instead of clobbering.
     status_write: tokio::sync::Mutex<()>,
+    /// Hash of the last status we actually persisted+emitted, per luna_id. Lets
+    /// `save_status_and_emit` skip the SQLite write and the UI event when the
+    /// status is byte-identical to what the frontend already has — the common
+    /// steady-state case where every reused artifact/document still triggers a
+    /// save.
+    last_emitted: Mutex<HashMap<String, u64>>,
 }
 
 impl CourseAutomationState {
@@ -86,6 +92,7 @@ impl CourseAutomationState {
             job_rx: Mutex::new(Some(job_rx)),
             cycle_lock: tokio::sync::RwLock::new(()),
             status_write: tokio::sync::Mutex::new(()),
+            last_emitted: Mutex::new(HashMap::new()),
         }
     }
 }
@@ -389,6 +396,12 @@ pub struct CourseAutomationStatus {
     /// When the documents were last auto-filed (epoch seconds).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_organized: Option<i64>,
+    /// Fingerprint of the organize candidate set the last time we ran the AI
+    /// planner. While it is unchanged, every file is already in its theme folder
+    /// (filing is idempotent), so the planner is skipped — no wasted request on a
+    /// set we've already planned. Internal bookkeeping; not shown in the UI.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub organize_signature: String,
     /// Per-course user-state overlay keyed by item id (e.g. "done" / "known").
     /// Unified across facets; survives the model regenerating items because the
     /// id is a stable content fingerprint. Pruned to currently-present ids.
@@ -513,6 +526,11 @@ async fn process_job(app: &AppHandle, job: &Job) -> Result<CourseAutomationView,
                 config.interval_minutes,
                 epoch_secs(),
             ) {
+                return Ok(CourseAutomationView { config, status });
+            }
+            // The session can drop between enqueue and execution (notably the
+            // deferred follow-up's delay), so re-check login for automatic jobs.
+            if is_automatic_trigger(&job.trigger) && !luna_is_authenticated(app).await {
                 return Ok(CourseAutomationView { config, status });
             }
             // run_course has its own timeout + status cleanup.
@@ -711,7 +729,7 @@ pub async fn course_automation_organize_now(
     let _write = automation.status_write.lock().await;
     let mut status = load_status(&db, &luna_id, &course_name);
     let schedule = course_schedule_text(&db, &course_name);
-    let filed = organize_course_documents(&luna_id, &mut status, &schedule).await;
+    let filed = organize_course_documents(&luna_id, &mut status, &schedule, true).await;
     if filed > 0 {
         status.last_organized = Some(epoch_secs());
         push_run_log(&mut status, "ok", format!("{filed}件の資料をテーマ別に整理"));
@@ -1033,6 +1051,11 @@ fn reset_stale_running_flags(app: &AppHandle) {
 }
 
 async fn run_due_courses(app: &AppHandle) -> Result<(), String> {
+    // Like every other automatic AI feature, SenseA only runs while logged in.
+    // Skip the whole scheduled pass when the Luna session is absent.
+    if !luna_is_authenticated(app).await {
+        return Ok(());
+    }
     let db = app.state::<Database>();
     let configs = db.list_data_cache_prefix(CONFIG_PREFIX)?;
     let now = epoch_secs();
@@ -1137,6 +1160,24 @@ fn scheduled_cycle_is_due(last_run: Option<i64>, interval_minutes: u32, now: i64
     last_run.is_none_or(|last_run| now.saturating_sub(last_run) >= due_after)
 }
 
+/// SenseA's automatic cycles. User-initiated ("manual") jobs and single-document
+/// re-analyses are not part of this set: the user explicitly asked for those.
+fn is_automatic_trigger(trigger: &str) -> bool {
+    matches!(trigger, "scheduled" | "deferred")
+}
+
+/// SenseA shares the same basic precondition as every other automatic AI feature
+/// (see background_refresh's `luna_authenticated` gating): it only runs while the
+/// user is logged in to Luna. Automatic cycles are skipped entirely when logged
+/// out; manual jobs are left to fail loudly if the session is gone.
+async fn luna_is_authenticated(app: &AppHandle) -> bool {
+    app.state::<crate::LunaState>()
+        .client
+        .lock()
+        .await
+        .authenticated
+}
+
 fn should_skip_automatic_cycle(
     config_enabled: bool,
     trigger: &str,
@@ -1144,7 +1185,7 @@ fn should_skip_automatic_cycle(
     interval_minutes: u32,
     now: i64,
 ) -> bool {
-    if !config_enabled && matches!(trigger, "scheduled" | "deferred") {
+    if !config_enabled && is_automatic_trigger(trigger) {
         return true;
     }
     trigger == "scheduled" && !scheduled_cycle_is_due(last_run, interval_minutes, now)
@@ -1921,7 +1962,7 @@ async fn run_course_inner(
     // Gated on a real change so steady "unchanged" cycles cost no extra request.
     if outcome.is_ok() && status.stage == "done" {
         let schedule = course_schedule_text(&db, &status.course_name);
-        let filed = organize_course_documents(luna_id, &mut status, &schedule).await;
+        let filed = organize_course_documents(luna_id, &mut status, &schedule, false).await;
         if filed > 0 {
             status.last_organized = Some(epoch_secs());
             push_run_log(&mut status, "ok", format!("{filed}件の資料をテーマ別に整理"));
@@ -2872,6 +2913,7 @@ async fn organize_course_documents(
     luna_id: &str,
     status: &mut CourseAutomationStatus,
     schedule: &str,
+    force: bool,
 ) -> usize {
     // Candidates = tracked ledger documents + loose Live notes physically in the
     // course folder. Nothing to do for fewer than two (no grouping possible).
@@ -2879,6 +2921,22 @@ async fn organize_course_documents(
     if candidates.len() < 2 {
         return 0;
     }
+
+    // Skip the AI planner unless the candidate set itself changed since we last
+    // planned. Filing is idempotent (already-filed files don't move), so re-
+    // planning the same set just reproduces the same placement at the cost of one
+    // request. The signature is over the candidate *ids* (stable content
+    // fingerprints / "loose:<name>"), so it flips only when a file is added or
+    // removed — a newly-downloaded document or a fresh loose note — and never on
+    // a mere path change from a previous filing. This precisely gates the call on
+    // genuinely new inputs, with no re-fire for an ungroupable lone file. `force`
+    // (the user's manual "整理" button) bypasses the gate but still refreshes the
+    // signature so the next automatic cycle doesn't redundantly re-plan.
+    let signature = organize_candidate_signature(&candidates);
+    if !force && signature == status.organize_signature {
+        return 0;
+    }
+    status.organize_signature = signature;
 
     // AI does the smart semantic grouping over the summaries / note previews
     // (aligning to the syllabus); then a heuristic sweep files whatever the model
@@ -2965,6 +3023,22 @@ fn build_organize_candidates(
         }
     }
     candidates
+}
+
+/// Fingerprint of the organize candidate set, over its ids only. The map is a
+/// BTreeMap so key iteration is sorted and deterministic; the digest flips only
+/// when a candidate is added or removed, never when a previously-filed file's
+/// path changes (the id is stable). Used to skip the AI planner for a set we
+/// have already planned.
+fn organize_candidate_signature(
+    candidates: &std::collections::BTreeMap<String, organize::OrganizeCandidate>,
+) -> String {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    for id in candidates.keys() {
+        id.hash(&mut hasher);
+    }
+    format!("{:x}", hasher.finish())
 }
 
 /// A compact, whitespace-collapsed preview of a text note for the AI prompt.
@@ -4159,9 +4233,33 @@ fn save_status_and_emit(
     db: &Database,
     status: &CourseAutomationStatus,
 ) -> Result<(), String> {
-    save_json(db, &status_key(&status.luna_id), status)?;
+    use std::hash::{Hash, Hasher};
+    let raw = serde_json::to_string(status).map_err(|error| error.to_string())?;
+    let key = status_key(&status.luna_id);
+    let digest = {
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        raw.hash(&mut hasher);
+        hasher.finish()
+    };
+    // A cycle fires this on every reused artifact/document, so most calls carry
+    // no change. Skip the SQLite write and the IPC event (which re-renders the
+    // dock) when the serialized status matches what we last persisted.
+    let state = app.state::<CourseAutomationState>();
+    if state
+        .last_emitted
+        .lock()
+        .map(|last| last.get(&key) == Some(&digest))
+        .unwrap_or(false)
+    {
+        return Ok(());
+    }
+    db.save_data_cache(&key, &raw)?;
     app.emit("course-automation-updated", status)
-        .map_err(|error| error.to_string())
+        .map_err(|error| error.to_string())?;
+    if let Ok(mut last) = state.last_emitted.lock() {
+        last.insert(key, digest);
+    }
+    Ok(())
 }
 
 fn config_key(luna_id: &str) -> String {
@@ -5532,6 +5630,36 @@ mod tests {
         assert!(["worksheet".to_string()]
             .iter()
             .any(|item| normalize_category(item) == normalize_category("WORKSHEET")));
+    }
+
+    #[test]
+    fn organize_signature_is_id_based_and_path_independent() {
+        use std::collections::BTreeMap;
+        let candidate = |path: &str| organize::OrganizeCandidate {
+            path: path.to_string(),
+            filename: "a.pdf".into(),
+            title: "A".into(),
+            summary: String::new(),
+            kind: "material".into(),
+        };
+        let mut set: BTreeMap<String, organize::OrganizeCandidate> = BTreeMap::new();
+        set.insert("doc1".into(), candidate("/course/a.pdf"));
+        set.insert("doc2".into(), candidate("/course/b.pdf"));
+        let before = organize_candidate_signature(&set);
+
+        // Filing moves a file into a theme folder: its path changes but its id
+        // does not, so the signature must stay the same (no redundant re-plan).
+        set.insert("doc1".into(), candidate("/course/第1回/a.pdf"));
+        assert_eq!(organize_candidate_signature(&set), before);
+
+        // Adding a new file (e.g. a fresh download or loose note) must flip it.
+        set.insert("loose:note.md".into(), candidate("/course/note.md"));
+        let after_add = organize_candidate_signature(&set);
+        assert_ne!(after_add, before);
+
+        // Removing it returns to the original signature (set is what matters).
+        set.remove("loose:note.md");
+        assert_eq!(organize_candidate_signature(&set), before);
     }
 
     #[test]

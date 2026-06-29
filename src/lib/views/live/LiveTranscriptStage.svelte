@@ -1,7 +1,5 @@
 <script lang="ts">
-  import TodoDraftCard from "../../TodoDraftCard.svelte";
   import type { LiveSaveResult, LiveSessionSnapshot } from "../../api";
-  import type { LiveTodoDraft } from "./liveTypes";
 
   type TranscriptLine = LiveSessionSnapshot["transcript_lines"][number];
 
@@ -13,18 +11,12 @@
     saveProgress: string;
     sttBooting: boolean;
     sttBootMessage: string;
-    todoDrafts: LiveTodoDraft[];
-    todoDraftsWithDeadlineCount: number;
-    todoDraftSaving: boolean;
     lastSaved: LiveSaveResult | null;
     showSaveNotif: boolean;
     visibleLines: TranscriptLine[];
     hiddenLineCount: number;
     renderMd: (text: string) => string;
     extractOverallSummary: (markdown: string) => string;
-    onToggleTodoDraft: (index: number) => void;
-    onCloseTodoDrafts: () => void;
-    onConfirmTodoDrafts: () => void;
   }
 
   let {
@@ -35,18 +27,12 @@
     saveProgress,
     sttBooting,
     sttBootMessage,
-    todoDrafts,
-    todoDraftsWithDeadlineCount,
-    todoDraftSaving,
     lastSaved,
     showSaveNotif,
     visibleLines,
     hiddenLineCount,
     renderMd,
     extractOverallSummary,
-    onToggleTodoDraft,
-    onCloseTodoDrafts,
-    onConfirmTodoDrafts,
   }: Props = $props();
 </script>
 
@@ -81,27 +67,6 @@
               <span class="save-capsule-spinner"></span>
               <span class="save-capsule-text">{saveProgress}</span>
             </div>
-          {:else if todoDrafts.length > 0}
-            <div class="save-capsule done">
-              <svg class="save-capsule-icon" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="url(#notif-grad)" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-                <defs><linearGradient id="notif-grad" x1="0%" y1="0%" x2="100%" y2="100%"><stop offset="0%" stop-color="#c480e8"/><stop offset="100%" stop-color="#6bacf0"/></linearGradient></defs>
-                <path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"/><polyline points="22 4 12 14.01 9 11.01"/>
-              </svg>
-              <span class="save-capsule-text">保存完了・TODO候補あり</span>
-            </div>
-            {#if lastSaved}
-              <div class="save-summary md">{@html renderMd(extractOverallSummary(lastSaved.markdown))}</div>
-            {/if}
-            <TodoDraftCard
-              title="LiveからTODO候補を追加"
-              subtitle={`${todoDrafts.length}件中 ${todoDraftsWithDeadlineCount}件にDDLあり。必要なものだけ選んで追加できます。`}
-              drafts={todoDrafts}
-              saving={todoDraftSaving}
-              inline
-              onToggle={onToggleTodoDraft}
-              onClose={onCloseTodoDrafts}
-              onConfirm={onConfirmTodoDrafts}
-            />
           {:else if showSaveNotif && lastSaved}
             <div class="save-capsule done">
               <svg class="save-capsule-icon" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="url(#notif-grad)" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">

@@ -2,8 +2,16 @@
   import type { LiveTermExplanation } from "../../api";
   import type { WhiteboardLayoutResult } from "../../whiteboardLayout";
   import type { TermFloatLabels } from "./liveTypes";
+  import LiveSummaryCard from "./LiveSummaryCard.svelte";
+
+  type SummaryEntry = { range_label: string; body: string; isOverall: boolean };
 
   interface Props {
+    summaryEntries: SummaryEntry[];
+    activeSummaryIdx: number;
+    summarySegmentCount: number;
+    renderMd: (text: string) => string;
+    onOpenSummaryDetail: () => void;
     previewLayout: WhiteboardLayoutResult | null;
     activeSummaryTerms: LiveTermExplanation[];
     termsCollapsed: boolean;
@@ -19,6 +27,11 @@
   }
 
   let {
+    summaryEntries,
+    activeSummaryIdx,
+    summarySegmentCount,
+    renderMd,
+    onOpenSummaryDetail,
     previewLayout,
     activeSummaryTerms,
     termsCollapsed,
@@ -43,8 +56,89 @@
   );
 </script>
 
-{#if previewLayout || activeSummaryTerms.length > 0}
+{#if summaryEntries.length > 0 || previewLayout || activeSummaryTerms.length > 0}
   <div class="right-rail">
+    {#if summaryEntries.length > 0}
+      <LiveSummaryCard
+        entries={summaryEntries}
+        activeIdx={activeSummaryIdx}
+        segmentCount={summarySegmentCount}
+        {renderMd}
+        onOpenDetail={onOpenSummaryDetail}
+      />
+    {/if}
+    {#if activeSummaryTerms.length > 0}
+      <aside class="term-stack" class:collapsed={termsCollapsed} class:multi={!termsCollapsed && activeSummaryTerms.length > 1} aria-label={termFloatLabels.title}>
+        {#if termsCollapsed}
+          <button
+            type="button"
+            class="term-stack-collapsed"
+            onclick={onToggleTermsCollapsed}
+            aria-label={termFloatLabels.expand}
+            title={termFloatLabels.expand}
+          >
+            <span class="term-stack-preview" aria-hidden="true">
+              {#each collapsedTermPreview as item, i (i + "-" + item.term)}
+                <span class="term-stack-preview-chip">{item.term}</span>
+              {/each}
+            </span>
+            <svg class="term-stack-expand-icon" width="11" height="11" viewBox="0 0 12 12" fill="none" aria-hidden="true"><path d="M3 7.5 6 4.5l3 3" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"/></svg>
+          </button>
+        {:else}
+          {#each activeSummaryTerms as item, i (i + "-" + item.term)}
+            {@const offset = termStackOffset(i)}
+            {@const visible = offset >= 0 && offset <= 2}
+            <button
+              type="button"
+              class="term-card"
+              class:active={offset === 0}
+              class:peek={offset > 0}
+              style="
+                transform: translateY({offset * 10}px) scale({1 - offset * 0.04});
+                opacity: {offset === 0 ? 1 : 0.72 - (offset - 1) * 0.22};
+                z-index: {100 - offset};
+                pointer-events: {visible ? 'auto' : 'none'};
+                visibility: {visible ? 'visible' : 'hidden'};
+                {visible ? '' : 'transition: none;'}
+              "
+              onclick={() => (offset === 0 ? onOpenSummaryDetail() : onSelectTermCard(i))}
+              aria-hidden={!visible}
+              tabindex={offset === 0 ? 0 : -1}
+            >
+              <div class="term-card-term">{item.term}</div>
+              <div class="term-card-body">{item.explanation}</div>
+              {#if item.source_excerpt || item.external_source}
+                <div class="term-card-meta">
+                  {#if item.source_excerpt}
+                    <div class="term-card-source"><span>{termFloatLabels.source}</span>{item.source_excerpt}</div>
+                  {/if}
+                  {#if item.external_source}
+                    <div class="term-card-source external"><span>{termFloatLabels.externalSource}</span>{item.external_source}</div>
+                  {/if}
+                </div>
+              {/if}
+            </button>
+          {/each}
+          <div class="term-stack-nav">
+            {#if activeSummaryTerms.length > 1}
+              <button class="term-stack-arrow" onclick={onTermCardPrev} aria-label={termFloatLabels.previous} title={termFloatLabels.previous}>
+                <svg width="9" height="9" viewBox="0 0 10 10" fill="none"><path d="M7 2L3 5l4 3" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"/></svg>
+              </button>
+            {/if}
+            <span class="term-stack-counter">{termCardIdx + 1}/{activeSummaryTerms.length}</span>
+            {#if activeSummaryTerms.length > 1}
+              <button class="term-stack-arrow" onclick={onTermCardNext} aria-label={termFloatLabels.next} title={termFloatLabels.next}>
+                <svg width="9" height="9" viewBox="0 0 10 10" fill="none"><path d="M3 2l4 3-4 3" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"/></svg>
+              </button>
+            {/if}
+            <button class="term-stack-arrow collapse" onclick={onToggleTermsCollapsed} aria-label={termFloatLabels.collapse} title={termFloatLabels.collapse}>
+              <svg width="10" height="10" viewBox="0 0 12 12" fill="none"><path d="M3 4.5 6 7.5l3-3" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>
+            </button>
+          </div>
+        {/if}
+      </aside>
+    {/if}
+
     {#if previewLayout}
       <aside class="board-stack" aria-label={termFloatLabels.boardTitle}>
         <button
@@ -87,78 +181,6 @@
         </button>
       </aside>
     {/if}
-
-    {#if activeSummaryTerms.length > 0}
-      <aside class="term-stack" class:collapsed={termsCollapsed} aria-label={termFloatLabels.title}>
-        {#if termsCollapsed}
-          <button
-            type="button"
-            class="term-stack-collapsed"
-            onclick={onToggleTermsCollapsed}
-            aria-label={termFloatLabels.expand}
-            title={termFloatLabels.expand}
-          >
-            <span class="term-stack-preview" aria-hidden="true">
-              {#each collapsedTermPreview as item, i (i + "-" + item.term)}
-                <span class="term-stack-preview-chip">{item.term}</span>
-              {/each}
-            </span>
-            <svg class="term-stack-expand-icon" width="11" height="11" viewBox="0 0 12 12" fill="none" aria-hidden="true"><path d="M3 7.5 6 4.5l3 3" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"/></svg>
-          </button>
-        {:else}
-          {#each activeSummaryTerms as item, i (i + "-" + item.term)}
-            {@const offset = termStackOffset(i)}
-            {@const visible = offset >= 0 && offset <= 2}
-            <button
-              type="button"
-              class="term-card"
-              class:active={offset === 0}
-              class:peek={offset > 0}
-              style="
-                transform: translateY({offset * 14}px) scale({1 - offset * 0.04});
-                opacity: {offset === 0 ? 1 : 0.72 - (offset - 1) * 0.22};
-                z-index: {100 - offset};
-                pointer-events: {visible ? 'auto' : 'none'};
-                visibility: {visible ? 'visible' : 'hidden'};
-                {visible ? '' : 'transition: none;'}
-              "
-              onclick={() => onSelectTermCard(i)}
-              aria-hidden={!visible}
-              tabindex={offset === 0 ? 0 : -1}
-            >
-              <div class="term-card-term">{item.term}</div>
-              <div class="term-card-body">{item.explanation}</div>
-              {#if item.source_excerpt || item.external_source}
-                <div class="term-card-meta">
-                  {#if item.source_excerpt}
-                    <div class="term-card-source"><span>{termFloatLabels.source}</span>{item.source_excerpt}</div>
-                  {/if}
-                  {#if item.external_source}
-                    <div class="term-card-source external"><span>{termFloatLabels.externalSource}</span>{item.external_source}</div>
-                  {/if}
-                </div>
-              {/if}
-            </button>
-          {/each}
-          <div class="term-stack-nav">
-            {#if activeSummaryTerms.length > 1}
-              <button class="term-stack-arrow" onclick={onTermCardPrev} aria-label={termFloatLabels.previous} title={termFloatLabels.previous}>
-                <svg width="9" height="9" viewBox="0 0 10 10" fill="none"><path d="M7 2L3 5l4 3" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"/></svg>
-              </button>
-            {/if}
-            <span class="term-stack-counter">{termCardIdx + 1}/{activeSummaryTerms.length}</span>
-            {#if activeSummaryTerms.length > 1}
-              <button class="term-stack-arrow" onclick={onTermCardNext} aria-label={termFloatLabels.next} title={termFloatLabels.next}>
-                <svg width="9" height="9" viewBox="0 0 10 10" fill="none"><path d="M3 2l4 3-4 3" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"/></svg>
-              </button>
-            {/if}
-            <button class="term-stack-arrow collapse" onclick={onToggleTermsCollapsed} aria-label={termFloatLabels.collapse} title={termFloatLabels.collapse}>
-              <svg width="10" height="10" viewBox="0 0 12 12" fill="none"><path d="M3 4.5 6 7.5l3-3" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>
-            </button>
-          </div>
-        {/if}
-      </aside>
-    {/if}
   </div>
 {/if}
 
@@ -168,11 +190,11 @@
     right: 16px;
     bottom: 16px;
     z-index: 33;
-    width: min(300px, calc(100% - 32px));
+    width: min(280px, calc(100% - 32px));
     display: flex;
     flex-direction: column;
     align-items: stretch;
-    gap: 10px;
+    gap: 8px;
     pointer-events: none;
   }
   .right-rail > * {
@@ -308,6 +330,11 @@
     border: none;
     animation: term-stack-in 0.32s cubic-bezier(0.22, 1, 0.36, 1) both;
   }
+  /* Reserve space for the peeking cards (~28px below the front) so they don't
+     overlap the whiteboard entry below and the gaps stay even. */
+  .term-stack.multi {
+    margin-bottom: 14px;
+  }
   .term-stack.collapsed {
     width: fit-content;
     max-width: 100%;
@@ -387,11 +414,14 @@
     position: relative;
     inset: auto;
     min-height: 92px;
-    cursor: default;
+    cursor: pointer;
     background: color-mix(in srgb, var(--bg-primary) 90%, transparent);
     backdrop-filter: blur(18px) saturate(1.25);
     -webkit-backdrop-filter: blur(18px) saturate(1.25);
     box-shadow: 0 4px 12px rgba(0, 0, 0, 0.08);
+  }
+  .term-card.active:hover {
+    border-color: color-mix(in srgb, var(--text-primary) 16%, var(--glass-border));
   }
   .term-card.peek:hover {
     background: color-mix(in srgb, var(--bg-primary) 94%, transparent);
@@ -416,8 +446,8 @@
     color: var(--text-secondary);
     word-break: break-word;
     display: -webkit-box;
-    -webkit-line-clamp: 4;
-    line-clamp: 4;
+    -webkit-line-clamp: 3;
+    line-clamp: 3;
     -webkit-box-orient: vertical;
     overflow: hidden;
   }
