@@ -281,11 +281,18 @@ pub(super) fn write_partial_markdown_file(
         summaries,
         transcript_lines,
     );
+    let _ = write_formal_markdown_file(course, started_at, &markdown);
+}
+
+pub(super) fn write_formal_markdown_file(
+    course: &LiveCourseInfo,
+    started_at: DateTime<Local>,
+    markdown: &str,
+) -> Result<std::path::PathBuf, String> {
     let dir = live_storage_dir(course);
+    std::fs::create_dir_all(&dir).map_err(|e| format!("保存先フォルダ作成失敗: {}", e))?;
     let path = dir.join(formal_markdown_filename(course, started_at));
-    if std::fs::write(&path, markdown.as_bytes()).is_err() {
-        return;
-    }
+    std::fs::write(&path, markdown.as_bytes()).map_err(|e| format!("Markdown保存失敗: {}", e))?;
     let path_str = path.to_string_lossy().to_string();
     let file_name = path
         .file_name()
@@ -300,6 +307,7 @@ pub(super) fn write_partial_markdown_file(
         "live",
         markdown.len() as u64,
     );
+    Ok(path)
 }
 
 /// Auto-save session state to day cache (non-fatal on error).

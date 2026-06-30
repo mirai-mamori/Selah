@@ -1332,6 +1332,16 @@ mod tests {
     }
 
     #[test]
+    fn simplify_strips_faculty_path_and_course_code() {
+        // The faculty-path + 8-digit course-code prefix must not leak into the
+        // course label (e.g. notification titles).
+        let s = simplify_course_name("国際学部/International Studies 34001001 キリスト教学A　１");
+        assert!(!s.contains("34001001"), "got: {s}");
+        assert!(!s.contains("International Studies"), "got: {s}");
+        assert!(s.starts_with("キリスト教学A"), "got: {s}");
+    }
+
+    #[test]
     fn theme_subfolder_extracts_in_course_path() {
         let base = std::path::Path::new("/Users/x/Selah");
         // base/<course>/<theme>/<file> → theme

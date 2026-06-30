@@ -10,7 +10,7 @@ mod types;
 
 use self::cache::{
     auto_save_day_cache, formal_markdown_filename, live_storage_dir, load_day_cache,
-    remove_day_cache, save_day_cache_full, write_partial_markdown_file,
+    remove_day_cache, save_day_cache_full, write_formal_markdown_file, write_partial_markdown_file,
 };
 use self::markdown::build_markdown;
 use ai_output::{
@@ -42,6 +42,8 @@ const LIVE_FLUSH_DRIVER_MIN_SLEEP_SECS: u64 = 1;
 // model to compress earlier branches. Per-field length and the relationship
 // guards in `parse_live_whiteboard` are the remaining safety nets.
 const FREE_NOTE_FOLDER_NAME: &str = "自由ノート";
+const PRE_AI_OVERALL_SUMMARY: &str =
+    "### 全体要約\n_(AI生成前の一時保存です。生成完了後に更新します)_";
 
 pub struct LiveState(Mutex<Option<LiveSession>>, Arc<Notify>);
 
@@ -126,6 +128,10 @@ fn format_datetime(dt: DateTime<Local>) -> String {
 
 fn format_time(dt: DateTime<Local>) -> String {
     dt.format("%H:%M").to_string()
+}
+
+fn emit_live_finish_progress(app: &tauri::AppHandle, step: &str) {
+    let _ = app.emit("live-finish-progress", serde_json::json!({ "step": step }));
 }
 
 fn clock_time_on_session_date(
@@ -269,9 +275,7 @@ fn live_ai_config() -> Result<crate::ai::AiConfig, String> {
             "[Live] AI summarization aborted: api_key empty for provider '{}' (secret store unreadable?)",
             cfg.provider
         );
-        return Err(
-            "AI APIキーを読み込めませんでした。設定でAPIキーを保存し直してください".into(),
-        );
+        return Err("AI APIキーを読み込めませんでした。設定でAPIキーを保存し直してください".into());
     }
     Ok(cfg)
 }
@@ -1908,7 +1912,7 @@ pub async fn live_finish_session(
     app: tauri::AppHandle,
     state: tauri::State<'_, LiveState>,
 ) -> Result<LiveSaveResult, String> {
-    let (finish_started_at, pending_line_count) = {
+    let (course, started_at, transcript_lines, summaries, pending_line_count) = {
         let guard = state
             .0
             .lock()
@@ -1916,37 +1920,6 @@ pub async fn live_finish_session(
         let Some(session) = guard.as_ref() else {
             return Err("Liveセッションが開始されていません".to_string());
         };
-        (session.started_at, session.pending_lines.len())
-    };
-    let finish_started_check_at = Local::now();
-    if should_require_finish_chunk_ai(
-        finish_started_at,
-        finish_started_check_at,
-        pending_line_count,
-    ) {
-        // Retry the closing segment a few times before giving up. If it still
-        // fails, degrade to saving the transcript plus the segments we already
-        // have rather than failing the whole stop and losing everything — the
-        // markdown build below works from whatever summaries exist.
-        if let Err(err) = flush_final_summary_with_retry(&state).await {
-            log::warn!(
-                "[Live] final chunk summary gave up after retries: {err}; \
-                 saving transcript without the last segment"
-            );
-        }
-    } else {
-        // Non-fatal for short sessions: they intentionally skip AI and save the transcript as-is.
-        let _ = flush_session_summary(&state, true).await;
-    }
-
-    let (course, started_at, transcript_lines, summaries) = {
-        let guard = state
-            .0
-            .lock()
-            .map_err(|_| "Live state lock failed".to_string())?;
-        let session = guard
-            .as_ref()
-            .ok_or_else(|| "Liveセッションが開始されていません".to_string())?;
         if session.transcript_lines.is_empty() {
             let course = session.course.clone();
             drop(guard);
@@ -1982,11 +1955,63 @@ pub async fn live_finish_session(
             session.started_at,
             session.transcript_lines.clone(),
             session.summaries.clone(),
+            session.pending_lines.len(),
+        )
+    };
+
+    let pre_ai_saved_at = Local::now();
+    let pre_ai_markdown = build_markdown(
+        &course,
+        started_at,
+        pre_ai_saved_at,
+        PRE_AI_OVERALL_SUMMARY,
+        &summaries,
+        &transcript_lines,
+    );
+    write_formal_markdown_file(&course, started_at, &pre_ai_markdown)?;
+    save_day_cache_full(&course, started_at, &transcript_lines, &summaries);
+    emit_live_finish_progress(&app, "record_saved");
+
+    let ai_config = crate::ai::load_ai_config();
+    let will_run_finish_ai = should_run_finish_ai(&ai_config.provider, started_at, pre_ai_saved_at);
+    let needs_final_chunk_ai =
+        should_require_finish_chunk_ai(started_at, pre_ai_saved_at, pending_line_count);
+    if needs_final_chunk_ai || will_run_finish_ai {
+        emit_live_finish_progress(&app, "ai");
+    }
+    if needs_final_chunk_ai {
+        // Retry the closing segment a few times before giving up. If it still
+        // fails, degrade to saving the transcript plus the segments we already
+        // have rather than failing the whole stop and losing everything — the
+        // markdown build below works from whatever summaries exist.
+        if let Err(err) = flush_final_summary_with_retry(&state).await {
+            log::warn!(
+                "[Live] final chunk summary gave up after retries: {err}; \
+                 saving transcript without the last segment"
+            );
+        }
+    } else {
+        // Non-fatal for short sessions: they intentionally skip AI and save the transcript as-is.
+        let _ = flush_session_summary(&state, true).await;
+    }
+
+    let (course, started_at, transcript_lines, summaries) = {
+        let guard = state
+            .0
+            .lock()
+            .map_err(|_| "Live state lock failed".to_string())?;
+        let session = guard
+            .as_ref()
+            .ok_or_else(|| "Liveセッションが開始されていません".to_string())?;
+        (
+            session.course.clone(),
+            session.started_at,
+            session.transcript_lines.clone(),
+            session.summaries.clone(),
         )
     };
 
     let ended_at = Local::now();
-    let ai_config = crate::ai::load_ai_config();
     let should_run_finish_ai = should_run_finish_ai(&ai_config.provider, started_at, ended_at);
     let overall_summary =
         generate_overall_summary(&course, started_at, ended_at, &summaries, &transcript_lines)
@@ -2008,25 +2033,13 @@ pub async fn live_finish_session(
         && !should_skip_ai_summarization(started_at, ended_at)
         && should_run_finish_ai;
 
-    let dir = live_storage_dir(&course);
-    let path = dir.join(formal_markdown_filename(&course, started_at));
-    std::fs::write(&path, markdown.as_bytes()).map_err(|e| format!("Markdown保存失敗: {}", e))?;
+    emit_live_finish_progress(&app, "final_save");
+    let path = write_formal_markdown_file(&course, started_at, &markdown)?;
 
     // Save day cache so next session for same course today can resume
     save_day_cache_full(&course, started_at, &transcript_lines, &summaries);
 
     let path_str = path.to_string_lossy().to_string();
-    let file_name = path
-        .file_name()
-        .and_then(|value| value.to_str())
-        .unwrap_or("live.md");
-    crate::commands::record_download(
-        file_name,
-        &path_str,
-        Some(&course.course_name),
-        "live",
-        markdown.len() as u64,
-    );
 
     let snapshot = {
         let mut guard = state

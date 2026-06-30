@@ -27,7 +27,6 @@
     liveCancelSession,
     liveClearDayCache,
     liveFinishSession,
-    liveFlushSummary,
     liveGenerateOverallSummary,
     liveGetSession,
     livePeekDayCache,
@@ -84,8 +83,9 @@
 
   const STOP_STEP = "録音を停止中";
   const AUTO_STOP_STEP = "自動終了の準備中";
+  const RECORD_WRITE_STEP = "録音内容を保存中";
   const SUMMARY_STEP = "AI要約を生成中";
-  const WRITE_STEP = "ファイルに書き出し中";
+  const FINAL_WRITE_STEP = "AI反映版を書き出し中";
   const TODO_STEP = "やること・締切を抽出中";
   const OVERALL_STEP = "全体要約を生成中";
 
@@ -98,6 +98,20 @@
     const i = saveSteps.indexOf(label);
     if (i >= 0) saveStepIndex = i;
     saveProgress = `${label}…`;
+  }
+  function gotoSaveIfPresent(label: string) {
+    if (saveSteps.includes(label)) gotoSave(label);
+  }
+  function applyFinishProgress(step: string) {
+    if (step === "record_saved" || step === "ai") {
+      if (saveSteps.includes(SUMMARY_STEP)) {
+        gotoSave(SUMMARY_STEP);
+      } else {
+        gotoSaveIfPresent(FINAL_WRITE_STEP);
+      }
+    } else if (step === "final_save") {
+      gotoSaveIfPresent(FINAL_WRITE_STEP);
+    }
   }
   function endSave() {
     saveSteps = [];
@@ -528,6 +542,7 @@
   let unlistenInfo: (() => void) | null = null;
   let unlistenLive: (() => void) | null = null;
   let unlistenSaved: (() => void) | null = null;
+  let unlistenFinishProgress: (() => void) | null = null;
   let unlistenAiConfig: (() => void) | null = null;
   let unlistenScheduleCache: (() => void) | null = null;
   let unlistenWinFocus: (() => void) | null = null;
@@ -1187,7 +1202,7 @@
     sttPhase = "idle";
     const stopLabel = automated ? AUTO_STOP_STEP : STOP_STEP;
     // Provisional full pipeline; corrected once we know empty/skip below.
-    beginSave([stopLabel, SUMMARY_STEP, WRITE_STEP, TODO_STEP]);
+    beginSave([stopLabel, RECORD_WRITE_STEP, SUMMARY_STEP, FINAL_WRITE_STEP, TODO_STEP]);
     try {
       if (!isDemoActive()) {
         try {
@@ -1198,7 +1213,7 @@
       partialText = "";
       snapshot = await liveGetSession();
       if (snapshot.transcript_lines.length === 0) {
-        beginSave([stopLabel, WRITE_STEP], 1);
+        beginSave([stopLabel, RECORD_WRITE_STEP], 1);
         const ended = await liveFinishSession();
         lastSaved = ended.saved ? ended : null;
         snapshot = await liveGetSession();
@@ -1211,13 +1226,10 @@
       }
       const skipAiSummarization = shouldSkipAiSummarizationForSnapshot(snapshot);
       if (skipAiSummarization) {
-        beginSave([stopLabel, WRITE_STEP, TODO_STEP], 1);
+        beginSave([stopLabel, RECORD_WRITE_STEP, FINAL_WRITE_STEP, TODO_STEP], 1);
       } else {
-        gotoSave(SUMMARY_STEP);
-        const flushed = await liveFlushSummary(true);
-        snapshot = flushed;
+        gotoSave(RECORD_WRITE_STEP);
       }
-      gotoSave(WRITE_STEP);
       const saved = await liveFinishSession();
       lastSaved = saved.saved ? saved : null;
       overallSummary = "";
@@ -1422,6 +1434,9 @@
       unlistenSaved = await listen<LiveSaveResult>("live-session-saved", (event) => {
         lastSaved = event.payload;
       });
+      unlistenFinishProgress = await listen<{ step: string }>("live-finish-progress", (event) => {
+        applyFinishProgress(event.payload.step);
+      });
       unlistenAiConfig = await listen("ai-config-changed", () => {
         refreshReadiness().catch((e: any) => {
           liveReady = false;
@@ -1459,6 +1474,7 @@
     unlistenInfo?.();
     unlistenLive?.();
     unlistenSaved?.();
+    unlistenFinishProgress?.();
     unlistenAiConfig?.();
     unlistenScheduleCache?.();
     unlistenWinFocus?.();

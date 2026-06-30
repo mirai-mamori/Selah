@@ -732,7 +732,11 @@ pub async fn course_automation_organize_now(
     let filed = organize_course_documents(&luna_id, &mut status, &schedule, true).await;
     if filed > 0 {
         status.last_organized = Some(epoch_secs());
-        push_run_log(&mut status, "ok", format!("{filed}件の資料をテーマ別に整理"));
+        push_run_log(
+            &mut status,
+            "ok",
+            format!("{filed}件の資料をテーマ別に整理"),
+        );
     }
     save_status_and_emit(&app, &db, &status)?;
     Ok(load_view(&db, &luna_id, &course_name))
@@ -758,7 +762,11 @@ pub async fn course_automation_undo_organize(
     let course_root = crate::commands::resolve_download_dir(Some(&course_name));
     let restored = organize::undo_organize(&mut status, &course_root);
     if restored > 0 {
-        push_run_log(&mut status, "ok", format!("{restored}件の整理を元に戻しました"));
+        push_run_log(
+            &mut status,
+            "ok",
+            format!("{restored}件の整理を元に戻しました"),
+        );
     }
     save_status_and_emit(&app, &db, &status)?;
     Ok(load_view(&db, &luna_id, &course_name))
@@ -1838,7 +1846,10 @@ async fn run_course_inner(
             );
             match crate::ai::send_native_notification(
                 app,
-                &format!("{}: 座席情報が更新されました", status.course_name),
+                &format!(
+                    "{}: 座席情報が更新されました",
+                    crate::commands::simplify_course_name(&status.course_name)
+                ),
                 &body,
             ) {
                 Ok(_) => {
@@ -1862,7 +1873,10 @@ async fn run_course_inner(
             let pending_ids = status.pending_notification_ids.clone();
             match crate::ai::send_native_notification(
                 app,
-                &format!("{}: Plus からのお知らせ", status.course_name),
+                &format!(
+                    "{}: Plus からのお知らせ",
+                    crate::commands::simplify_course_name(&status.course_name)
+                ),
                 &proactive_notification_body(&status.analysis),
             ) {
                 Ok(_) => {
@@ -1966,7 +1980,11 @@ async fn run_course_inner(
         let filed = organize_course_documents(luna_id, &mut status, &schedule, false).await;
         if filed > 0 {
             status.last_organized = Some(epoch_secs());
-            push_run_log(&mut status, "ok", format!("{filed}件の資料をテーマ別に整理"));
+            push_run_log(
+                &mut status,
+                "ok",
+                format!("{filed}件の資料をテーマ別に整理"),
+            );
         }
     }
     save_status_and_emit(app, &db, &status)?;
@@ -2992,10 +3010,14 @@ async fn organize_course_documents(
             .filter_map(|id| candidates.get(id).map(|cand| (id.clone(), cand.clone())))
             .collect();
         let notices = organize_notices(status);
-        match plan_organize_with_agent(luna_id, &subset, &status.course_name, schedule, &notices).await {
+        match plan_organize_with_agent(luna_id, &subset, &status.course_name, schedule, &notices)
+            .await
+        {
             Ok(plan) => plan,
             Err(error) => {
-                log::warn!("[course_automation] organize planning failed, using heuristic: {error}");
+                log::warn!(
+                    "[course_automation] organize planning failed, using heuristic: {error}"
+                );
                 Vec::new()
             }
         }
@@ -3032,6 +3054,13 @@ fn build_organize_candidates(
         std::collections::BTreeMap::new();
     let mut tracked_paths: HashSet<String> = HashSet::new();
 
+    // Live notes whose recording is still live (their day-cache sidecar exists):
+    // the Live writer keeps rewriting them at a FIXED root path, so moving one now
+    // would split-brain (a stale copy in a theme folder + a fresh one re-created at
+    // the root on the next save). Leave them at the root until the session finishes
+    // (`remove_day_cache` clears the sidecar), then they file normally.
+    let in_progress = active_live_notes(course_root);
+
     // Ledger lookup by filename, so a swept file recovers its AI analysis even
     // when the stored path is empty/stale. First done analysis per name wins.
     let mut ledger_by_name: HashMap<&str, &DocumentAnalysis> = HashMap::new();
@@ -3043,19 +3072,31 @@ fn build_organize_candidates(
             ledger_by_name.entry(doc.filename.as_str()).or_insert(doc);
         }
         // Directly usable: a ledger doc whose path still points at a real file.
-        if !doc.path.trim().is_empty() && Path::new(&doc.path).is_file() {
+        if !doc.path.trim().is_empty()
+            && Path::new(&doc.path).is_file()
+            && !in_progress.contains(&doc.filename)
+        {
             tracked_paths.insert(doc.path.clone());
-            candidates.entry(doc.id.clone()).or_insert_with(|| organize::OrganizeCandidate {
-                path: doc.path.clone(),
-                filename: doc.filename.clone(),
-                title: doc.title.clone(),
-                summary: organize_signal(&doc.summary, &doc.findings),
-                kind: doc.kind.clone(),
-            });
+            candidates
+                .entry(doc.id.clone())
+                .or_insert_with(|| organize::OrganizeCandidate {
+                    path: doc.path.clone(),
+                    filename: doc.filename.clone(),
+                    title: doc.title.clone(),
+                    summary: organize_signal(&doc.summary, &doc.findings),
+                    kind: doc.kind.clone(),
+                });
         }
     }
 
-    collect_disk_files(course_root, &tracked_paths, &ledger_by_name, &mut candidates, 0);
+    collect_disk_files(
+        course_root,
+        &tracked_paths,
+        &in_progress,
+        &ledger_by_name,
+        &mut candidates,
+        0,
+    );
     candidates
 }
 
@@ -3069,6 +3110,39 @@ fn default_candidate_kind(ext: &str) -> &'static str {
     }
 }
 
+/// Filenames of Live notes whose recording is still live — derived from the
+/// day-cache sidecars (`.<date>_<course>_live*.cache.json` / `.lines.ndjson`) the
+/// Live module keeps at the course root while a session is open or resumable, and
+/// deletes on finish. The organizer skips these so it never moves a note the Live
+/// writer will re-create at the fixed root path. Maps each sidecar back to its
+/// `…_live.md` name (tolerating the build-cache tag between `_live` and the suffix).
+fn active_live_notes(course_root: &Path) -> HashSet<String> {
+    let mut active = HashSet::new();
+    let Ok(entries) = std::fs::read_dir(course_root) else {
+        return active;
+    };
+    for entry in entries.flatten() {
+        let Some(name) = entry.file_name().to_str().map(str::to_string) else {
+            continue;
+        };
+        if !name.starts_with('.') {
+            continue;
+        }
+        let stem = match name
+            .strip_suffix(".cache.json")
+            .or_else(|| name.strip_suffix(".lines.ndjson"))
+        {
+            Some(stem) => stem.trim_start_matches('.'),
+            None => continue,
+        };
+        // stem = "<date>_<course>_live<tag>" → the markdown is "<…_live>.md".
+        if let Some(idx) = stem.rfind("_live") {
+            active.insert(format!("{}_live.md", &stem[..idx]));
+        }
+    }
+    active
+}
+
 /// Recursively gathers every real file under `dir` into `candidates`, bounded in
 /// depth so a pathological tree can't stall the sweep. Hidden files, Office lock
 /// files (`~$…`), and paths already added as tracked candidates are skipped. Each
@@ -3079,6 +3153,7 @@ fn default_candidate_kind(ext: &str) -> &'static str {
 fn collect_disk_files(
     dir: &Path,
     tracked_paths: &HashSet<String>,
+    in_progress: &HashSet<String>,
     ledger_by_name: &HashMap<&str, &DocumentAnalysis>,
     candidates: &mut std::collections::BTreeMap<String, organize::OrganizeCandidate>,
     depth: usize,
@@ -3100,10 +3175,22 @@ fn collect_disk_files(
             continue;
         }
         if path.is_dir() {
-            collect_disk_files(&path, tracked_paths, ledger_by_name, candidates, depth + 1);
+            collect_disk_files(
+                &path,
+                tracked_paths,
+                in_progress,
+                ledger_by_name,
+                candidates,
+                depth + 1,
+            );
             continue;
         }
         if !path.is_file() {
+            continue;
+        }
+        // A Live note still being recorded must stay put — the Live writer keeps
+        // rewriting it at the fixed root path, so moving it would split-brain.
+        if in_progress.contains(name) {
             continue;
         }
         let path_str = path.to_string_lossy().to_string();
@@ -4589,6 +4676,30 @@ mod tests {
         // Whitespace-collapsed and bounded.
         assert!(!signal.contains("  "));
         assert!(signal.chars().count() <= 600);
+    }
+
+    #[test]
+    fn active_live_notes_maps_sidecars_to_md_names() {
+        let root = std::env::temp_dir().join(format!("live-active-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        // Open-session sidecars (cache + deltas), incl. a build-cache-tagged one.
+        std::fs::write(root.join(".20260623_キリスト教学_live.cache.json"), b"{}").unwrap();
+        std::fs::write(root.join(".20260624_キリスト教学_live.lines.ndjson"), b"").unwrap();
+        std::fs::write(
+            root.join(".20260625_キリスト教学_live-debug.cache.json"),
+            b"{}",
+        )
+        .unwrap();
+        // Finished note: md present but no sidecar → organizable.
+        std::fs::write(root.join("20260601_キリスト教学_live.md"), b"x").unwrap();
+
+        let active = active_live_notes(&root);
+        assert!(active.contains("20260623_キリスト教学_live.md"));
+        assert!(active.contains("20260624_キリスト教学_live.md"));
+        assert!(active.contains("20260625_キリスト教学_live.md")); // tag tolerated
+        assert!(!active.contains("20260601_キリスト教学_live.md"));
+
+        std::fs::remove_dir_all(&root).ok();
     }
 
     #[test]
