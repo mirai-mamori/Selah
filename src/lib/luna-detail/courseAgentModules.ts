@@ -376,6 +376,7 @@ export function stageText(stage: string, enabled = true): string {
       printing: "印刷を検証中",
       unchanged: "変更なし",
       done: "確認済み",
+      partial_error: "一部資料の確認エラー",
       error: "確認エラー",
     }[stage] || (enabled ? "次の確認を待機中" : "無効")
   );

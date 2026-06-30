@@ -28,7 +28,10 @@ const MAX_FILE_TEXT_CHARS: usize = 16_000;
 const FULL_SUMMARY_NEW_ITEM_THRESHOLD: usize = 4;
 const PRINT_CONFIDENCE_THRESHOLD: f32 = 0.8;
 const PLUS_AI_ATTEMPTS: usize = 2;
-const PLUS_AI_TIMEOUT_SECS: u64 = 180;
+const PLUS_AI_TIMEOUT_SECS: u64 = 300;
+const LEGACY_ALL_DOCUMENTS_FAILED_ERROR: &str = "全資料の分析に失敗しました";
+const LEGACY_AI_TIMEOUT_180_ERROR: &str = "AI リクエストが 180 秒でタイムアウトしました";
+const LEGACY_AI_TIMEOUT_ERROR: &str = "AI リクエストがタイムアウトしました";
 /// Whole-run watchdog. A hung download / print / render must never hold the
 /// global run lock forever; incremental status saves let a timed-out run resume
 /// on the next cycle, so this can be generous without losing work.
@@ -1571,7 +1574,6 @@ async fn run_course_inner(
 
         let mut document_analyses = previous.document_analyses.clone();
         let mut newly_analyzed_ids = Vec::new();
-        let mut processed_document_ids = Vec::new();
         for document in &documents {
             status.current_document = document_label(document);
             save_status_and_emit(app, &db, &status)?;
@@ -1657,10 +1659,8 @@ async fn run_course_inner(
             }
             let should_pause_for_immediate =
                 should_pause_delta_cycle_after_analysis(force_all, previous_document, &analysis);
-            let processed_id = analysis.id.clone();
             upsert_document_analysis(&mut document_analyses, analysis);
             status.processed_documents += 1;
-            processed_document_ids.push(processed_id);
             if should_pause_for_immediate {
                 let remaining = documents.len().saturating_sub(status.processed_documents);
                 if remaining > 0 {
@@ -1680,24 +1680,10 @@ async fn run_course_inner(
             }
         }
         status.current_document.clear();
-        let current_document_ids = processed_document_ids.into_iter().collect::<HashSet<_>>();
-        let successful = document_analyses
-            .iter()
-            .filter(|analysis| {
-                analysis.status == "done" && current_document_ids.contains(&analysis.id)
-            })
-            .count();
-        let errored = document_analyses
-            .iter()
-            .filter(|analysis| {
-                analysis.status == "error" && current_document_ids.contains(&analysis.id)
-            })
-            .count();
-        // Abort only when documents genuinely failed; a run where everything was
-        // skipped (e.g. unreadable scans) is not a failure.
-        if successful == 0 && errored > 0 {
-            return Err("全資料の分析に失敗しました".into());
-        }
+        // Per-document failures are already persisted, shown in the run log,
+        // and counted by `retryable_failure_count` so the course is retried on
+        // the next pass. Do not also fail the whole run here: a single hard-to-
+        // read seat PDF would otherwise produce a duplicate global error.
 
         let mut pending_summary_ids = previous.pending_summary_ids.to_vec();
         let mut pending_notification_ids = previous.pending_notification_ids.to_vec();
@@ -1958,25 +1944,25 @@ async fn run_course_inner(
     .await;
 
     let retryable_failure_count = retryable_failure_count(&status);
+    let analysis_failure_count = analysis_failure_count(&status);
     status.running = false;
     status.last_run = Some(epoch_secs());
     status.last_ok = Some(outcome.is_ok() && retryable_failure_count == 0);
     // Print failures are surfaced on the 印刷 capsule (via print_results), not the
     // control capsule, so a successful run with only print failures is not an
     // error here — it does not touch last_error or the error stage.
-    status.stage = if outcome.is_ok() {
-        match status.stage.as_str() {
-            "unchanged" | "pending_summary" => status.stage.clone(),
-            _ => "done".into(),
-        }
-    } else {
-        "error".into()
-    };
+    status.stage = final_run_stage(
+        status.stage.as_str(),
+        outcome.is_ok(),
+        analysis_failure_count,
+    );
     if let Err(error) = &outcome {
         status.last_error = error.clone();
         // Per-operation entries are logged inline during the run; here we add a
         // single run-level entry only when the whole run failed.
         push_run_log(&mut status, "error", error.clone());
+    } else if analysis_failure_count > 0 {
+        status.last_error = analysis_failure_summary(analysis_failure_count);
     }
     // After a run that actually changed something, file the documents into theme
     // folders (AI grouping over the per-document summaries, heuristic fallback).
@@ -2715,6 +2701,73 @@ fn retryable_failure_count(status: &CourseAutomationStatus) -> usize {
             .count()
         + usize::from(!status.pending_notification_ids.is_empty())
         + usize::from(status.pending_seat_notification)
+}
+
+fn analysis_failure_count(status: &CourseAutomationStatus) -> usize {
+    status
+        .artifacts
+        .iter()
+        .filter(|item| item.status == "error")
+        .count()
+        + status
+            .document_analyses
+            .iter()
+            .filter(|item| item.status == "error")
+            .count()
+}
+
+fn analysis_failure_summary(count: usize) -> String {
+    if count <= 1 {
+        "一部の資料の分析に失敗しました".into()
+    } else {
+        format!("{count}件の資料の分析に失敗しました")
+    }
+}
+
+fn final_run_stage(current_stage: &str, outcome_ok: bool, analysis_failures: usize) -> String {
+    if !outcome_ok {
+        return "error".into();
+    }
+    if analysis_failures > 0 {
+        return "partial_error".into();
+    }
+    match current_stage {
+        "unchanged" | "pending_summary" => current_stage.into(),
+        _ => "done".into(),
+    }
+}
+
+fn migrate_legacy_status_errors(status: &mut CourseAutomationStatus) {
+    status
+        .run_log
+        .retain(|entry| entry.message != LEGACY_ALL_DOCUMENTS_FAILED_ERROR);
+    for entry in &mut status.run_log {
+        if entry.message == LEGACY_AI_TIMEOUT_180_ERROR {
+            entry.message = LEGACY_AI_TIMEOUT_ERROR.into();
+        }
+    }
+
+    let analysis_failures = analysis_failure_count(status);
+    if analysis_failures > 0
+        && (status.last_error == LEGACY_ALL_DOCUMENTS_FAILED_ERROR
+            || status.last_error == LEGACY_AI_TIMEOUT_180_ERROR
+            || status.last_error.trim().is_empty()
+            || matches!(
+                status.stage.as_str(),
+                "done" | "unchanged" | "pending_summary"
+            ))
+    {
+        status.stage = final_run_stage(status.stage.as_str(), true, analysis_failures);
+        status.last_ok = Some(false);
+        status.last_error = analysis_failure_summary(analysis_failures);
+        return;
+    }
+
+    if status.last_error == LEGACY_ALL_DOCUMENTS_FAILED_ERROR {
+        status.last_error = "資料の分析に失敗しました".into();
+    } else if status.last_error == LEGACY_AI_TIMEOUT_180_ERROR {
+        status.last_error = LEGACY_AI_TIMEOUT_ERROR.into();
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
@@ -4616,6 +4669,7 @@ fn load_status(db: &Database, luna_id: &str, course_name: &str) -> CourseAutomat
     status
         .run_log
         .retain(|entry| !entry.level.trim().is_empty());
+    migrate_legacy_status_errors(&mut status);
     status
 }
 
@@ -6406,6 +6460,84 @@ mod tests {
         };
 
         assert_eq!(retryable_failure_count(&status), 5);
+        assert_eq!(analysis_failure_count(&status), 2);
+        assert_eq!(
+            analysis_failure_summary(1),
+            "一部の資料の分析に失敗しました"
+        );
+        assert_eq!(analysis_failure_summary(2), "2件の資料の分析に失敗しました");
+    }
+
+    #[test]
+    fn final_run_stage_distinguishes_partial_analysis_failure() {
+        assert_eq!(final_run_stage("analyzing", true, 1), "partial_error");
+        assert_eq!(final_run_stage("printing", true, 0), "done");
+        assert_eq!(
+            final_run_stage("pending_summary", true, 0),
+            "pending_summary"
+        );
+        assert_eq!(final_run_stage("unchanged", true, 0), "unchanged");
+        assert_eq!(final_run_stage("summarizing", false, 0), "error");
+    }
+
+    #[test]
+    fn migrate_legacy_status_errors_surfaces_partial_analysis_failure() {
+        let mut status = CourseAutomationStatus {
+            stage: "done".into(),
+            last_ok: Some(false),
+            last_error: LEGACY_ALL_DOCUMENTS_FAILED_ERROR.into(),
+            document_analyses: vec![DocumentAnalysis {
+                title: "第12回　社会言語学基礎：座席表".into(),
+                status: "error".into(),
+                error: "分析に失敗".into(),
+                ..Default::default()
+            }],
+            run_log: vec![
+                RunLogEntry {
+                    at: 1,
+                    level: "error".into(),
+                    message: LEGACY_ALL_DOCUMENTS_FAILED_ERROR.into(),
+                },
+                RunLogEntry {
+                    at: 2,
+                    level: "error".into(),
+                    message: "『第12回　社会言語学基礎：座席表』の分析に失敗".into(),
+                },
+            ],
+            ..Default::default()
+        };
+
+        migrate_legacy_status_errors(&mut status);
+
+        assert_eq!(status.stage, "partial_error");
+        assert_eq!(status.last_ok, Some(false));
+        assert_eq!(status.last_error, "一部の資料の分析に失敗しました");
+        assert_eq!(status.run_log.len(), 1);
+        assert_eq!(
+            status.run_log[0].message,
+            "『第12回　社会言語学基礎：座席表』の分析に失敗"
+        );
+    }
+
+    #[test]
+    fn migrate_legacy_status_errors_normalizes_old_timeout_text() {
+        let mut status = CourseAutomationStatus {
+            stage: "error".into(),
+            last_ok: Some(false),
+            last_error: LEGACY_AI_TIMEOUT_180_ERROR.into(),
+            run_log: vec![RunLogEntry {
+                at: 1,
+                level: "error".into(),
+                message: LEGACY_AI_TIMEOUT_180_ERROR.into(),
+            }],
+            ..Default::default()
+        };
+
+        migrate_legacy_status_errors(&mut status);
+
+        assert_eq!(status.stage, "error");
+        assert_eq!(status.last_error, LEGACY_AI_TIMEOUT_ERROR);
+        assert_eq!(status.run_log[0].message, LEGACY_AI_TIMEOUT_ERROR);
     }
 
     #[test]

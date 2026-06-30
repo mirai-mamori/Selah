@@ -253,7 +253,6 @@
   // Stacked-card pager state for term annotations.
   // No wheel interception — switching is via click on a back card or the prev/next chips.
   let termCardIdx = $state(0);
-  let termsCollapsed = $state(false);
   // activeSummaryTerms is a $derived built with .filter(), so it returns a NEW
   // array reference every time the snapshot updates (every few hundred ms during
   // a live session). Watching the array itself would reset termCardIdx on every
@@ -262,7 +261,6 @@
   const termFingerprint = $derived(
     activeSummaryTerms.map((t) => t.term).join("|")
   );
-  const collapsedTermPreview = $derived(activeSummaryTerms.slice(0, 3));
   $effect(() => {
     termFingerprint;
     // Only clamp if our current pick is now out of range (e.g. user switched
@@ -287,9 +285,6 @@
   function termCardNext() {
     const total = activeSummaryTerms.length;
     if (total > 0) termCardIdx = (termCardIdx + 1) % total;
-  }
-  function toggleTermsCollapsed() {
-    termsCollapsed = !termsCollapsed;
   }
 
   let whiteboardExpanded = $state(false);
@@ -1546,13 +1541,10 @@
     {summaryStatusLabel}
     previewLayout={previewWhiteboardLayout}
     {activeSummaryTerms}
-    {termsCollapsed}
-    {collapsedTermPreview}
     {termCardIdx}
     {termFloatLabels}
     {termStackOffset}
     onOpenWhiteboard={openWhiteboardOverlay}
-    onToggleTermsCollapsed={toggleTermsCollapsed}
     onSelectTermCard={selectTermCard}
     onTermCardPrev={termCardPrev}
     onTermCardNext={termCardNext}

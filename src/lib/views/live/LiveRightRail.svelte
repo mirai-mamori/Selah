@@ -19,13 +19,10 @@
     summaryStatusLabel: string;
     previewLayout: WhiteboardLayoutResult | null;
     activeSummaryTerms: LiveTermExplanation[];
-    termsCollapsed: boolean;
-    collapsedTermPreview: LiveTermExplanation[];
     termCardIdx: number;
     termFloatLabels: TermFloatLabels;
     termStackOffset: (index: number) => number;
     onOpenWhiteboard: () => void;
-    onToggleTermsCollapsed: () => void;
     onSelectTermCard: (index: number) => void;
     onTermCardPrev: () => void;
     onTermCardNext: () => void;
@@ -43,13 +40,10 @@
     summaryStatusLabel,
     previewLayout,
     activeSummaryTerms,
-    termsCollapsed,
-    collapsedTermPreview,
     termCardIdx,
     termFloatLabels,
     termStackOffset,
     onOpenWhiteboard,
-    onToggleTermsCollapsed,
     onSelectTermCard,
     onTermCardPrev,
     onTermCardNext,
@@ -113,74 +107,54 @@
       />
     {/if}
     {#if activeSummaryTerms.length > 0}
-      <aside class="term-stack" class:collapsed={termsCollapsed} class:multi={!termsCollapsed && activeSummaryTerms.length > 1} aria-label={termFloatLabels.title}>
-        {#if termsCollapsed}
+      <aside class="term-stack" class:multi={activeSummaryTerms.length > 1} aria-label={termFloatLabels.title}>
+        {#each activeSummaryTerms as item, i (i + "-" + item.term)}
+          {@const offset = termStackOffset(i)}
+          {@const visible = offset >= 0 && offset <= 2}
           <button
             type="button"
-            class="term-stack-collapsed"
-            onclick={onToggleTermsCollapsed}
-            aria-label={termFloatLabels.expand}
-            title={termFloatLabels.expand}
+            class="term-card"
+            class:active={offset === 0}
+            class:peek={offset > 0}
+            style="
+              transform: translateY({offset * 10}px) scale({1 - offset * 0.04});
+              opacity: {offset === 0 ? 1 : 0.72 - (offset - 1) * 0.22};
+              z-index: {100 - offset};
+              pointer-events: {visible ? 'auto' : 'none'};
+              visibility: {visible ? 'visible' : 'hidden'};
+              {visible ? '' : 'transition: none;'}
+            "
+            onclick={() => (offset === 0 ? onOpenSummaryDetail() : onSelectTermCard(i))}
+            aria-hidden={!visible}
+            tabindex={offset === 0 ? 0 : -1}
           >
-            <span class="term-stack-preview" aria-hidden="true">
-              {#each collapsedTermPreview as item, i (i + "-" + item.term)}
-                <span class="term-stack-preview-chip">{item.term}</span>
-              {/each}
-            </span>
-            <svg class="term-stack-expand-icon" width="11" height="11" viewBox="0 0 12 12" fill="none" aria-hidden="true"><path d="M3 7.5 6 4.5l3 3" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"/></svg>
+            <div class="term-card-term">{item.term}</div>
+            <div class="term-card-body">{item.explanation}</div>
+            {#if item.source_excerpt || item.external_source}
+              <div class="term-card-meta">
+                {#if item.source_excerpt}
+                  <div class="term-card-source"><span>{termFloatLabels.source}</span>{item.source_excerpt}</div>
+                {/if}
+                {#if item.external_source}
+                  <div class="term-card-source external"><span>{termFloatLabels.externalSource}</span>{item.external_source}</div>
+                {/if}
+              </div>
+            {/if}
           </button>
-        {:else}
-          {#each activeSummaryTerms as item, i (i + "-" + item.term)}
-            {@const offset = termStackOffset(i)}
-            {@const visible = offset >= 0 && offset <= 2}
-            <button
-              type="button"
-              class="term-card"
-              class:active={offset === 0}
-              class:peek={offset > 0}
-              style="
-                transform: translateY({offset * 10}px) scale({1 - offset * 0.04});
-                opacity: {offset === 0 ? 1 : 0.72 - (offset - 1) * 0.22};
-                z-index: {100 - offset};
-                pointer-events: {visible ? 'auto' : 'none'};
-                visibility: {visible ? 'visible' : 'hidden'};
-                {visible ? '' : 'transition: none;'}
-              "
-              onclick={() => (offset === 0 ? onOpenSummaryDetail() : onSelectTermCard(i))}
-              aria-hidden={!visible}
-              tabindex={offset === 0 ? 0 : -1}
-            >
-              <div class="term-card-term">{item.term}</div>
-              <div class="term-card-body">{item.explanation}</div>
-              {#if item.source_excerpt || item.external_source}
-                <div class="term-card-meta">
-                  {#if item.source_excerpt}
-                    <div class="term-card-source"><span>{termFloatLabels.source}</span>{item.source_excerpt}</div>
-                  {/if}
-                  {#if item.external_source}
-                    <div class="term-card-source external"><span>{termFloatLabels.externalSource}</span>{item.external_source}</div>
-                  {/if}
-                </div>
-              {/if}
+        {/each}
+        <div class="term-stack-nav">
+          {#if activeSummaryTerms.length > 1}
+            <button class="term-stack-arrow" onclick={onTermCardPrev} aria-label={termFloatLabels.previous} title={termFloatLabels.previous}>
+              <svg width="9" height="9" viewBox="0 0 10 10" fill="none"><path d="M7 2L3 5l4 3" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"/></svg>
             </button>
-          {/each}
-          <div class="term-stack-nav">
-            {#if activeSummaryTerms.length > 1}
-              <button class="term-stack-arrow" onclick={onTermCardPrev} aria-label={termFloatLabels.previous} title={termFloatLabels.previous}>
-                <svg width="9" height="9" viewBox="0 0 10 10" fill="none"><path d="M7 2L3 5l4 3" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"/></svg>
-              </button>
-            {/if}
-            <span class="term-stack-counter">{termCardIdx + 1}/{activeSummaryTerms.length}</span>
-            {#if activeSummaryTerms.length > 1}
-              <button class="term-stack-arrow" onclick={onTermCardNext} aria-label={termFloatLabels.next} title={termFloatLabels.next}>
-                <svg width="9" height="9" viewBox="0 0 10 10" fill="none"><path d="M3 2l4 3-4 3" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"/></svg>
-              </button>
-            {/if}
-            <button class="term-stack-arrow collapse" onclick={onToggleTermsCollapsed} aria-label={termFloatLabels.collapse} title={termFloatLabels.collapse}>
-              <svg width="10" height="10" viewBox="0 0 12 12" fill="none"><path d="M3 4.5 6 7.5l3-3" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>
+          {/if}
+          <span class="term-stack-counter">{termCardIdx + 1}/{activeSummaryTerms.length}</span>
+          {#if activeSummaryTerms.length > 1}
+            <button class="term-stack-arrow" onclick={onTermCardNext} aria-label={termFloatLabels.next} title={termFloatLabels.next}>
+              <svg width="9" height="9" viewBox="0 0 10 10" fill="none"><path d="M3 2l4 3-4 3" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"/></svg>
             </button>
-          </div>
-        {/if}
+          {/if}
+        </div>
       </aside>
     {/if}
 
@@ -489,60 +463,6 @@
   .term-stack.multi {
     margin-bottom: 14px;
   }
-  .term-stack.collapsed {
-    width: fit-content;
-    max-width: 100%;
-    align-self: flex-end;
-  }
-
-  .term-stack-collapsed {
-    width: auto;
-    max-width: 100%;
-    min-height: 32px;
-    display: flex;
-    align-items: center;
-    gap: 6px;
-    padding: 5px 8px;
-    font-family: inherit;
-    color: var(--text-primary);
-    text-align: left;
-    border-radius: 999px;
-    border: 0.5px solid var(--glass-border);
-    background: color-mix(in srgb, var(--glass-bg) 58%, var(--bg-primary));
-    box-shadow: var(--shadow-glass), 0 6px 18px rgba(0, 0, 0, 0.08);
-    backdrop-filter: var(--glass-blur) var(--glass-saturate);
-    -webkit-backdrop-filter: var(--glass-blur) var(--glass-saturate);
-    cursor: pointer;
-  }
-  .term-stack-collapsed:hover {
-    background: color-mix(in srgb, var(--glass-bg) 68%, var(--bg-primary));
-  }
-  .term-stack-preview {
-    min-width: 0;
-    flex: 0 1 auto;
-    display: flex;
-    align-items: center;
-    gap: 4px;
-  }
-  .term-stack-preview-chip {
-    min-width: 18px;
-    max-width: 80px;
-    flex: 0 1 auto;
-    padding: 2px 6px;
-    border-radius: 999px;
-    background: color-mix(in srgb, var(--accent) 8%, transparent);
-    color: var(--text-primary);
-    font-size: 10.5px;
-    font-weight: 700;
-    line-height: 1.35;
-    white-space: nowrap;
-    overflow: hidden;
-    text-overflow: ellipsis;
-  }
-  .term-stack-expand-icon {
-    flex: 0 0 auto;
-    color: var(--accent);
-  }
 
   .term-card {
     position: absolute;
@@ -668,10 +588,6 @@
     align-items: center;
     justify-content: center;
     transition: background 0.15s ease, color 0.15s ease, opacity 0.15s ease;
-  }
-  .term-stack-arrow.collapse {
-    margin-left: 2px;
-    color: var(--text-secondary);
   }
   .term-stack-arrow:hover:not(:disabled) {
     background: color-mix(in srgb, var(--accent) 14%, transparent);
