@@ -651,4 +651,3 @@ pub(crate) struct CourseBuilder {
     pub(crate) recent_results: Vec<DetectiveCaseResult>,
     pub(crate) latest_at: i64,
 }
-

@@ -934,6 +934,8 @@ async fn rebuild_memory(
     }
 
     let student = load_student_profile(&db);
+    refresh_luna_todo_cache_for_agent(app).await;
+    let existing_course_todos = load_existing_course_todos(&db, &status_snapshot.course_name);
     // Clean slate: no previous analysis, so the memory is derived purely from
     // the documents themselves rather than carried forward.
     let analysis = summarize_with_agent(
@@ -941,6 +943,7 @@ async fn rebuild_memory(
         &status_snapshot.course_name,
         &analysed,
         &student,
+        &existing_course_todos,
         &AgentCourseAnalysis::default(),
     )
     .await?;
@@ -1768,6 +1771,8 @@ async fn run_course_inner(
                 .collect::<Vec<_>>();
             let provider = AgentProvider::resolve().map_err(|error| error.to_string())?;
             let configured_max_tokens = crate::ai::load_ai_config().max_tokens;
+            refresh_luna_todo_cache_for_agent(app).await;
+            let existing_course_todos = load_existing_course_todos(&db, &status.course_name);
             let mut result = previous.analysis.clone();
             let mut batches = context::summary_batches(&new_items);
             if batches.is_empty() && !pending_source_events.is_empty() {
@@ -1792,6 +1797,7 @@ async fn run_course_inner(
                     &event_batch,
                     &student,
                     &result,
+                    &existing_course_todos,
                     configured_max_tokens,
                     batch_index,
                 )
@@ -1874,7 +1880,7 @@ async fn run_course_inner(
             match crate::ai::send_native_notification(
                 app,
                 &format!(
-                    "{}: Plus からのお知らせ",
+                    "{}: 自動検知からのお知らせ",
                     crate::commands::simplify_course_name(&status.course_name)
                 ),
                 &proactive_notification_body(&status.analysis),
@@ -2782,6 +2788,7 @@ async fn summarize_with_agent(
     course_name: &str,
     new_or_changed_documents: &[DocumentAnalysis],
     student: &Value,
+    existing_course_todos: &[context::ExistingCourseTodo],
     previous: &AgentCourseAnalysis,
 ) -> Result<AgentCourseAnalysis, String> {
     let provider = AgentProvider::resolve().map_err(|error| error.to_string())?;
@@ -2800,6 +2807,7 @@ async fn summarize_with_agent(
             &source_events,
             student,
             &working_memory,
+            existing_course_todos,
             configured_max_tokens,
             batch_index,
         )
@@ -2817,6 +2825,7 @@ async fn summarize_batch_with_agent(
     source_events: &[&SourceEvent],
     student: &Value,
     working_memory: &AgentCourseAnalysis,
+    existing_course_todos: &[context::ExistingCourseTodo],
     configured_max_tokens: u32,
     batch_index: usize,
 ) -> Result<(AgentCourseAnalysis, AiUsageEstimate), String> {
@@ -2826,6 +2835,7 @@ async fn summarize_batch_with_agent(
         course_id: luna_id,
         course_name,
         student,
+        existing_course_todos,
         previous_course_analysis: &prompt_memory,
         new_or_changed_documents: batch
             .iter()
@@ -2839,7 +2849,14 @@ async fn summarize_batch_with_agent(
             .collect(),
     };
     let label = format!("最終まとめ batch {}", batch_index + 1);
-    let gen_id = summary_generation_id(luna_id, batch_index, batch, source_events, &prompt_memory);
+    let gen_id = summary_generation_id(
+        luna_id,
+        batch_index,
+        batch,
+        source_events,
+        &prompt_memory,
+        existing_course_todos,
+    );
     let response: PlusJsonResponse<AgentCourseAnalysis> = request_plus_json(
         provider,
         context::SUMMARY_SYSTEM_PROMPT,
@@ -3383,6 +3400,7 @@ fn summary_generation_id(
     batch: &[&DocumentAnalysis],
     source_events: &[&SourceEvent],
     working_memory: &AgentCourseAnalysis,
+    existing_course_todos: &[context::ExistingCourseTodo],
 ) -> String {
     let mut hasher = Sha256::new();
     hasher.update(b"course-automation-summary");
@@ -3409,6 +3427,11 @@ fn summary_generation_id(
         hasher.update(b"memory");
         hasher.update([0]);
         hasher.update(memory_hash.as_bytes());
+    }
+    if let Ok(todo_hash) = sha256_json(existing_course_todos) {
+        hasher.update(b"existing-course-todos");
+        hasher.update([0]);
+        hasher.update(todo_hash.as_bytes());
     }
     let digest = format!("{:x}", hasher.finalize());
     format!(
@@ -3931,6 +3954,8 @@ fn prune_item_states(status: &mut CourseAutomationStatus) {
 /// The shared data-cache key the main TODO page reads detail-generated todos from
 /// (must match the frontend's `DETAIL_GENERATED_TODO_KEY`).
 const DETAIL_TODO_CACHE_KEY: &str = "detail_generated_todo";
+const LIVE_TODO_CACHE_KEY: &str = "live_generated_todo";
+const LUNA_TODO_CACHE_KEY: &str = "luna_todo";
 
 /// One detail-generated todo, mirroring the frontend `DetailGeneratedTodo` shape
 /// (snake_case JSON). `extra` preserves any fields the frontend owns so other
@@ -3964,6 +3989,136 @@ struct DetailTodo {
 
 fn sensea_todo_id(luna_id: &str, item_id: &str) -> String {
     format!("sensea-{}-{}", luna_id, item_id)
+}
+
+fn todo_context_course_name(value: &str) -> String {
+    crate::commands::simplify_course_name(value)
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_lowercase()
+}
+
+fn is_active_detail_todo(todo: &DetailTodo) -> bool {
+    todo.completed_at.is_none() && todo.archived_at.is_none()
+}
+
+fn todo_context_same_course(course_name: &str, candidate: &str) -> bool {
+    let course_name = todo_context_course_name(course_name);
+    let candidate = todo_context_course_name(candidate);
+    !course_name.is_empty() && course_name == candidate
+}
+
+fn push_existing_course_todo(
+    todos: &mut Vec<context::ExistingCourseTodo>,
+    seen: &mut HashSet<String>,
+    title: impl Into<String>,
+    content_type: impl Into<String>,
+    deadline: impl Into<String>,
+    status: impl Into<String>,
+    source: impl Into<String>,
+) {
+    let todo = context::ExistingCourseTodo {
+        title: title.into().trim().to_string(),
+        content_type: content_type.into().trim().to_string(),
+        deadline: deadline.into().trim().to_string(),
+        status: status.into().trim().to_string(),
+        source: source.into().trim().to_string(),
+    };
+    if todo.title.is_empty() {
+        return;
+    }
+    let key = format!(
+        "{}|{}|{}|{}|{}",
+        todo.title.to_lowercase(),
+        todo.content_type.to_lowercase(),
+        todo.deadline.to_lowercase(),
+        todo.status.to_lowercase(),
+        todo.source.to_lowercase()
+    );
+    if seen.insert(key) {
+        todos.push(todo);
+    }
+}
+
+fn load_existing_course_todos(
+    db: &Database,
+    course_name: &str,
+) -> Vec<context::ExistingCourseTodo> {
+    const MAX_EXISTING_COURSE_TODOS: usize = 40;
+
+    let mut todos = Vec::new();
+    let mut seen = HashSet::new();
+
+    let luna_todos: Vec<crate::luna_parser::LunaTodoItem> =
+        load_json(db, LUNA_TODO_CACHE_KEY).unwrap_or_default();
+    for todo in luna_todos {
+        if !todo_context_same_course(course_name, &todo.course_name) {
+            continue;
+        }
+        push_existing_course_todo(
+            &mut todos,
+            &mut seen,
+            todo.content_name,
+            todo.content_type,
+            todo.deadline,
+            todo.status,
+            "LUNA",
+        );
+        if todos.len() >= MAX_EXISTING_COURSE_TODOS {
+            return todos;
+        }
+    }
+
+    for (cache_key, source) in [
+        (DETAIL_TODO_CACHE_KEY, "アプリ内追加"),
+        (LIVE_TODO_CACHE_KEY, "Live"),
+    ] {
+        let generated: Vec<DetailTodo> = load_json(db, cache_key).unwrap_or_default();
+        for todo in generated {
+            if !is_active_detail_todo(&todo)
+                || !todo_context_same_course(course_name, &todo.course_name)
+            {
+                continue;
+            }
+            push_existing_course_todo(
+                &mut todos,
+                &mut seen,
+                todo.title,
+                todo.content_type,
+                todo.deadline,
+                "未完了",
+                source,
+            );
+            if todos.len() >= MAX_EXISTING_COURSE_TODOS {
+                return todos;
+            }
+        }
+    }
+
+    todos
+}
+
+async fn refresh_luna_todo_cache_for_agent(app: &AppHandle) {
+    match crate::luna_commands::luna_fetch_todo(
+        app.state::<crate::LunaState>(),
+        app.state::<Database>(),
+    )
+    .await
+    {
+        Ok(items) => {
+            log::info!(
+                "[course_automation] refreshed {} existing LUNA todos for AI context",
+                items.len()
+            );
+        }
+        Err(error) => {
+            log::warn!(
+                "[course_automation] existing LUNA todo refresh failed; using cache if present: {}",
+                error
+            );
+        }
+    }
 }
 
 /// The TODO sink: reconciles the main TODO page with this course's action
@@ -4017,10 +4172,10 @@ fn sync_action_todos(app: &AppHandle, db: &Database, status: &CourseAutomationSt
     }
 
     // Add todos for desired items we don't have yet.
-    let existing: HashSet<String> = todos.iter().map(|todo| todo.id.clone()).collect();
+    let mut existing: HashSet<String> = todos.iter().map(|todo| todo.id.clone()).collect();
     for item in &desired {
         let id = sensea_todo_id(&status.luna_id, &item.id);
-        if existing.contains(&id) {
+        if !existing.insert(id.clone()) {
             continue;
         }
         todos.push(DetailTodo {
@@ -4029,7 +4184,7 @@ fn sync_action_todos(app: &AppHandle, db: &Database, status: &CourseAutomationSt
             course_name: status.course_name.clone(),
             content_type: "課題".into(),
             deadline: item.expires_at.clone(),
-            note: "Plus".into(),
+            note: "自動検知".into(),
             created_at: now.clone(),
             ..Default::default()
         });
@@ -4044,7 +4199,10 @@ fn sync_action_todos(app: &AppHandle, db: &Database, status: &CourseAutomationSt
     }
     // Reuse the app's cache-sync event so the main TODO page rebuilds luna_todo
     // (which re-merges the detail-generated todos we just wrote).
-    let _ = app.emit("backend-cache-updated", json!({ "keys": ["luna_todo"] }));
+    let _ = app.emit(
+        "backend-cache-updated",
+        json!({ "keys": [LUNA_TODO_CACHE_KEY] }),
+    );
 }
 
 fn normalize_short_list(values: Vec<String>, max_items: usize, max_chars: usize) -> Vec<String> {
@@ -4515,7 +4673,7 @@ fn status_key(luna_id: &str) -> String {
     format!("{}{}", STATUS_PREFIX, luna_id)
 }
 
-fn sha256_json<T: Serialize>(value: &T) -> Result<String, String> {
+fn sha256_json<T: Serialize + ?Sized>(value: &T) -> Result<String, String> {
     let raw = serde_json::to_vec(value).map_err(|error| error.to_string())?;
     Ok(format!("{:x}", Sha256::digest(raw)))
 }
@@ -4586,6 +4744,86 @@ mod tests {
         assert!(config.monitor_assignments);
         assert!(!config.analyze_all);
         assert!(config.auto_print);
+    }
+
+    fn luna_todo(
+        course_name: &str,
+        content_name: &str,
+        deadline: &str,
+    ) -> crate::luna_parser::LunaTodoItem {
+        crate::luna_parser::LunaTodoItem {
+            course_name: course_name.into(),
+            content_type: "課題".into(),
+            content_name: content_name.into(),
+            url: "/lms/todo".into(),
+            deadline: deadline.into(),
+            status: "未提出".into(),
+            feedback: String::new(),
+        }
+    }
+
+    fn existing_todo(title: &str) -> context::ExistingCourseTodo {
+        context::ExistingCourseTodo {
+            title: title.into(),
+            content_type: "課題".into(),
+            deadline: "2026-07-03".into(),
+            status: "未提出".into(),
+            source: "LUNA".into(),
+        }
+    }
+
+    #[test]
+    fn loads_existing_course_todos_for_ai_context() {
+        let root = std::env::temp_dir().join(format!("course-todos-{}", uuid::Uuid::new_v4()));
+        let db = Database::open(&root).expect("temp db");
+        save_json(
+            &db,
+            LUNA_TODO_CACHE_KEY,
+            &vec![
+                luna_todo(
+                    "国際学部/International Studies 34001001 キリスト教学A　１",
+                    "第3回 レポート課題",
+                    "2026/07/03 23:59",
+                ),
+                luna_todo("別の授業", "別授業の課題", "2026/07/03"),
+            ],
+        )
+        .expect("save luna todos");
+        save_json(
+            &db,
+            DETAIL_TODO_CACHE_KEY,
+            &vec![
+                DetailTodo {
+                    id: "detail-active".into(),
+                    title: "確認済みの追加課題".into(),
+                    course_name: "キリスト教学A １".into(),
+                    content_type: "課題".into(),
+                    deadline: "2026-07-10".into(),
+                    ..Default::default()
+                },
+                DetailTodo {
+                    id: "detail-completed".into(),
+                    title: "完了済みの追加課題".into(),
+                    course_name: "キリスト教学A １".into(),
+                    completed_at: Some("2026-07-03T00:00:00Z".into()),
+                    ..Default::default()
+                },
+            ],
+        )
+        .expect("save detail todos");
+
+        let todos = load_existing_course_todos(&db, "キリスト教学A １");
+        let titles = todos
+            .iter()
+            .map(|todo| todo.title.as_str())
+            .collect::<Vec<_>>();
+
+        assert!(titles.contains(&"第3回 レポート課題"));
+        assert!(titles.contains(&"確認済みの追加課題"));
+        assert!(!titles.contains(&"別授業の課題"));
+        assert!(!titles.contains(&"完了済みの追加課題"));
+
+        std::fs::remove_dir_all(&root).ok();
     }
 
     #[test]
@@ -5216,15 +5454,22 @@ mod tests {
             id: "event-1".into(),
             ..Default::default()
         };
+        let empty_todos: Vec<context::ExistingCourseTodo> = Vec::new();
+        let todo_context = vec![existing_todo("第3回 レポート課題")];
 
-        let stable_a = summary_generation_id("course", 0, &[&first], &[], &memory);
-        let stable_b = summary_generation_id("course", 0, &[&first], &[], &memory);
-        let changed_doc = summary_generation_id("course", 0, &[&changed], &[], &memory);
-        let changed_event = summary_generation_id("course", 0, &[&first], &[&event], &memory);
+        let stable_a = summary_generation_id("course", 0, &[&first], &[], &memory, &empty_todos);
+        let stable_b = summary_generation_id("course", 0, &[&first], &[], &memory, &empty_todos);
+        let changed_doc =
+            summary_generation_id("course", 0, &[&changed], &[], &memory, &empty_todos);
+        let changed_event =
+            summary_generation_id("course", 0, &[&first], &[&event], &memory, &empty_todos);
+        let changed_todos =
+            summary_generation_id("course", 0, &[&first], &[], &memory, &todo_context);
 
         assert_eq!(stable_a, stable_b);
         assert_ne!(stable_a, changed_doc);
         assert_ne!(stable_a, changed_event);
+        assert_ne!(stable_a, changed_todos);
         assert!(stable_a.starts_with("course-automation-course-summary-0-"));
     }
 
@@ -5247,6 +5492,7 @@ mod tests {
             ..Default::default()
         };
         let student = json!({"studentNumber": "1234"});
+        let existing_todos = vec![existing_todo("第3回 レポート課題")];
         let source_event = SourceEvent {
             id: "event-1".into(),
             event: "removed".into(),
@@ -5263,6 +5509,7 @@ mod tests {
             course_id: "course",
             course_name: "Course",
             student: &student,
+            existing_course_todos: &existing_todos,
             previous_course_analysis: &previous,
             new_or_changed_documents: vec![context::CompactAnalysis::from(&delta)],
             source_events: vec![context::CompactSourceEvent::from(&source_event)],
@@ -5270,6 +5517,8 @@ mod tests {
         let serialized = serde_json::to_string(&input).expect("serialize compact input");
 
         assert!(serialized.contains("compressed working memory"));
+        assert!(serialized.contains("existingCourseTodos"));
+        assert!(serialized.contains("第3回 レポート課題"));
         assert!(serialized.contains("new-success"));
         assert!(serialized.contains("old context"));
         assert!(!serialized.contains("must-not-be-sent"));

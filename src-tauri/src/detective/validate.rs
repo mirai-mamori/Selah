@@ -629,4 +629,3 @@ pub(crate) fn extract_json_object(text: &str) -> Option<String> {
     }
     None
 }
-

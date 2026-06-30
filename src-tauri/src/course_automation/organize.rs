@@ -159,11 +159,16 @@ pub fn heuristic_plan(
 /// groups): same-folder groups combine their members so the heuristic feeds the
 /// session folders the AI already opened instead of forking near-duplicates. An
 /// id placed by the primary plan is never re-added by the secondary.
-pub fn merge_plans(mut primary: Vec<PlannedGroup>, secondary: Vec<PlannedGroup>) -> Vec<PlannedGroup> {
+pub fn merge_plans(
+    mut primary: Vec<PlannedGroup>,
+    secondary: Vec<PlannedGroup>,
+) -> Vec<PlannedGroup> {
     let mut by_folder: BTreeMap<String, usize> = BTreeMap::new();
     let mut seen: HashSet<String> = HashSet::new();
     for (index, group) in primary.iter().enumerate() {
-        by_folder.entry(sanitize_component(&group.label)).or_insert(index);
+        by_folder
+            .entry(sanitize_component(&group.label))
+            .or_insert(index);
         for id in &group.doc_ids {
             seen.insert(id.clone());
         }
@@ -649,11 +654,20 @@ mod tests {
         let mut candidates2: BTreeMap<String, OrganizeCandidate> = BTreeMap::new();
         candidates2.insert(
             "id_a".into(),
-            candidate(root.join("第01回").join("第01回資料.pdf").to_str().unwrap(), "material"),
+            candidate(
+                root.join("第01回").join("第01回資料.pdf").to_str().unwrap(),
+                "material",
+            ),
         );
         candidates2.insert(
             "id_b".into(),
-            candidate(root.join("第01回").join("第01回座席表.pdf").to_str().unwrap(), "material"),
+            candidate(
+                root.join("第01回")
+                    .join("第01回座席表.pdf")
+                    .to_str()
+                    .unwrap(),
+                "material",
+            ),
         );
         let moved2 = apply_groups(&mut status, &candidates2, &planned, &root);
         assert_eq!(moved2, 0);
@@ -670,7 +684,10 @@ mod tests {
         std::fs::write(&solo, b"x").unwrap();
 
         let mut candidates: BTreeMap<String, OrganizeCandidate> = BTreeMap::new();
-        candidates.insert("id_solo".into(), candidate(solo.to_str().unwrap(), "material"));
+        candidates.insert(
+            "id_solo".into(),
+            candidate(solo.to_str().unwrap(), "material"),
+        );
         let planned = vec![PlannedGroup {
             label: "第07回".into(),
             kind: "material".into(),

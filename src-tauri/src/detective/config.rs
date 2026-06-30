@@ -153,4 +153,3 @@ pub(crate) const EXAM_KEYWORDS: &[&str] = &[
     "midterm",
     "final",
 ];
-

@@ -256,7 +256,11 @@ fn record_chapter_canon(db: &Database, course_key: &str, case: &DetectiveCase) {
 
     // Log recurring-cast appearances: any testimony witness whose name matches a
     // bible cast member becomes a continuity entry for later chapters.
-    let cast_names: Vec<String> = campaign.cast.iter().map(|m| m.name.trim().to_string()).collect();
+    let cast_names: Vec<String> = campaign
+        .cast
+        .iter()
+        .map(|m| m.name.trim().to_string())
+        .collect();
     let chapter_label = if case.title.trim().is_empty() {
         "ある章".to_string()
     } else {
@@ -618,7 +622,6 @@ fn build_context(db: &Database) -> Result<DetectiveContext, String> {
     })
 }
 
-
 /// Rewrite a completed campaign's finale to pay off the REAL accumulated canon
 /// (chapter beats, established facts, the staged 暗线 reveals) rather than the
 /// static guess written at bible time. Only fires once a campaign hits 100%;
@@ -688,4 +691,3 @@ pub async fn detective_finalize_finale(
     eprintln!("[detective] finale + reveals finalized for {course_key}");
     Ok(campaign)
 }
-

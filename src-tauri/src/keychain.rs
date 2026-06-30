@@ -36,7 +36,8 @@ const BUNDLE_ACCOUNT: &str = "secret_bundle_v1_dev";
 const BUNDLE_ACCOUNT: &str = "secret_bundle_v1";
 
 /// In-memory copy of the whole secret bundle. None = not loaded yet.
-static BUNDLE: LazyLock<Mutex<Option<HashMap<String, String>>>> = LazyLock::new(|| Mutex::new(None));
+static BUNDLE: LazyLock<Mutex<Option<HashMap<String, String>>>> =
+    LazyLock::new(|| Mutex::new(None));
 
 /// Set when the keychain bundle existed but could not be read this session
 /// (e.g. the access prompt was denied). The in-memory bundle is then empty
@@ -143,7 +144,9 @@ fn load_bundle_from_store() -> HashMap<String, String> {
 
 fn persist_bundle(map: &HashMap<String, String>) -> Result<(), String> {
     if BUNDLE_LOAD_FAILED.load(Ordering::Relaxed) {
-        return Err("secret store locked: keychain read failed this session — restart to retry".into());
+        return Err(
+            "secret store locked: keychain read failed this session — restart to retry".into(),
+        );
     }
     let json = serde_json::to_string(map).map_err(|e| format!("serialize bundle: {e}"))?;
     if store_is_file() {
@@ -182,7 +185,10 @@ pub fn reapply_storage_policy() {
 
 #[cfg(target_os = "windows")]
 fn kc_get(service: &str, account: &str) -> Option<String> {
-    keyring::Entry::new(service, account).ok()?.get_password().ok()
+    keyring::Entry::new(service, account)
+        .ok()?
+        .get_password()
+        .ok()
 }
 
 #[cfg(target_os = "windows")]
@@ -349,8 +355,8 @@ fn enc_write(path: &std::path::Path, value: &str) -> Result<(), String> {
     use aes_gcm::{aead::Aead, Aes256Gcm, KeyInit, Nonce};
     use rand::RngCore;
 
-    let cipher =
-        Aes256Gcm::new_from_slice(&machine_key()).map_err(|e| format!("cipher init failed: {e}"))?;
+    let cipher = Aes256Gcm::new_from_slice(&machine_key())
+        .map_err(|e| format!("cipher init failed: {e}"))?;
     let mut nonce_bytes = [0u8; 12];
     rand::thread_rng().fill_bytes(&mut nonce_bytes);
     let ciphertext = cipher

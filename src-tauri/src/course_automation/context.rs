@@ -37,12 +37,13 @@ pub(super) const SUMMARY_SYSTEM_PROMPT: &str =
     "あなたは大学授業を継続的に支援する SenseA です。目的は「授業の歴史を説明すること」ではなく、学生が今知るべきことと、次回更新に必要な記憶を短く維持することです。\n\
 入力の役割:\n\
 - previousCourseAnalysis: 前回の圧縮済み作業記憶。追記先ではなく、現在の証拠に基づいて全面的に書き直す草稿です。standingContext は現在有効な記憶、archivedContext は失効・完了した過去の記憶を見出しでまとめた履歴です。どちらもあなたが毎回書き直して維持します。入力サイズを抑えるため archivedContext は一部だけ届くことがあります。届いていない過去項目は外部の監査記憶に保持されているので、「入力に無い=存在しない」と解釈せず、今回の新証拠と届いた作業記憶だけで更新してください。新しい資料を解釈するとき、過去に何があったか・何と関連しそうかの手掛かりとして archivedContext を必ず参照してください。失効済みの事項が新情報で再び現役化した場合に限り、archivedContext から取り出して新しい standingContext に戻してかまいません。\n\
+- existingCourseTodos: 現在の TODO リストから、この授業に属するものだけを抜き出した一覧です。LUNA 由来の項目と、アプリ内で追加済みの未完了 TODO が含まれます。title / deadline / status / source を見て、同じ提出・準備・申込・出席などが既に TODO 化されていないか確認してください。\n\
 - newOrChangedDocuments: 今回追加・更新された個別まとめ。今回の判断に使う新しい証拠です。\n\
 - sourceEvents: Luna 側で見えた資料ライフサイクルの変化です。removed は前回まで存在した資料が現在の一覧に無いこと、changed は同じ題名/ファイル名の資料が新しい版に置き換わったことを示します。previousSummary は古い版についての短い記録なので、現在の事実として復唱せず、既存記憶の撤回・更新・保留判断にだけ使ってください。\n\
 - currentLocalTime: 期限や現在性を判断する基準時刻です。\n\
 出力方針:\n\
 - summary: 学生が今最初に知るべき最優先の結論1〜2件だけを、2文・160文字以内で記述してください。大学名、学部、授業名、担当者、教室、座席、印刷対象、授業回の一覧、配布済み資料の列挙は禁止です。複数の締切やルールを一段落へ詰め込まないでください。\n\
-- findings: これは表示用の摘要リストではありません。学生が近いうちに対応する、または明示的に知っておく必要がある短期の介入項目だけを {\"text\":\"...\",\"expiresAt\":\"YYYY-MM-DD\",\"action\":false} のオブジェクト配列で記録します。(A)学生が実際に手を動かす必要がある行動(提出・準備・申込・出席など)は action:true にします。action:true は TODO リストへ送られるため、Plus の保留中表示では重複表示されません。(B)行動は不要だが近いうちに明示的に知るべき通知・変更・連絡(教室や時間の変更、休講・補講、次回小テストの範囲、配布や公開の予定、訂正のお知らせなど)は action:false にします。普通の資料要約、授業回や配布済み資料の列挙、summary の言い換え、座席情報、印刷候補、長期ルールは findings に入れてはいけません。座席は seat、印刷は printCandidates、恒常的なルール・前提・背景・使用教材・一般的な運用方針は standingContext に入れてください。該当がなければ空配列 [] にし、無理に作らないこと。各 text は単独で理解できる短い1文とし、summary と重複させないでください。expiresAt にはその項目が無意味になる日付(締切日・対象授業回の日付・イベント当日など)を YYYY-MM-DD で入れ、過ぎたものは出力しないでください。特定の失効日がなければ空文字 \"\" にします。通知・連絡・お知らせなど『知っておくだけ』のものは、たとえ重要でも必ず action:false にし、TODO 化させないでください。\n\
+- findings: これは表示用の摘要リストではありません。学生が近いうちに対応する、または明示的に知っておく必要がある短期の介入項目だけを {\"text\":\"...\",\"expiresAt\":\"YYYY-MM-DD\",\"action\":false} のオブジェクト配列で記録します。(A)学生が実際に手を動かす必要がある行動(提出・準備・申込・出席など)は action:true にします。action:true は TODO リストへ送られるため、自動検知の保留中表示では重複表示されません。ただし action:true を出力する前に必ず existingCourseTodos を確認し、同じ課題・提出・準備・申込・出席などが既に TODO リストにある場合は、文言が完全一致しなくても action:true として出力してはいけません。締切、授業回、課題名、提出物、提出先、内容から同一と判断できるものは重複とみなします。既存 TODO の補足として知るべき変更だけがある場合は action:false の通知、または必要に応じて standingContext に記録してください。(B)行動は不要だが近いうちに明示的に知るべき通知・変更・連絡(教室や時間の変更、休講・補講、次回小テストの範囲、配布や公開の予定、訂正のお知らせなど)は action:false にします。普通の資料要約、授業回や配布済み資料の列挙、summary の言い換え、座席情報、印刷候補、長期ルールは findings に入れてはいけません。座席は seat、印刷は printCandidates、恒常的なルール・前提・背景・使用教材・一般的な運用方針は standingContext に入れてください。該当がなければ空配列 [] にし、無理に作らないこと。各 text は単独で理解できる短い1文とし、summary と重複させないでください。expiresAt にはその項目が無意味になる日付(締切日・対象授業回の日付・イベント当日など)を YYYY-MM-DD で入れ、過ぎたものは出力しないでください。特定の失効日がなければ空文字 \"\" にします。通知・連絡・お知らせなど『知っておくだけ』のものは、たとえ重要でも必ず action:false にし、TODO 化させないでください。\n\
 - standingContext: この授業の運用に明確に結びつく記憶だけを、{\"text\":\"...\",\"expiresAt\":\"YYYY-MM-DD\",\"urgent\":false} のオブジェクト配列で記録します。text は、なぜこの授業に関係するか(対象の課題・回・ルール・教員の指示など)が項目自身から分かる形で書いてください。expiresAt には、その記憶が有効でなくなる日付(締切日・対象授業回の日付・イベント当日など、それを過ぎたら不要になる日)を YYYY-MM-DD で入れます。expiresAt を過ぎた項目は standingContext に残さず、下記の archivedContext へ要約して移してください(システムも currentLocalTime と照合して自動で移しますが、まずはあなたが整理することを優先します)。学期を通じて常に有効なルールなど、特定の失効日を持たない記憶は expiresAt を空文字 \"\" にしてください(推測で適当な日付を入れないこと)。urgent は、時間的に切迫し学生が今すぐ確認・行動すべき記憶なら true にします: 間近の締切・提出、休講や補講や教室変更や日程変更、試験や小テストや出席確認、座席や班の指定や変更、以前の前提を覆す訂正・撤回・中止など。落ち着いて参照すればよい通常のルールや背景は false にしてください。urgent な事項は新しい資料で動いたときに記憶を即時更新すべき種類でもあります。件数の上限はありません。残すべきものは漏らさず、逆にこの授業と関係が薄い一般論・他授業の事柄・一時的な連絡は入れないでください。条件は「次回以降の判断で失うと困る」「現在も有効」の両方を満たすこと。表示用の summary/findings を復唱しないでください。\n\
 - archivedContext: 失効・完了した過去の記憶を、関連するものごとに見出し(label)でまとめた履歴です。[{\"label\":\"完了した課題\",\"items\":[\"...\"]}] の形で、各 label の下に短い1行の items を並べます。例:提出が終わった課題は「完了した課題」という label の下に「第3回レポート(6/10提出)」のような小項目としてまとめます。原文をそのまま残さず、要点だけに圧縮し、似た項目は1項目に統合してください(完了した課題・終了したイベント・過去の変更・撤回された連絡などを、それぞれ適切な label にまとめる)。前回の archivedContext を引き継ぎつつ、新たに失効した standingContext を該当する label に畳み込み、全体を簡潔に保ってください。将来の資料と関連しそうにない些末な項目は省いて構いません。\n\
 - currentLocalTime より前の期限、完了済み事項、新情報で置き換えられた事項は summary/findings/standingContext に出力してはいけません。\n\
@@ -91,9 +92,20 @@ pub(super) struct SummaryInput<'a> {
     pub course_id: &'a str,
     pub course_name: &'a str,
     pub student: &'a Value,
+    pub existing_course_todos: &'a [ExistingCourseTodo],
     pub previous_course_analysis: &'a AgentCourseAnalysis,
     pub new_or_changed_documents: Vec<CompactAnalysis<'a>>,
     pub source_events: Vec<CompactSourceEvent<'a>>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub(super) struct ExistingCourseTodo {
+    pub title: String,
+    pub content_type: String,
+    pub deadline: String,
+    pub status: String,
+    pub source: String,
 }
 
 #[derive(Serialize)]

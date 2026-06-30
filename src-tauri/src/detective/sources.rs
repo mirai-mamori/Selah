@@ -295,11 +295,20 @@ pub(crate) fn chapter_case_key(course_key: &str, live_id: &str) -> String {
     format!("{DETECTIVE_CHAPTER_PREFIX}{course_key}:{live_id}")
 }
 
-pub(crate) fn load_chapter_case(db: &Database, course_key: &str, live_id: &str) -> Option<DetectiveCase> {
+pub(crate) fn load_chapter_case(
+    db: &Database,
+    course_key: &str,
+    live_id: &str,
+) -> Option<DetectiveCase> {
     load_cache_json(db, &chapter_case_key(course_key, live_id))
 }
 
-pub(crate) fn save_chapter_case(db: &Database, course_key: &str, live_id: &str, case: &DetectiveCase) {
+pub(crate) fn save_chapter_case(
+    db: &Database,
+    course_key: &str,
+    live_id: &str,
+    case: &DetectiveCase,
+) {
     if let Ok(json) = serde_json::to_string(case) {
         let _ = db.save_data_cache(&chapter_case_key(course_key, live_id), &json);
     }
@@ -317,7 +326,12 @@ pub(crate) fn load_knowledge_points(
     load_cache_json(db, &knowledge_key(course_key, live_id))
 }
 
-pub(crate) fn save_knowledge_points(db: &Database, course_key: &str, live_id: &str, pts: &[KnowledgePoint]) {
+pub(crate) fn save_knowledge_points(
+    db: &Database,
+    course_key: &str,
+    live_id: &str,
+    pts: &[KnowledgePoint],
+) {
     if let Ok(json) = serde_json::to_string(pts) {
         let _ = db.save_data_cache(&knowledge_key(course_key, live_id), &json);
     }
@@ -378,11 +392,18 @@ pub(crate) fn align_key(course_key: &str) -> String {
 }
 
 /// Map of Live note id → matched 第N回 (content alignment).
-pub(crate) fn load_align(db: &Database, course_key: &str) -> std::collections::HashMap<String, i32> {
+pub(crate) fn load_align(
+    db: &Database,
+    course_key: &str,
+) -> std::collections::HashMap<String, i32> {
     load_cache_json(db, &align_key(course_key)).unwrap_or_default()
 }
 
-pub(crate) fn save_align(db: &Database, course_key: &str, map: &std::collections::HashMap<String, i32>) {
+pub(crate) fn save_align(
+    db: &Database,
+    course_key: &str,
+    map: &std::collections::HashMap<String, i32>,
+) {
     if let Ok(json) = serde_json::to_string(map) {
         let _ = db.save_data_cache(&align_key(course_key), &json);
     }

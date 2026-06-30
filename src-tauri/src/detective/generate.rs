@@ -311,7 +311,8 @@ pub(crate) async fn detective_editor_pass(
     arc_focus: Option<u8>,
     case_id: &str,
 ) -> Result<Option<String>, String> {
-    let user = detective_editor_user_prompt(draft_json, outline_json, campaign, knowledge, arc_focus);
+    let user =
+        detective_editor_user_prompt(draft_json, outline_json, campaign, knowledge, arc_focus);
     let json = detective_ai_json(
         provider,
         cfg.max_tokens,
@@ -552,7 +553,6 @@ pub(crate) async fn ensure_campaign(
     Ok(campaign)
 }
 
-
 /// Extract a knowledge-point checklist from one Live note (cheap AI pass).
 /// Live notes typically already contain list-like structures (「今日のポイント」/
 /// 「まとめ」/「要点」/箇条書き) — the prompt is wired to USE THEM FIRST and
@@ -737,7 +737,6 @@ pub(crate) async fn ensure_knowledge_points(
     Ok(pts)
 }
 
-
 /// One raw source unit fed to the AI. Transient — these never appear in the
 /// final `DetectiveCase`. The AI reads these and emits its own short
 /// evidence cards (one paragraph of distilled information per card).
@@ -831,7 +830,10 @@ pub(crate) fn build_evidence_input(course: &DetectiveCourse) -> Vec<EvidenceInpu
 /// Assemble the AI input for ONE chapter: a single Live note as the primary
 /// source (l1), plus the course's exam signals (s*) and doubts (d*) for
 /// exam-context. Returns `None` if the live note can't be found.
-pub(crate) fn build_chapter_input(course: &DetectiveCourse, live_id: &str) -> Option<Vec<EvidenceInputEntry>> {
+pub(crate) fn build_chapter_input(
+    course: &DetectiveCourse,
+    live_id: &str,
+) -> Option<Vec<EvidenceInputEntry>> {
     let record = course.live_records.iter().find(|r| r.id == live_id)?;
     let mut out = Vec::new();
     let content = if record.excerpt.trim().is_empty() {
@@ -896,4 +898,3 @@ pub(crate) fn build_chapter_input(course: &DetectiveCourse, live_id: &str) -> Op
 
     Some(out)
 }
-
