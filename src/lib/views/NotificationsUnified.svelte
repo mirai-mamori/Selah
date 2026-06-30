@@ -228,15 +228,26 @@
     if (selectedTab !== "授業のお知らせ" || selectedCourse === "all") return currentItems;
     return currentItems.filter(n => (n.courseInfo || n.category || "") === selectedCourse);
   });
-  // Cap rendered DOM nodes — older entries reachable via "show more"
-  // pagination instead of mounting hundreds of buttons up front.
+  // Split each category into unread (priority, own area) and read.
+  // filteredItems is already date-sorted desc.
+  let partitioned = $derived.by(() => {
+    const unread: UnifiedNotif[] = [];
+    const read: UnifiedNotif[] = [];
+    for (const n of filteredItems) {
+      (isNotifRead(n) ? read : unread).push(n);
+    }
+    return { unread, read };
+  });
+
+  // Cap rendered DOM nodes — older read entries reachable via "show more".
+  // Unread are always shown in full since they're the priority area.
   const NOTIF_PAGE_SIZE = 50;
-  let notifVisibleCount = $state(NOTIF_PAGE_SIZE);
+  let readVisibleCount = $state(NOTIF_PAGE_SIZE);
   $effect(() => {
     selectedTab; selectedCourse;
-    notifVisibleCount = NOTIF_PAGE_SIZE;
+    readVisibleCount = NOTIF_PAGE_SIZE;
   });
-  let visibleNotifs = $derived(filteredItems.slice(0, notifVisibleCount));
+  let visibleRead = $derived(partitioned.read.slice(0, readVisibleCount));
 
   async function markAllRead() {
     const items = filteredItems.filter(n => n.source !== "mail" && !isNotifRead(n));
@@ -321,31 +332,49 @@
     </div>
   {/if}
 
+  {#snippet notifItem(n: UnifiedNotif)}
+    <button
+      class="notif-item"
+      class:clickable={n.source === "luna" || n.source === "kwic" || n.source === "mail"}
+      class:read={isNotifRead(n)}
+      onclick={() => openNotif(n)}
+    >
+      <div class="notif-header">
+        {#if n.category}
+          <span class="notif-badge" class:badge-kwic={n.source === "kwic"} class:badge-luna={n.source === "luna"} class:badge-mail={n.source === "mail"}>{n.category}</span>
+        {/if}
+        <span class="notif-title">{n.title}</span>
+        <span class="notif-date">{n.date}</span>
+      </div>
+      {#if n.courseInfo}
+        <div class="notif-course">{n.courseInfo}</div>
+      {/if}
+    </button>
+  {/snippet}
+
   <ViewLoader {loading} {error} empty={filteredItems.length === 0 && !loading} emptyMessage="お知らせはありません">
     <div class="notif-list">
-      {#each visibleNotifs as n}
-        <button
-          class="notif-item"
-          class:clickable={n.source === "luna" || n.source === "kwic" || n.source === "mail"}
-          class:read={isNotifRead(n)}
-          onclick={() => openNotif(n)}
-        >
-          <div class="notif-header">
-            {#if n.category}
-              <span class="notif-badge" class:badge-kwic={n.source === "kwic"} class:badge-luna={n.source === "luna"} class:badge-mail={n.source === "mail"}>{n.category}</span>
-            {/if}
-            <span class="notif-title">{n.title}</span>
-            <span class="notif-date">{n.date}</span>
-          </div>
-          {#if n.courseInfo}
-            <div class="notif-course">{n.courseInfo}</div>
-          {/if}
-        </button>
-      {/each}
-      {#if filteredItems.length > notifVisibleCount}
-        <button class="notif-more" onclick={() => notifVisibleCount += NOTIF_PAGE_SIZE}>
-          もっと見る ({filteredItems.length - notifVisibleCount} 件)
-        </button>
+      {#if partitioned.unread.length > 0}
+        <div class="section-label">
+          未読 <span class="section-count">{partitioned.unread.length}</span>
+        </div>
+        {#each partitioned.unread as n}
+          {@render notifItem(n)}
+        {/each}
+      {/if}
+
+      {#if partitioned.read.length > 0}
+        {#if partitioned.unread.length > 0}
+          <div class="section-label section-label-read">既読</div>
+        {/if}
+        {#each visibleRead as n}
+          {@render notifItem(n)}
+        {/each}
+        {#if partitioned.read.length > readVisibleCount}
+          <button class="notif-more" onclick={() => readVisibleCount += NOTIF_PAGE_SIZE}>
+            もっと見る ({partitioned.read.length - readVisibleCount} 件)
+          </button>
+        {/if}
       {/if}
     </div>
   </ViewLoader>
@@ -425,6 +454,31 @@
     display: flex;
     flex-direction: column;
     gap: 6px;
+  }
+  .section-label {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    font-size: 11px;
+    font-weight: 700;
+    color: var(--text-secondary);
+    letter-spacing: 0.04em;
+    margin: 2px 2px 2px;
+  }
+  .section-label-read {
+    margin-top: 14px;
+    color: var(--text-tertiary);
+    font-weight: 600;
+  }
+  .section-count {
+    font-size: 10px;
+    min-width: 18px;
+    padding: 1px 6px;
+    border-radius: 9px;
+    background: var(--accent);
+    color: #fff;
+    font-weight: 700;
+    text-align: center;
   }
   .notif-more {
     margin-top: 8px;
