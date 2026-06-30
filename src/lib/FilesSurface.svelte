@@ -13,6 +13,7 @@
     size_bytes: number;
     downloaded_at: number;
     file_exists: boolean;
+    subfolder?: string;
   }
   interface DownloadPreview {
     kind: string;
@@ -337,11 +338,33 @@
     }
     return Array.from(map, ([ext, items]) => ({ label: typeLabel(ext), items }));
   }
+  // Mirror the organizer's on-disk structure: within a single course, bucket by
+  // the theme subfolder (第NN回 / 課題 / 教材 …) the file was filed into. Files
+  // still loose at the course root fall into a trailing "未整理" group.
+  const ROOT_GROUP = "未整理";
+  function groupBySubfolder(records: DownloadRecord[]): FileGroup[] {
+    const map = new Map<string, DownloadRecord[]>();
+    for (const r of records) {
+      const key = (r.subfolder || "").trim() || ROOT_GROUP;
+      if (!map.has(key)) map.set(key, []);
+      map.get(key)!.push(r);
+    }
+    return Array.from(map, ([label, items]) => ({ label, items })).sort((a, b) => {
+      if (a.label === ROOT_GROUP) return 1;
+      if (b.label === ROOT_GROUP) return -1;
+      return a.label.localeCompare(b.label, "ja", { numeric: true });
+    });
+  }
   let groups = $derived.by<FileGroup[]>(() => {
     const records = filteredRecords;
     const oneCourse = courseFilters.size === 1;
-    if (sortKey === "date" && !oneCourse) return groupByDate(records);
-    if (oneCourse) return groupByType(records);
+    if (oneCourse) {
+      // Adapt to the structure: theme-folder view when the course is organized,
+      // else keep the by-type grouping for an unorganized (flat) course.
+      const hasThemes = records.some((r) => (r.subfolder || "").trim());
+      return hasThemes ? groupBySubfolder(records) : groupByType(records);
+    }
+    if (sortKey === "date") return groupByDate(records);
     return groupByCourse(records);
   });
 

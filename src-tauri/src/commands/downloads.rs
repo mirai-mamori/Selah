@@ -121,6 +121,13 @@ pub struct DownloadRecord {
     pub downloaded_at: i64,
     #[serde(default)]
     pub file_exists: bool,
+    /// Theme subfolder the file sits in *within* its course folder (the 第NN回 /
+    /// 課題 / 教材 folders the organizer creates), relative and "/"-joined. Empty
+    /// when the file is directly in the course root. Surfaced so the file page can
+    /// mirror the organized structure instead of flattening it. Derived from the
+    /// path on read; not persisted as authoritative.
+    #[serde(default)]
+    pub subfolder: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -214,6 +221,7 @@ pub fn record_download(
         size_bytes,
         downloaded_at: now_ms,
         file_exists: true,
+        subfolder: String::new(),
     };
     // Dedupe by path: a prior `scan_download_dir` (e.g. triggered by opening
     // the downloads window while this download was in flight) may have already
@@ -234,11 +242,47 @@ pub fn record_download(
 pub fn list_downloads() -> Vec<DownloadRecord> {
     let mut records = load_download_history();
     records.retain(|r| !r.path.is_empty());
-    for r in &mut records {
-        r.file_exists = std::path::Path::new(&r.path).exists();
-    }
+    annotate_records(&mut records);
     records.reverse();
     records
+}
+
+/// Download base directory (configured, else default). The course-classified
+/// layout under it is `base/<course>/[<theme>/...]<file>`.
+fn download_base() -> std::path::PathBuf {
+    let config = load_download_config();
+    if config.download_dir.is_empty() {
+        default_download_dir()
+    } else {
+        std::path::PathBuf::from(&config.download_dir)
+    }
+}
+
+/// The theme subfolder a file sits in within its course folder: the path
+/// components between the course folder and the filename, relative to `base` and
+/// "/"-joined. Empty when the file is at the course root (or outside `base`).
+fn theme_subfolder(path: &str, base: &std::path::Path) -> String {
+    let Ok(rel) = std::path::Path::new(path).strip_prefix(base) else {
+        return String::new();
+    };
+    let comps: Vec<&str> = rel
+        .components()
+        .filter_map(|c| c.as_os_str().to_str())
+        .collect();
+    // comps = [course, theme.., file]; drop the course head and the file tail.
+    if comps.len() <= 2 {
+        return String::new();
+    }
+    comps[1..comps.len() - 1].join("/")
+}
+
+/// Fills `file_exists` and the derived `subfolder` for each record.
+fn annotate_records(records: &mut [DownloadRecord]) {
+    let base = download_base();
+    for r in records.iter_mut() {
+        r.file_exists = std::path::Path::new(&r.path).exists();
+        r.subfolder = theme_subfolder(&r.path, &base);
+    }
 }
 
 #[tauri::command]
@@ -289,9 +333,7 @@ pub fn scan_download_dir() -> Vec<DownloadRecord> {
     }
 
     records.retain(|r| !r.path.is_empty());
-    for r in &mut records {
-        r.file_exists = std::path::Path::new(&r.path).exists();
-    }
+    annotate_records(&mut records);
     records.reverse();
     records
 }
@@ -322,18 +364,25 @@ fn scan_dir_recursive(
             if name.starts_with('.') {
                 continue;
             }
-            // Immediate parent folder becomes the course label. Normalize the
-            // folder name so newly discovered files get the same simplified
-            // course_name as records written by record_download (which also
-            // calls simplify_course_name). This prevents the sidebar from
-            // showing both "日本語" and "日本語 2025" as separate groups.
-            let simplified_name = sanitize_path_component(&simplify_course_name(name));
-            let label: &str = if simplified_name.is_empty() {
-                name
+            // The course label is the FIRST folder under base; any deeper folder
+            // is in-course organization (the 第NN回 / 教材 / 課題 theme folders the
+            // organizer creates) and must keep the course's name, not the theme's.
+            // Otherwise filing a course's files would fragment it into one fake
+            // "course" per theme folder in the downloads sidebar / duplicate scan.
+            // Normalize the top-level name so scanned files get the same simplified
+            // course_name as record_download writes (which also simplifies),
+            // keeping "日本語" and "日本語 2025" from splitting into two groups.
+            let next_label: String = if course_folder.is_empty() {
+                let simplified = sanitize_path_component(&simplify_course_name(name));
+                if simplified.is_empty() {
+                    name.to_string()
+                } else {
+                    simplified
+                }
             } else {
-                simplified_name.as_str()
+                course_folder.to_string()
             };
-            scan_dir_recursive(&path, label, known, discovered, depth + 1);
+            scan_dir_recursive(&path, &next_label, known, discovered, depth + 1);
         }
     }
 }
@@ -348,7 +397,14 @@ fn try_discover_file(
         return None;
     }
     let filename = path.file_name()?.to_str()?;
-    if filename.starts_with('.') || filename == "desktop.ini" || filename == "Thumbs.db" {
+    // Skip hidden files, OS junk, and Office lock/owner files (`~$report.docx`),
+    // which are transient 0-byte artifacts — not real downloads. Surfacing them
+    // pollutes the downloads list and the duplicate scanner.
+    if filename.starts_with('.')
+        || filename.starts_with("~$")
+        || filename == "desktop.ini"
+        || filename == "Thumbs.db"
+    {
         return None;
     }
     let metadata = std::fs::metadata(path).ok()?;
@@ -372,6 +428,7 @@ fn try_discover_file(
         size_bytes: metadata.len(),
         downloaded_at: modified,
         file_exists: true,
+        subfolder: String::new(),
     })
 }
 
@@ -1238,5 +1295,56 @@ pub fn migrate_rename_course_folders() {
     }
     if changed {
         let _ = save_download_history(&records);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn scan_attributes_theme_subfolders_to_their_course() {
+        // base/<course>/<theme>/<file> — the file belongs to <course>, not <theme>.
+        let base = std::env::temp_dir().join(format!("scan-course-{}", uuid::Uuid::new_v4()));
+        let course = base.join("政治学基礎");
+        let theme = course.join("第01回");
+        std::fs::create_dir_all(&theme).unwrap();
+        let flat = course.join("シラバス.pdf");
+        let nested = theme.join("資料.pdf");
+        std::fs::write(&flat, b"a").unwrap();
+        std::fs::write(&nested, b"b").unwrap();
+
+        let known = std::collections::HashSet::new();
+        let mut discovered = Vec::new();
+        scan_dir_recursive(&base, "", &known, &mut discovered, 0);
+
+        let by_name = |n: &str| {
+            discovered
+                .iter()
+                .find(|r| r.filename == n)
+                .map(|r| r.course_name.clone())
+        };
+        // Both files attribute to the course, regardless of theme nesting.
+        assert_eq!(by_name("シラバス.pdf").as_deref(), Some("政治学基礎"));
+        assert_eq!(by_name("資料.pdf").as_deref(), Some("政治学基礎"));
+
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    #[test]
+    fn theme_subfolder_extracts_in_course_path() {
+        let base = std::path::Path::new("/Users/x/Selah");
+        // base/<course>/<theme>/<file> → theme
+        assert_eq!(
+            theme_subfolder("/Users/x/Selah/政治学基礎/第01回/資料.pdf", base),
+            "第01回"
+        );
+        // base/<course>/<file> → no theme (course root)
+        assert_eq!(
+            theme_subfolder("/Users/x/Selah/政治学基礎/資料.pdf", base),
+            ""
+        );
+        // outside base → empty
+        assert_eq!(theme_subfolder("/elsewhere/資料.pdf", base), "");
     }
 }

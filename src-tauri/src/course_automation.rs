@@ -755,7 +755,8 @@ pub async fn course_automation_undo_organize(
     if status.organize_undo.is_empty() {
         return Ok(load_view(&db, &luna_id, &course_name));
     }
-    let restored = organize::undo_organize(&mut status);
+    let course_root = crate::commands::resolve_download_dir(Some(&course_name));
+    let restored = organize::undo_organize(&mut status, &course_root);
     if restored > 0 {
         push_run_log(&mut status, "ok", format!("{restored}件の整理を元に戻しました"));
     }
@@ -2848,7 +2849,40 @@ struct OrganizeInput<'a> {
     course_name: &'a str,
     #[serde(skip_serializing_if = "str::is_empty")]
     course_schedule: &'a str,
+    /// Announcement notices that pin a 第NN回 to a date/topic — the date↔回 bridge
+    /// the schedule lacks, so the planner can file date-named files (live notes,
+    /// 座席表) into the right session.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    notices: Vec<&'a str>,
     documents: Vec<OrganizeDocInput<'a>>,
+}
+
+/// Compact announcement notices that pin a session (第NN回): these carry the
+/// date↔回 pairing absent from the syllabus, drawn from the per-announcement
+/// analysis already generated. Bounded in count so the planner prompt stays lean.
+fn organize_notices(status: &CourseAutomationStatus) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let mut seen: HashSet<String> = HashSet::new();
+    for doc in &status.document_analyses {
+        if doc.status != "done" || doc.kind != "announcement" {
+            continue;
+        }
+        let probe = format!("{} {} {}", doc.title, doc.summary, doc.findings.join(" "));
+        if organize::detect_session(&probe).is_none() {
+            continue;
+        }
+        let line = organize_signal(&format!("{}｜{}", doc.title, doc.summary), &doc.findings);
+        if line.trim().is_empty() {
+            continue;
+        }
+        if seen.insert(line.clone()) {
+            out.push(line);
+        }
+        if out.len() >= 24 {
+            break;
+        }
+    }
+    out
 }
 
 /// Best-effort 授業計画 for the course as compact "第NN回: テーマ" lines, drawn
@@ -2886,6 +2920,10 @@ fn course_schedule_text(db: &Database, course_name: &str) -> String {
 struct OrganizeDocInput<'a> {
     id: &'a str,
     kind: &'a str,
+    /// The actual filename — it usually carries the clearest session marker
+    /// (第03回資料配付.pdf), which the title/summary may have dropped. Without it
+    /// the planner is blind to the single most reliable grouping signal.
+    filename: &'a str,
     title: &'a str,
     summary: &'a str,
 }
@@ -2917,7 +2955,8 @@ async fn organize_course_documents(
 ) -> usize {
     // Candidates = tracked ledger documents + loose Live notes physically in the
     // course folder. Nothing to do for fewer than two (no grouping possible).
-    let candidates = build_organize_candidates(status);
+    let course_root = crate::commands::resolve_download_dir(Some(&status.course_name));
+    let candidates = build_organize_candidates(status, &course_root);
     if candidates.len() < 2 {
         return 0;
     }
@@ -2938,91 +2977,174 @@ async fn organize_course_documents(
     }
     status.organize_signature = signature;
 
-    // AI does the smart semantic grouping over the summaries / note previews
-    // (aligning to the syllabus); then a heuristic sweep files whatever the model
-    // left out (into the same session folders where possible) so nothing is
-    // stranded loose at the top level.
-    let ai_plan = match plan_organize_with_agent(luna_id, &candidates, &status.course_name, schedule).await {
-        Ok(plan) => plan,
-        Err(error) => {
-            log::warn!("[course_automation] organize planning failed, using heuristic: {error}");
-            Vec::new()
+    // Cost-first: place everything the free, deterministic heuristic is confident
+    // about (explicit 第N回 / topic markers) up front, and only spend the AI on the
+    // ambiguous remainder (date-named notes, markerless files) — handing it just
+    // those few files plus the announcement notices that bridge dates to 第NN回.
+    // When nothing is ambiguous, the AI is never called at all.
+    let (confident, ambiguous) = organize::confident_plan(&candidates);
+
+    let ai_plan = if ambiguous.is_empty() {
+        Vec::new()
+    } else {
+        let subset: std::collections::BTreeMap<String, organize::OrganizeCandidate> = ambiguous
+            .iter()
+            .filter_map(|id| candidates.get(id).map(|cand| (id.clone(), cand.clone())))
+            .collect();
+        let notices = organize_notices(status);
+        match plan_organize_with_agent(luna_id, &subset, &status.course_name, schedule, &notices).await {
+            Ok(plan) => plan,
+            Err(error) => {
+                log::warn!("[course_automation] organize planning failed, using heuristic: {error}");
+                Vec::new()
+            }
         }
     };
-    let assigned: HashSet<String> = ai_plan
+
+    // Confident heuristic groups are primary; the AI's placements for the ambiguous
+    // files merge in; a final heuristic sweep gives any still-unplaced file a kind
+    // folder so nothing is left loose at the course root.
+    let mut combined = organize::merge_plans(confident, ai_plan);
+    let assigned: HashSet<String> = combined
         .iter()
         .flat_map(|group| group.doc_ids.iter().cloned())
         .collect();
     let sweep = organize::heuristic_plan(&candidates, &assigned);
-    let combined = organize::merge_plans(ai_plan, sweep);
-    organize::apply_groups(status, &candidates, &combined)
+    combined = organize::merge_plans(combined, sweep);
+    organize::apply_groups(status, &candidates, &combined, &course_root)
 }
 
-/// Builds the unified candidate set: every analysed ledger document still on
-/// disk, plus loose text notes (Live whiteboard exports etc.) sitting in the
-/// course folder that the agent never tracked — so the organizer can file those
-/// too instead of leaving them stranded at the top level.
+/// Builds the unified candidate set, driven by the files actually on disk so the
+/// organizer can never go blind to a document. The SenseA ledger often holds an
+/// empty `path` (the unified items model regenerates analyses without re-binding
+/// the download location), so keying candidate discovery on `doc.path` alone
+/// silently drops most files. Instead we walk the course folder for every real
+/// file and enrich each with the ledger's AI title/summary/kind matched by
+/// filename — so the LLM planner still gets full semantic signal, while filing
+/// is anchored to what truly exists. Tracked docs whose path is still valid are
+/// added directly; everything else (handouts with a lost path, loose Live notes)
+/// is picked up by the disk sweep.
 fn build_organize_candidates(
     status: &CourseAutomationStatus,
+    course_root: &Path,
 ) -> std::collections::BTreeMap<String, organize::OrganizeCandidate> {
     let mut candidates: std::collections::BTreeMap<String, organize::OrganizeCandidate> =
         std::collections::BTreeMap::new();
     let mut tracked_paths: HashSet<String> = HashSet::new();
+
+    // Ledger lookup by filename, so a swept file recovers its AI analysis even
+    // when the stored path is empty/stale. First done analysis per name wins.
+    let mut ledger_by_name: HashMap<&str, &DocumentAnalysis> = HashMap::new();
     for doc in &status.document_analyses {
-        if doc.status != "done" || doc.path.trim().is_empty() || !Path::new(&doc.path).is_file() {
+        if doc.status != "done" {
             continue;
         }
-        tracked_paths.insert(doc.path.clone());
-        candidates.insert(
-            doc.id.clone(),
-            organize::OrganizeCandidate {
+        if !doc.filename.trim().is_empty() {
+            ledger_by_name.entry(doc.filename.as_str()).or_insert(doc);
+        }
+        // Directly usable: a ledger doc whose path still points at a real file.
+        if !doc.path.trim().is_empty() && Path::new(&doc.path).is_file() {
+            tracked_paths.insert(doc.path.clone());
+            candidates.entry(doc.id.clone()).or_insert_with(|| organize::OrganizeCandidate {
                 path: doc.path.clone(),
                 filename: doc.filename.clone(),
                 title: doc.title.clone(),
-                summary: doc.summary.clone(),
+                summary: organize_signal(&doc.summary, &doc.findings),
                 kind: doc.kind.clone(),
-            },
-        );
-    }
-
-    let course_dir = crate::commands::resolve_download_dir(Some(&status.course_name));
-    if let Ok(entries) = std::fs::read_dir(&course_dir) {
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if !path.is_file() {
-                continue;
-            }
-            let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
-                continue;
-            };
-            // Skip hidden cache files (.{date}_..._live.cache.json etc.).
-            if name.starts_with('.') {
-                continue;
-            }
-            let ext = path
-                .extension()
-                .and_then(|e| e.to_str())
-                .unwrap_or("")
-                .to_ascii_lowercase();
-            // Only sweep text notes; binaries here are usually tracked downloads.
-            if ext != "md" && ext != "txt" {
-                continue;
-            }
-            let path_str = path.to_string_lossy().to_string();
-            if tracked_paths.contains(&path_str) {
-                continue;
-            }
-            let id = format!("loose:{name}");
-            candidates.entry(id).or_insert_with(|| organize::OrganizeCandidate {
-                path: path_str,
-                filename: name.to_string(),
-                title: name.to_string(),
-                summary: read_text_preview(&path),
-                kind: "ライブノート".to_string(),
             });
         }
     }
+
+    collect_disk_files(course_root, &tracked_paths, &ledger_by_name, &mut candidates, 0);
     candidates
+}
+
+/// Coarse fallback kind for a swept file with no ledger match, from its
+/// extension: text notes read as Live notes, everything else as course material.
+/// Used only when the AI analysis (richer) is unavailable.
+fn default_candidate_kind(ext: &str) -> &'static str {
+    match ext {
+        "md" | "txt" => "ライブノート",
+        _ => "material",
+    }
+}
+
+/// Recursively gathers every real file under `dir` into `candidates`, bounded in
+/// depth so a pathological tree can't stall the sweep. Hidden files, Office lock
+/// files (`~$…`), and paths already added as tracked candidates are skipped. Each
+/// file is enriched from `ledger_by_name` (matched by filename) so it carries the
+/// AI title/summary/kind when available; otherwise it falls back to the filename
+/// and an extension-inferred kind. The id reuses the ledger doc's stable content
+/// id when matched (keeps signature / reuse consistent), else `loose:<name>`.
+fn collect_disk_files(
+    dir: &Path,
+    tracked_paths: &HashSet<String>,
+    ledger_by_name: &HashMap<&str, &DocumentAnalysis>,
+    candidates: &mut std::collections::BTreeMap<String, organize::OrganizeCandidate>,
+    depth: usize,
+) {
+    if depth > 8 {
+        return;
+    }
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        // Skip hidden files/folders (.DS_Store, .{date}_live.cache.json) and
+        // Office lock/owner files (~$report.docx) — transient, not real docs.
+        if name.starts_with('.') || name.starts_with("~$") {
+            continue;
+        }
+        if path.is_dir() {
+            collect_disk_files(&path, tracked_paths, ledger_by_name, candidates, depth + 1);
+            continue;
+        }
+        if !path.is_file() {
+            continue;
+        }
+        let path_str = path.to_string_lossy().to_string();
+        if tracked_paths.contains(&path_str) {
+            continue;
+        }
+        let ext = path
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("")
+            .to_ascii_lowercase();
+
+        let ledger = ledger_by_name.get(name).copied();
+        let id = ledger
+            .map(|doc| doc.id.clone())
+            .unwrap_or_else(|| format!("loose:{name}"));
+        let title = ledger
+            .map(|doc| doc.title.clone())
+            .filter(|t| !t.trim().is_empty())
+            .unwrap_or_else(|| name.to_string());
+        let kind = ledger
+            .map(|doc| doc.kind.clone())
+            .filter(|k| !k.trim().is_empty())
+            .unwrap_or_else(|| default_candidate_kind(&ext).to_string());
+        let summary = match ledger {
+            // Use the full per-document analysis (summary + findings), not just
+            // the one-liner, so classification leans on everything already extracted.
+            Some(doc) if !doc.summary.trim().is_empty() || !doc.findings.is_empty() => {
+                organize_signal(&doc.summary, &doc.findings)
+            }
+            _ if ext == "md" || ext == "txt" => read_text_preview(&path),
+            _ => String::new(),
+        };
+        candidates.entry(id).or_insert(organize::OrganizeCandidate {
+            path: path_str,
+            filename: name.to_string(),
+            title,
+            summary,
+            kind,
+        });
+    }
 }
 
 /// Fingerprint of the organize candidate set, over its ids only. The map is a
@@ -3039,6 +3161,27 @@ fn organize_candidate_signature(
         id.hash(&mut hasher);
     }
     format!("{:x}", hasher.finish())
+}
+
+/// Folds a document's AI summary together with its extracted `findings` into one
+/// compact signal for organize, so classification reuses the *whole* per-document
+/// analysis (the key points the model already pulled out) rather than only the
+/// one-line summary. Whitespace-collapsed and length-bounded to keep the planner
+/// prompt small.
+fn organize_signal(summary: &str, findings: &[String]) -> String {
+    let mut text = summary.to_string();
+    for finding in findings {
+        if !finding.trim().is_empty() {
+            text.push(' ');
+            text.push_str(finding);
+        }
+    }
+    text.split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .chars()
+        .take(600)
+        .collect()
 }
 
 /// A compact, whitespace-collapsed preview of a text note for the AI prompt.
@@ -3063,6 +3206,7 @@ async fn plan_organize_with_agent(
     candidates: &std::collections::BTreeMap<String, organize::OrganizeCandidate>,
     course_name: &str,
     schedule: &str,
+    notices: &[String],
 ) -> Result<Vec<organize::PlannedGroup>, String> {
     let provider = AgentProvider::resolve().map_err(|error| error.to_string())?;
     let documents: Vec<OrganizeDocInput> = candidates
@@ -3070,6 +3214,7 @@ async fn plan_organize_with_agent(
         .map(|(id, cand)| OrganizeDocInput {
             id: id.as_str(),
             kind: cand.kind.as_str(),
+            filename: cand.filename.as_str(),
             title: cand.title.as_str(),
             summary: cand.summary.as_str(),
         })
@@ -3083,6 +3228,7 @@ async fn plan_organize_with_agent(
     let input = OrganizeInput {
         course_name,
         course_schedule: schedule,
+        notices: notices.iter().map(String::as_str).collect(),
         documents,
     };
     let mut hasher = Sha256::new();
@@ -3091,6 +3237,10 @@ async fn plan_organize_with_agent(
     hasher.update(luna_id.as_bytes());
     hasher.update([0]);
     hasher.update(schedule.as_bytes());
+    for notice in &input.notices {
+        hasher.update([0]);
+        hasher.update(notice.as_bytes());
+    }
     for doc in &input.documents {
         hasher.update([0]);
         hasher.update(doc.id.as_bytes());
@@ -3112,7 +3262,9 @@ async fn plan_organize_with_agent(
     let mut seen: HashSet<String> = HashSet::new();
     let mut plan: Vec<organize::PlannedGroup> = Vec::new();
     for group in response.value.groups {
-        let label = group.label.trim().to_string();
+        // Canonicalize so the model's session labels merge with the heuristic's
+        // (第3回 / 第１０回 → 第03回 / 第10回) instead of forking a parallel folder.
+        let label = organize::canonical_session_label(&group.label);
         if label.is_empty() {
             continue;
         }
@@ -3325,21 +3477,27 @@ fn document_id(document: &AnalysisDocument) -> String {
             ))
         );
     }
+    // Identity is deliberately path-free: the organizer moves a file between theme
+    // folders, and that must NOT change who the document is — otherwise the next
+    // cycle can't find its prior analysis and re-runs the AI on an unchanged file.
     format!(
         "{:x}",
         Sha256::digest(format!(
-            "{}|{}|{}|{}",
-            document.kind, document.title, document.filename, document.path
+            "{}|{}|{}",
+            document.kind, document.title, document.filename
         ))
     )
 }
 
 fn document_fingerprint(document: &AnalysisDocument) -> Result<String, String> {
+    // Version fingerprint excludes `path` for the same reason as `document_id`:
+    // relocating a file (organize) is not a content change, so it must not look
+    // like one and trigger re-analysis. `content` + `sourceFingerprint` carry the
+    // real "has this document changed" signal.
     sha256_json(&json!({
         "kind": document.kind,
         "title": document.title,
         "filename": document.filename,
-        "path": document.path,
         "content": document.content,
         "sourceFingerprint": document.source_fingerprint,
     }))
@@ -4414,6 +4572,90 @@ mod tests {
         document.content = "changed".into();
         document.source_fingerprint = "remote-v2".into();
         assert!(should_process_document_delta(&previous_done, &document));
+    }
+
+    #[test]
+    fn organize_signal_folds_findings_into_summary() {
+        let signal = organize_signal(
+            "配布資料です",
+            &["第3回の小テスト範囲".into(), "".into(), "提出は来週".into()],
+        );
+        // Findings are merged into the signal (empty ones skipped), so a session
+        // marker present only in findings is still visible to theme detection
+        // (theme_of searches the summary — see session_marker_groups_across_kinds).
+        assert!(signal.contains("配布資料です"));
+        assert!(signal.contains("第3回の小テスト範囲"));
+        assert!(signal.contains("提出は来週"));
+        // Whitespace-collapsed and bounded.
+        assert!(!signal.contains("  "));
+        assert!(signal.chars().count() <= 600);
+    }
+
+    #[test]
+    fn organize_notices_keeps_only_session_pinning_announcements() {
+        let status = CourseAutomationStatus {
+            document_analyses: vec![
+                DocumentAnalysis {
+                    kind: "announcement".into(),
+                    title: "5月26日 第7回 座席表".into(),
+                    summary: "本日の座席指定".into(),
+                    status: "done".into(),
+                    ..Default::default()
+                },
+                DocumentAnalysis {
+                    kind: "announcement".into(),
+                    title: "システムメンテナンス".into(),
+                    summary: "停止のお知らせ".into(),
+                    status: "done".into(),
+                    ..Default::default()
+                },
+                DocumentAnalysis {
+                    kind: "material".into(),
+                    title: "第3回資料".into(),
+                    status: "done".into(),
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+        let notices = organize_notices(&status);
+        // Only the session-pinning announcement; the no-session one and the
+        // material file (grouped directly as a candidate) are excluded.
+        assert_eq!(notices.len(), 1);
+        assert!(notices[0].contains("第7回"));
+    }
+
+    #[test]
+    fn moving_a_file_does_not_retrigger_analysis() {
+        // No source_fingerprint: identity and version must both be path-free, so
+        // the organizer relocating the file never looks like a new/changed doc.
+        let mut document = AnalysisDocument {
+            kind: "material".into(),
+            title: "第01回資料".into(),
+            filename: "shiryo.pdf".into(),
+            path: "/Selah/course/shiryo.pdf".into(),
+            content: "BODY".into(),
+            source_fingerprint: String::new(),
+            load_error: String::new(),
+            images: Vec::new(),
+        };
+        let previous = CourseAutomationStatus {
+            document_analyses: vec![DocumentAnalysis {
+                id: document_id(&document),
+                fingerprint: document_fingerprint(&document).expect("fingerprint"),
+                source_fingerprint: String::new(),
+                status: "done".into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        assert!(!should_process_document_delta(&previous, &document));
+        // Organizer files it into a theme folder: same content, new path.
+        document.path = "/Selah/course/第01回/shiryo.pdf".into();
+        assert!(!should_process_document_delta(&previous, &document));
+        // A genuine content change still re-triggers.
+        document.content = "BODY-revised".into();
+        assert!(should_process_document_delta(&previous, &document));
     }
 
     #[test]
