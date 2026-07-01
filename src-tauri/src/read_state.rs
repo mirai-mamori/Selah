@@ -119,7 +119,8 @@ const SEEN_INIT_PREFIX: &str = "seen_notifs_init_";
 const SEEN_BOOTSTRAP_STARTED_AT_KEY: &str = "seen_notifs_bootstrap_started_at";
 const SEEN_BOOTSTRAP_COMPLETE_KEY: &str = "seen_notifs_bootstrap_complete";
 const SEEN_FORMAT_VERSION_KEY: &str = "seen_notifs_format_version";
-pub const CURRENT_SEEN_NOTIF_FORMAT_VERSION: u32 = 1;
+// v2: luna revision keys strip the volatile trailing timestamp from the body.
+pub const CURRENT_SEEN_NOTIF_FORMAT_VERSION: u32 = 2;
 const MAX_SEEN_IDS: usize = 2000;
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]

@@ -1155,12 +1155,31 @@ fn extend_seen_ids(
 }
 
 fn luna_revision_key(item: &crate::luna_parser::LunaNotification) -> String {
+    // Strip the volatile trailing "(YYYY/MM/DD HH:MM)" timestamp that LUNA
+    // appends to some notification bodies. It can change between polls without
+    // the item being genuinely updated, which otherwise makes the revision key
+    // drift and re-fires the same item as an "[更新]" notification every cycle.
+    // The action suffix (追加/更新/提出…) is deliberately kept so real updates
+    // still produce a new revision.
     format!(
         "{}|{}|{}",
         normalize_luna_key_part(&item.date),
         normalize_luna_key_part(&item.course_info),
-        normalize_luna_key_part(&item.content)
+        normalize_luna_key_part(&strip_trailing_luna_timestamp(&item.content))
     )
+}
+
+fn strip_trailing_luna_timestamp(content: &str) -> String {
+    let trimmed = content.trim_end();
+    if trimmed.ends_with(')') {
+        if let Some(open) = trimmed.rfind('(') {
+            let inner = &trimmed[open + 1..trimmed.len() - 1];
+            if looks_like_luna_timestamp(inner) {
+                return trimmed[..open].trim_end().to_string();
+            }
+        }
+    }
+    content.to_string()
 }
 
 fn luna_base_key(item: &crate::luna_parser::LunaNotification) -> String {
@@ -1398,4 +1417,58 @@ fn epoch_secs() -> i64 {
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_secs() as i64)
         .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::luna_parser::LunaNotification;
+
+    fn notif(content: &str) -> LunaNotification {
+        LunaNotification {
+            date: "2025/07/01".to_string(),
+            course_info: "英語I".to_string(),
+            module: "お知らせ".to_string(),
+            content: content.to_string(),
+            url: String::new(),
+            idnumber: String::new(),
+        }
+    }
+
+    #[test]
+    fn strips_trailing_timestamp() {
+        assert_eq!(
+            strip_trailing_luna_timestamp("第5回レポートについて (2025/07/01 12:00)"),
+            "第5回レポートについて"
+        );
+        assert_eq!(
+            strip_trailing_luna_timestamp("課題（第1回）(2025/07/01 12:00)"),
+            "課題（第1回）"
+        );
+    }
+
+    #[test]
+    fn keeps_non_timestamp_parens() {
+        assert_eq!(
+            strip_trailing_luna_timestamp("レポート（第1回）"),
+            "レポート（第1回）"
+        );
+        assert_eq!(strip_trailing_luna_timestamp("small (note)"), "small (note)");
+    }
+
+    #[test]
+    fn revision_key_stable_across_timestamp_change() {
+        // Same post, only the displayed timestamp changed → same revision key,
+        // so it must not re-fire as an update.
+        let a = notif("・お知らせ が追加されました。(2025/07/01 12:00)");
+        let b = notif("・お知らせ が追加されました。(2025/07/02 09:30)");
+        assert_eq!(luna_revision_key(&a), luna_revision_key(&b));
+    }
+
+    #[test]
+    fn revision_key_differs_on_genuine_update() {
+        let added = notif("・お知らせ が追加されました。(2025/07/01 12:00)");
+        let updated = notif("・お知らせ が更新されました。(2025/07/01 12:00)");
+        assert_ne!(luna_revision_key(&added), luna_revision_key(&updated));
+    }
 }

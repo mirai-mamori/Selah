@@ -5,7 +5,7 @@
   import { cachedBackendFetch, getCached, onCacheUpdate, lunaAuthState, kwicAuthState, mailAuthState, activeTab, readIdsStore, notifKey, markRead, markBatchRead, requestedMailMessageId } from "../stores";
   import type { NotificationsData } from "../stores";
   import type { KwicPortalHome } from "../api";
-  import { compareNotificationDatesDesc } from "../date";
+  import { compareNotificationDatesDesc, parseNotificationTime } from "../date";
   import ViewLoader from "../ViewLoader.svelte";
   import type { LunaNotification } from "../types";
 
@@ -117,14 +117,69 @@
     }
   });
 
+  // Normalize a 授業のお知らせ body/title so the "same" announcement coming from
+  // different sources (KGC's plain title vs LUNA's "・… が追加されました。(時刻)")
+  // collapses to one comparable key. Mirrors the backend luna key normalization.
+  function normalizeAnnouncementSubject(raw: string): string {
+    let s = (raw || "").trim().replace(/^・+/, "").trim();
+    s = s.replace(/(が更新されました|が追加されました|を提出しました|で解答しました|が削除されました)。?$/u, "").trim();
+    // trailing "(YYYY/MM/DD HH:MM)" timestamp
+    s = s.replace(/[)）]?\s*[（(][0-9/／:：\s]{8,}[)）]$/u, "").trim();
+    return s.replace(/\s+/g, "").toLowerCase();
+  }
+  // Prefer the source that can open a rich detail view when merging duplicates.
+  const CLASS_SOURCE_RANK: Record<string, number> = { luna: 3, kwic: 2, kgc: 1, mail: 0 };
+  function sameCalendarDay(a: number, b: number): boolean {
+    const da = new Date(a), db = new Date(b);
+    return da.getFullYear() === db.getFullYear() && da.getMonth() === db.getMonth() && da.getDate() === db.getDate();
+  }
+  // Merge two duplicates of the same class announcement: keep the richer source,
+  // but always carry a trustworthy (parseable) date so a bogus/epoch-dated copy
+  // never wins and surfaces as an "obviously too early" straggler.
+  function mergeClassDup(a: UnifiedNotif, b: UnifiedNotif): UnifiedNotif {
+    const base = (CLASS_SOURCE_RANK[b.source] ?? 0) > (CLASS_SOURCE_RANK[a.source] ?? 0) ? { ...b } : { ...a };
+    if (parseNotificationTime(base.date) === 0) {
+      const good = parseNotificationTime(a.date) !== 0 ? a : parseNotificationTime(b.date) !== 0 ? b : null;
+      if (good) {
+        base.date = good.date;
+        if (!base.courseInfo && good.courseInfo) base.courseInfo = good.courseInfo;
+      }
+    }
+    return base;
+  }
+
   // Build unified + categorized notifications
   let allNotifs = $derived.by(() => {
     const items: UnifiedNotif[] = [];
     const seen = new Set<string>();
+    // Cross-source merge for the class tab: "subject|course" → index into `items`.
+    const classByBase = new Map<string, number>();
     const addUniq = (n: UnifiedNotif) => {
       const key = `${n.source}:${n.id}:${n.title}:${n.date}:${n.category}`;
       if (seen.has(key)) return;
       seen.add(key);
+      if (n.tab === "授業のお知らせ") {
+        const subj = normalizeAnnouncementSubject(n.title);
+        const course = (n.courseInfo || n.category || "").replace(/\s+/g, "").toLowerCase();
+        const base = subj ? `${subj}|${course}` : "";
+        if (base) {
+          const existingIdx = classByBase.get(base);
+          if (existingIdx !== undefined) {
+            const existing = items[existingIdx];
+            const tn = parseNotificationTime(n.date);
+            const te = parseNotificationTime(existing.date);
+            // Genuinely distinct reposts: both dated and on different days → keep both.
+            if (tn !== 0 && te !== 0 && !sameCalendarDay(tn, te)) {
+              items.push(n);
+              return;
+            }
+            // Otherwise same announcement (or a bogus/undated duplicate) → merge.
+            items[existingIdx] = mergeClassDup(existing, n);
+            return;
+          }
+          classByBase.set(base, items.length);
+        }
+      }
       items.push(n);
     };
 
