@@ -51,6 +51,20 @@
     else if (event.key === "-") setScale(scale - 0.3);
     else if (event.key === "0") setScale(1);
   }
+
+  // The surrounding reader/detail surfaces animate with `transform` (which stays
+  // applied via `animation-fill-mode: both`), and a transformed ancestor becomes
+  // the containing block for `position: fixed`. That anchors the overlay to the
+  // scrolled content instead of the viewport, so it only lands correctly at the
+  // top of the page. Porting the node to <body> escapes that containing block.
+  function portal(node: HTMLElement) {
+    document.body.appendChild(node);
+    return {
+      destroy() {
+        node.remove();
+      },
+    };
+  }
 </script>
 
 <svelte:window onkeydown={handleKeydown} />
@@ -58,6 +72,7 @@
 <!-- svelte-ignore a11y_click_events_have_key_events -->
 <div
   class="lightbox"
+  use:portal
   role="dialog"
   aria-modal="true"
   aria-label="画像プレビュー"

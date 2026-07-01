@@ -1649,6 +1649,15 @@ fn start_live_flush_driver(app: tauri::AppHandle, session_id: String) {
                 }
                 Err(err) => {
                     log::warn!("[Live] backend scheduled flush failed: {err}");
+                    // The flush already cleared `flush_in_flight` on failure, but
+                    // without pushing a fresh snapshot the UI stays stuck on
+                    // "要約を生成中…". Emit the cleared state plus an error event so
+                    // Live can surface the failure instead of hanging silently.
+                    emit_live_update(&app, state.inner());
+                    let _ = app.emit(
+                        "live-summary-error",
+                        serde_json::json!({ "message": err }),
+                    );
                     tokio::time::sleep(std::time::Duration::from_secs(
                         LIVE_FLUSH_DRIVER_IDLE_SLEEP_SECS,
                     ))

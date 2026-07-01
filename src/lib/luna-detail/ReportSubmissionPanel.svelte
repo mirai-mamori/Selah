@@ -12,10 +12,14 @@
     progress: number;
     status: string;
     canSubmit: boolean;
+    external?: boolean;
+    externalLabel?: string;
+    externalNote?: string;
     ontextchange: (value: string) => void;
     onfilechange: (file: File | null) => void;
     onclearfile: () => void;
     onsubmit: () => void | Promise<void>;
+    onlaunch?: () => void | Promise<void>;
   }
 
   let {
@@ -29,10 +33,14 @@
     progress,
     status,
     canSubmit,
+    external = false,
+    externalLabel = "提出ページを開く",
+    externalNote = "",
     ontextchange,
     onfilechange,
     onclearfile,
     onsubmit,
+    onlaunch,
   }: Props = $props();
 
   let dragging = $state(false);
@@ -63,7 +71,18 @@
 <section class="panel">
   <h2>課題提出</h2>
 
-  {#if loading}
+  {#if external}
+    <div class="external">
+      {#if externalNote}<p class="external-note">{externalNote}</p>{/if}
+      {#if unavailable}<div class="unavailable">{unavailable}</div>{/if}
+      <div class="actions">
+        <button type="button" onclick={() => void onlaunch?.()}>
+          <Icon name="arrow.up.right.square" size={15} />
+          <span>{externalLabel}</span>
+        </button>
+      </div>
+    </div>
+  {:else if loading}
     <div class="state"><span class="spinner"></span>提出フォームを確認中...</div>
   {:else if unavailable}
     <div class="unavailable">{unavailable}</div>
@@ -370,6 +389,19 @@
     border-radius: inherit;
     background: var(--detail-accent, #173b68);
     transition: width 0.18s ease;
+  }
+
+  .external {
+    display: grid;
+    gap: 12px;
+  }
+
+  .external-note {
+    margin: 0;
+    color: var(--detail-muted, #475569);
+    font-size: 13px;
+    font-weight: 650;
+    line-height: 1.55;
   }
 
   .unavailable {

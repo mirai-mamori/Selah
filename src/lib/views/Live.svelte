@@ -538,6 +538,7 @@
   let unlistenLive: (() => void) | null = null;
   let unlistenSaved: (() => void) | null = null;
   let unlistenFinishProgress: (() => void) | null = null;
+  let unlistenSummaryError: (() => void) | null = null;
   let unlistenAiConfig: (() => void) | null = null;
   let unlistenScheduleCache: (() => void) | null = null;
   let unlistenWinFocus: (() => void) | null = null;
@@ -1432,6 +1433,16 @@
       unlistenFinishProgress = await listen<{ step: string }>("live-finish-progress", (event) => {
         applyFinishProgress(event.payload.step);
       });
+      unlistenSummaryError = await listen<{ message: string }>("live-summary-error", (event) => {
+        // A scheduled AI summary failed. The backend has already cleared the
+        // "生成中" flag; surface the reason (incl. any provider error code) so
+        // the user knows it stalled instead of silently waiting for the next tick.
+        const detail = (event.payload.message || "").trim();
+        setNotice("error", detail ? `AI要約に失敗しました：${detail}` : "AI要約に失敗しました。次の区間で再試行します。", {
+          source: "general",
+          autoClearMs: 8000,
+        });
+      });
       unlistenAiConfig = await listen("ai-config-changed", () => {
         refreshReadiness().catch((e: any) => {
           liveReady = false;
@@ -1470,6 +1481,7 @@
     unlistenLive?.();
     unlistenSaved?.();
     unlistenFinishProgress?.();
+    unlistenSummaryError?.();
     unlistenAiConfig?.();
     unlistenScheduleCache?.();
     unlistenWinFocus?.();

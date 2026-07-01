@@ -306,6 +306,9 @@ export async function buildCachedReportFallback(
   const title = item?.title || todo?.content_name || currentTitle;
   const courseName = course?.course_name || todo?.course_name || currentCourseName;
   if (!title && !courseName && !meta.length) return null;
-  meta.push(["詳細", "課題本文は取得できませんでしたが、この課題はローカルキャッシュから特定しました。"]);
+  const isTurnitin = /[?&]type=turnitin\b/i.test(path);
+  meta.push(["詳細", isTurnitin
+    ? "Turnitin 課題です。課題本文は Luna 上では取得できません。下のボタンから Turnitin を開いて提出してください。"
+    : "課題本文は取得できませんでしたが、この課題はローカルキャッシュから特定しました。"]);
   return { title, course_name: courseName, sections: [], attachments: [], meta };
 }

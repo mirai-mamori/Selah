@@ -143,6 +143,7 @@
       {reportIdParam}
       {pathParam}
       {periodParam}
+      {openExternal}
     />
   {/if}
 </article>

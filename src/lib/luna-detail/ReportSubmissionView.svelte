@@ -9,9 +9,17 @@
     reportIdParam: string;
     pathParam: string;
     periodParam: string;
+    openExternal: (url: string, title?: string) => void | Promise<void>;
   }
 
-  let { idnumberParam, reportIdParam, pathParam, periodParam }: Props = $props();
+  let { idnumberParam, reportIdParam, pathParam, periodParam, openExternal }: Props = $props();
+
+  // Turnitin (and other LTI 1.3 tool) 課題 are submitted by launching the
+  // external tool, not through Luna's /lms/course/report/* upload API. Their
+  // links carry no reportId, so the normal form can never work — detect them
+  // and offer a launch button instead.
+  const isLtiReport = $derived(/\/lms\/lti1p3\//i.test(pathParam));
+  const isTurnitin = $derived(isLtiReport && /[?&]type=turnitin\b/i.test(pathParam));
 
   let reportType = $state("");
   let loading = $state(true);
@@ -72,7 +80,19 @@
     return "";
   }
 
+  function launchExternal(): void {
+    if (!pathParam) return;
+    void openExternal(pathParam, isTurnitin ? "Turnitin" : "提出ページ");
+  }
+
   async function load(): Promise<void> {
+    if (isLtiReport) {
+      // Only surface a period message; the launch button is always available so
+      // the student can still open Turnitin (which may accept late submissions).
+      unavailable = submissionPeriodMessage();
+      loading = false;
+      return;
+    }
     if (!idnumberParam || !reportIdParam) {
       unavailable = "提出パラメータが不足しています。";
       loading = false;
@@ -179,8 +199,14 @@
   {progress}
   {status}
   {canSubmit}
+  external={isLtiReport}
+  externalLabel={isTurnitin ? "Turnitin で提出する" : "提出ページを開く"}
+  externalNote={isTurnitin
+    ? "この課題は Turnitin で提出します。ボタンから Turnitin を開いて提出してください。"
+    : "この課題は外部ツールで提出します。ボタンから提出ページを開いてください。"}
   ontextchange={updateText}
   onfilechange={selectFile}
   onclearfile={clearFile}
   onsubmit={submit}
+  onlaunch={launchExternal}
 />
