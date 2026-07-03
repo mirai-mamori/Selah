@@ -58,6 +58,7 @@ tauri-plugin-global-shortcut = "2"
 tauri-plugin-updater = { version = "2", optional = true }
 rfd = "0.15"
 zip = { version = "2", default-features = false, features = ["deflate"] }
+flate2 = "1"
 
 [target.'cfg(not(target_os = "windows"))'.dependencies]
 sherpa-onnx = { version = "1.12.39", default-features = false }

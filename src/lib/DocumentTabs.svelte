@@ -179,6 +179,7 @@
     if (kind === "files") return "ファイル";
     if (kind === "home") return "新しいタブ";
     if (kind === "detective") return "なるほど";
+    if (kind === "paper-check") return "論文チェック";
     return "LUNA";
   }
 
@@ -591,7 +592,7 @@
   <title>{activeTab?.title || "Copilot"}</title>
 </svelte:head>
 
-<main class="document-tabs" class:windows={isWindows} class:compact={activeTab?.type === "detective"} data-tauri-drag-region aria-label="Document tabs">
+<main class="document-tabs" class:windows={isWindows} class:compact={activeTab?.type === "detective" || activeTab?.type === "paper-check"} data-tauri-drag-region aria-label="Document tabs">
   <section
     class="tab-row"
     data-tauri-drag-region
@@ -1098,6 +1099,11 @@
   .kind-dot[data-kind="detective"] {
     background: #b91c1c;
     box-shadow: 0 0 0 2px rgba(185,28,28,0.12);
+  }
+
+  .kind-dot[data-kind="paper-check"] {
+    background: #173b68;
+    box-shadow: 0 0 0 2px rgba(23,59,104,0.12);
   }
 
   .new-tab {

@@ -44,6 +44,7 @@ mod mail;
 mod mail_commands;
 mod native_notification;
 mod notifier;
+mod paper_check;
 mod parser;
 mod power;
 mod read_state;
@@ -605,6 +606,15 @@ pub fn run() {
             detective::detective_save_case_result,
             detective::detective_save_included_courses,
             detective::detective_save_memory_outcome,
+            paper_check::paper_check_extract_text,
+            paper_check::paper_check_text_stats,
+            paper_check::paper_check_analyze_ai,
+            paper_check::paper_check_analyze_similarity,
+            paper_check::paper_check_calibrate,
+            paper_check::paper_check_get_calibration,
+            paper_check::paper_check_get_search_config,
+            paper_check::paper_check_save_search_config,
+            paper_check::paper_check_save_report,
             document_tabs::document_tabs_list,
             document_tabs::document_tabs_set_controls,
             document_tabs::document_tabs_report_title,
@@ -672,6 +682,7 @@ pub fn run() {
             commands::clear_download_history,
             commands::open_files_tab,
             commands::open_detective_tab,
+            commands::open_paper_check_tab,
             tray::set_tray_status_items,
             tray::show_main_window,
             tray::show_main_agent_window,

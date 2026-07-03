@@ -81,6 +81,12 @@ pub async fn open_detective_tab(app: tauri::AppHandle) -> Result<(), String> {
 }
 
 #[tauri::command]
+pub async fn open_paper_check_tab(app: tauri::AppHandle) -> Result<(), String> {
+    crate::document_tabs::open_paper_check_tab(&app)?;
+    Ok(())
+}
+
+#[tauri::command]
 pub async fn open_files_tab(
     app: tauri::AppHandle,
     focus_course: Option<String>,

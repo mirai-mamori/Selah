@@ -816,7 +816,10 @@ fn resize_document_window(app: &tauri::AppHandle, owner: &str, width: f64, heigh
     // drag. Detective collapses the toolbar row away (shorter strip); only a
     // cheap active-kind read is needed — the heavier full-state clone for the
     // content layout happens afterwards.
-    let strip_h = if active_kind_for_owner(owner).as_deref() == Some("detective") {
+    let strip_h = if matches!(
+        active_kind_for_owner(owner).as_deref(),
+        Some("detective") | Some("paper-check")
+    ) {
         COMPACT_STRIP_HEIGHT
     } else {
         TAB_STRIP_HEIGHT
@@ -1583,6 +1586,19 @@ pub fn open_detective_tab(app: &tauri::AppHandle) -> Result<DocumentTabInfo, Str
         "detective",
         "なるほど".to_string(),
         Some("detective"),
+        "",
+    )
+}
+
+/// Open (or focus) the 論文チェッカー (paper AI-rate + similarity) app as a
+/// singleton tab in the Copilot window. Keyed on "paper-check".
+pub fn open_paper_check_tab(app: &tauri::AppHandle) -> Result<DocumentTabInfo, String> {
+    open_app_surface_tab(
+        app,
+        "paper-check",
+        "paper-check",
+        "論文チェック".to_string(),
+        Some("paper-check"),
         "",
     )
 }

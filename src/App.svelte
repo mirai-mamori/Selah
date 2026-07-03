@@ -59,9 +59,10 @@
   const isFilesSurface = surface === "files";
   const isHomeSurface = surface === "home";
   const isDetectiveSurface = surface === "detective";
+  const isPaperCheckSurface = surface === "paper-check";
   const isSplitDividerSurface = surface === "split-divider";
   const isBrowserMouseSelftestSurface = surface === "browser-mouse-selftest";
-  const isAuxiliarySurface = isDocumentTabsSurface || isMarkdownReaderSurface || isUniversityDetailSurface || isAgentPanelSurface || isFilesSurface || isHomeSurface || isDetectiveSurface || isSplitDividerSurface || isBrowserMouseSelftestSurface;
+  const isAuxiliarySurface = isDocumentTabsSurface || isMarkdownReaderSurface || isUniversityDetailSurface || isAgentPanelSurface || isFilesSurface || isHomeSurface || isDetectiveSurface || isPaperCheckSurface || isSplitDividerSurface || isBrowserMouseSelftestSurface;
 
   let demoBootFlag = $state(readDemoBootFlag());
   let everLoggedIn = $state(readEverLoggedIn());
@@ -91,6 +92,8 @@
           AuxiliarySurface = (await import("./lib/NewTabSurface.svelte")).default;
         } else if (isDetectiveSurface) {
           AuxiliarySurface = (await import("./lib/views/Detective.svelte")).default;
+        } else if (isPaperCheckSurface) {
+          AuxiliarySurface = (await import("./lib/views/PaperCheck.svelte")).default;
         } else if (isSplitDividerSurface) {
           AuxiliarySurface = (await import("./lib/SplitDividerSurface.svelte")).default;
         } else if (isBrowserMouseSelftestSurface) {

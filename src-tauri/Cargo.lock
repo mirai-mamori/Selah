@@ -4907,6 +4907,7 @@ dependencies = [
  "cookie_store 0.21.1",
  "cpal",
  "dirs",
+ "flate2",
  "futures-util",
  "image",
  "keyring",

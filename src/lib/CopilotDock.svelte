@@ -414,6 +414,7 @@
   .cd-dot[data-kind="files"] { background: #0891b2; box-shadow: 0 0 0 3px rgba(8,145,178,0.16); }
   .cd-dot[data-kind="home"] { background: #475569; box-shadow: 0 0 0 3px rgba(71,85,105,0.16); }
   .cd-dot[data-kind="detective"] { background: #b91c1c; box-shadow: 0 0 0 3px rgba(185,28,28,0.16); }
+  .cd-dot[data-kind="paper-check"] { background: #173b68; box-shadow: 0 0 0 3px rgba(23,59,104,0.16); }
 
   .cd-tab-title {
     flex: 1 1 auto;

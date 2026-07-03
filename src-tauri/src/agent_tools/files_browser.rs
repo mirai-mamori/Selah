@@ -158,14 +158,16 @@ fn read_utf8ish_file(path: &Path, max_bytes: usize) -> Result<String, String> {
     Ok(String::from_utf8_lossy(&bytes).to_string())
 }
 
-fn extract_pdf_text(path: &Path) -> Result<String, String> {
+/// `max_pages == usize::MAX` reads the whole document (paper-check needs the
+/// full text; silently truncating a thesis would skip everything past the cap).
+fn extract_pdf_text_pages(path: &Path, max_pages: usize) -> Result<String, String> {
     let doc = lopdf::Document::load(path).map_err(|e| format!("PDF読み込み失敗: {}", e))?;
     let pages = doc.get_pages();
     if pages.is_empty() {
         return Err("PDFにページがありません".into());
     }
     let mut out = String::new();
-    for page_num in pages.keys().take(20) {
+    for page_num in pages.keys().take(max_pages) {
         match doc.extract_text(&[*page_num]) {
             Ok(text) => {
                 if !text.trim().is_empty() {
@@ -396,9 +398,19 @@ fn extract_zipped_office_text(
 }
 
 pub(super) fn read_supported_download_file(path: &Path) -> Result<String, String> {
+    read_supported_download_file_impl(path, 20)
+}
+
+/// Full-document variant (no PDF page cap) for surfaces that must see the
+/// entire file, e.g. the paper checker.
+pub(super) fn read_supported_download_file_full(path: &Path) -> Result<String, String> {
+    read_supported_download_file_impl(path, usize::MAX)
+}
+
+fn read_supported_download_file_impl(path: &Path, pdf_page_cap: usize) -> Result<String, String> {
     let ext = file_extension_lower(path);
     match ext.as_str() {
-        "pdf" => extract_pdf_text(path),
+        "pdf" => extract_pdf_text_pages(path, pdf_page_cap),
         "docx" => extract_docx_text(path),
         "pptx" => extract_zipped_office_text(path, &["ppt/slides/"], "PPTX"),
         "xlsx" => {

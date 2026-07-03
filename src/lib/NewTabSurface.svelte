@@ -67,6 +67,18 @@
       busy = false;
     }
   }
+
+  async function openPaperCheck(): Promise<void> {
+    if (busy) return;
+    busy = true;
+    try {
+      await invoke("open_paper_check_tab");
+      if (tabTarget) await invoke("document_tabs_close", { owner: tabOwner, id: tabTarget }).catch(() => {});
+    } catch (e) {
+      console.error("[Selah] open paper check failed:", e);
+      busy = false;
+    }
+  }
   let inputEl = $state<HTMLInputElement | null>(null);
   let allFiles = $state<FileRecord[]>([]);
 
@@ -281,9 +293,9 @@
       {/each}
     </section>
 
-    {#if detectiveOn}
-      <section class="links" aria-label="アプリ">
-        <div class="section-label">アプリ</div>
+    <section class="links" aria-label="アプリ">
+      <div class="section-label">アプリ</div>
+      {#if detectiveOn}
         <button class="link-tile det-tile" type="button" title="なるほど —— 講義の矛盾を暴く" disabled={busy} onclick={openDetective}>
           <img class="det-tile-logo" src="/naruhodo.png" alt="" aria-hidden="true" draggable="false" />
           <span class="det-tile-text">
@@ -291,8 +303,12 @@
             <span class="link-hint">講義の矛盾を暴く</span>
           </span>
         </button>
-      </section>
-    {/if}
+      {/if}
+      <button class="link-tile" type="button" title="論文チェック —— AI率・重複を検査" disabled={busy} onclick={openPaperCheck}>
+        <span class="link-label">論文チェック</span>
+        <span class="link-hint">AI率・重複を検査</span>
+      </button>
+    </section>
 
     {#if bookmarks.length}
       <section class="bookmarks" aria-label="ブックマーク">

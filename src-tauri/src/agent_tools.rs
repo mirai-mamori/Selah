@@ -62,6 +62,12 @@ pub(crate) fn read_downloaded_text(path: &std::path::Path) -> Result<String, Str
     files_browser::read_supported_download_file(path)
 }
 
+/// Full-document extraction (no PDF page cap) — used by the paper checker,
+/// which must analyse the whole file rather than an agent-sized excerpt.
+pub(crate) fn read_downloaded_text_full(path: &std::path::Path) -> Result<String, String> {
+    files_browser::read_supported_download_file_full(path)
+}
+
 /// Embedded page images for a scanned PDF whose text layer is empty, so a
 /// vision model can still read it. Errors for non-PDF or image-free files.
 pub(crate) fn read_downloaded_images(
