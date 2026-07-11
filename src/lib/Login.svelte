@@ -2,6 +2,7 @@
   import { openLoginWindow, setAuthFromSession, startBackgroundPolling, enterDemoMode } from "./api";
   import { authState } from "./stores";
   import { listen } from "@tauri-apps/api/event";
+  import { getCurrentWindow } from "@tauri-apps/api/window";
   import { onMount, onDestroy } from "svelte";
   import selahLogoUrl from "../assets/logo.png";
 
@@ -15,6 +16,12 @@
   const DEMO_TAPS = 7;
   const DEMO_TAP_WINDOW = 3000;
   let showDemoConfirm = $state(false);
+  const isWindows = navigator.userAgent.includes("Windows");
+  const appWindow = getCurrentWindow();
+
+  function minimizeWindow() { appWindow.minimize(); }
+  function toggleMaximize() { appWindow.toggleMaximize(); }
+  function closeWindow() { appWindow.close(); }
 
   function handleLogoClick() {
     logoTapCount++;
@@ -90,6 +97,20 @@
 </script>
 
 <div class="login-container">
+  {#if isWindows}
+    <div class="login-drag-region" data-tauri-drag-region aria-hidden="true"></div>
+    <div class="login-window-controls" aria-label="ウィンドウ操作">
+      <button class="login-win-ctrl" type="button" onclick={minimizeWindow} title="最小化" aria-label="最小化">
+        <svg width="10" height="1" viewBox="0 0 10 1"><line x1="0" y1="0.5" x2="10" y2="0.5" stroke="currentColor" stroke-width="1" /></svg>
+      </button>
+      <button class="login-win-ctrl" type="button" onclick={toggleMaximize} title="最大化" aria-label="最大化">
+        <svg width="10" height="10" viewBox="0 0 10 10"><rect x="0.5" y="0.5" width="9" height="9" stroke="currentColor" stroke-width="1" fill="none" /></svg>
+      </button>
+      <button class="login-win-ctrl login-win-close" type="button" onclick={closeWindow} title="閉じる" aria-label="閉じる">
+        <svg width="10" height="10" viewBox="0 0 10 10"><line x1="1" y1="1" x2="9" y2="9" stroke="currentColor" stroke-width="1.2" /><line x1="9" y1="1" x2="1" y2="9" stroke="currentColor" stroke-width="1.2" /></svg>
+      </button>
+    </div>
+  {/if}
   <div class="login-card">
     <div class="login-header">
       <button type="button" class="login-logo" aria-label="Selah" onclick={handleLogoClick}><img src={selahLogoUrl} alt="Selah" /></button>
@@ -145,12 +166,56 @@
 
 <style>
   .login-container {
+    position: relative;
     display: flex;
     align-items: center;
     justify-content: center;
     height: 100%;
     padding: 20px;
     background: var(--bg-secondary);
+  }
+
+  .login-window-controls {
+    position: absolute;
+    top: 10px;
+    right: 12px;
+    z-index: 10;
+    display: flex;
+    align-items: center;
+  }
+
+  .login-drag-region {
+    position: absolute;
+    top: 0;
+    left: 0;
+    right: 132px;
+    height: 46px;
+    z-index: 9;
+  }
+
+  .login-win-ctrl {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    width: 36px;
+    height: 30px;
+    padding: 0;
+    border: none;
+    border-radius: 4px;
+    background: transparent;
+    color: var(--text-secondary);
+    cursor: pointer;
+    transition: background 0.12s, color 0.12s;
+  }
+
+  .login-win-ctrl:hover {
+    background: var(--bg-hover);
+    color: var(--text-primary);
+  }
+
+  .login-win-close:hover {
+    background: #e81123;
+    color: #fff;
   }
 
   .login-card {

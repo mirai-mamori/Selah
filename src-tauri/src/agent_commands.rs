@@ -186,8 +186,11 @@ pub fn agent_cancel(conv_id: String) {
     agent::cancel(&conv_id);
 }
 
+// Async so it runs off the event-loop thread: open_agent_workspace creates child
+// webviews, which deadlocks in a sync command on Windows (see
+// document_tabs::ensure_window).
 #[tauri::command]
-pub fn open_agent_popup(
+pub async fn open_agent_popup(
     app: AppHandle,
     owner_label: Option<String>,
     target: Option<String>,
@@ -250,7 +253,7 @@ pub fn agent_rename_conversation(
 }
 
 /// Minimal UUIDv4 generator (no new dependency).  Uses `rand` (already a
-/// transitive dep via llama-cpp-2 features).
+/// transitive dependency of the macOS llama-cpp-2 backend.
 fn uuid_v4() -> String {
     use rand::RngCore;
     let mut bytes = [0u8; 16];

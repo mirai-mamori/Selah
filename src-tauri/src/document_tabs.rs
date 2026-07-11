@@ -66,6 +66,18 @@ static AGENT_PANEL_RATIO_BPS: AtomicU32 = AtomicU32::new(DEFAULT_AGENT_PANEL_RAT
 static FORCE_CLOSE: AtomicBool = AtomicBool::new(false);
 static DOCUMENT_WINDOWS: LazyLock<Mutex<HashMap<String, DocumentWindowState>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
+// Event-loop thread id, recorded at setup. Webview creation must be deferred to
+// a background thread when running on it (see note on ensure_window).
+static MAIN_THREAD_ID: std::sync::OnceLock<std::thread::ThreadId> = std::sync::OnceLock::new();
+
+/// Record the event-loop (main) thread. Called once from setup.
+pub fn record_main_thread() {
+    let _ = MAIN_THREAD_ID.set(std::thread::current().id());
+}
+
+fn on_main_thread() -> bool {
+    MAIN_THREAD_ID.get() == Some(&std::thread::current().id())
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -496,6 +508,13 @@ pub fn active_view_panes(app: &tauri::AppHandle, owner: &str) -> Vec<String> {
         .collect()
 }
 
+// Creating child webviews (`Window::add_child`) must never run on the event-loop
+// (main) thread on Windows: the creation is posted back to the event loop and the
+// caller blocks until it completes, so a synchronous #[tauri::command] — which
+// executes on that very thread — deadlocks the entire app. Every command that can
+// reach ensure_window / open_tab / open_agent_panel is therefore `async` (async
+// commands run on the tokio pool), and main-thread callbacks defer creation to a
+// background thread instead.
 fn ensure_window(app: &tauri::AppHandle, owner: &str) -> Result<tauri::Window, String> {
     if let Some(window) = app.get_window(owner) {
         if AGENT_PANEL_OPEN.load(Ordering::Relaxed) && app.get_webview(AGENT_PANEL_LABEL).is_none()
@@ -1149,7 +1168,9 @@ fn open_tab(
     let app_for_popup = app.clone();
     builder = builder.on_new_window(move |popup_url, _features| {
         let app_for_open = app_for_popup.clone();
-        let _ = app_for_popup.run_on_main_thread(move || {
+        // This callback runs on the event-loop thread; opening the tab there
+        // would deadlock on Windows (see note on ensure_window).
+        std::thread::spawn(move || {
             let _ = open_external_tab(&app_for_open, popup_url.to_string(), None);
         });
         tauri::webview::NewWindowResponse::Deny
@@ -1301,6 +1322,26 @@ fn split_divider_url(owner: &str, parent_target: &str, index: usize) -> String {
     )
 }
 
+fn add_split_divider_webview(
+    window: &tauri::Window,
+    owner: &str,
+    parent_target: &str,
+    index: usize,
+) -> Result<(), String> {
+    let target = split_divider_target(parent_target, index);
+    let url = split_divider_url(owner, parent_target, index);
+    let builder = tauri::webview::WebviewBuilder::new(&target, tauri::WebviewUrl::App(url.into()))
+        .background_throttling(tauri::utils::config::BackgroundThrottlingPolicy::Disabled);
+    window
+        .add_child(
+            builder,
+            tauri::Position::Logical(tauri::LogicalPosition::new(OFFSCREEN_X, TAB_STRIP_HEIGHT)),
+            tauri::Size::Logical(tauri::LogicalSize::new(SPLIT_DIVIDER_WIDTH, 120.0)),
+        )
+        .map(|_| ())
+        .map_err(|e| format!("分割バー作成失敗: {}", e))
+}
+
 fn ensure_split_divider_webview(
     app: &tauri::AppHandle,
     window: &tauri::Window,
@@ -1310,20 +1351,28 @@ fn ensure_split_divider_webview(
 ) -> Result<String, String> {
     let target = split_divider_target(parent_target, index);
     if app.get_webview(&target).is_none() {
-        let url = split_divider_url(owner, parent_target, index);
-        let builder =
-            tauri::webview::WebviewBuilder::new(&target, tauri::WebviewUrl::App(url.into()))
-                .background_throttling(tauri::utils::config::BackgroundThrottlingPolicy::Disabled);
-        window
-            .add_child(
-                builder,
-                tauri::Position::Logical(tauri::LogicalPosition::new(
-                    OFFSCREEN_X,
-                    TAB_STRIP_HEIGHT,
-                )),
-                tauri::Size::Logical(tauri::LogicalSize::new(SPLIT_DIVIDER_WIDTH, 120.0)),
-            )
-            .map_err(|e| format!("分割バー作成失敗: {}", e))?;
+        if on_main_thread() {
+            // add_child would deadlock here (see note on ensure_window): create
+            // the divider from a background thread and re-run the layout once it
+            // exists so it gets positioned.
+            let app = app.clone();
+            let window = window.clone();
+            let owner = owner.to_string();
+            let parent_target = parent_target.to_string();
+            std::thread::spawn(move || {
+                if app
+                    .get_webview(&split_divider_target(&parent_target, index))
+                    .is_some()
+                {
+                    return;
+                }
+                if add_split_divider_webview(&window, &owner, &parent_target, index).is_ok() {
+                    let _ = resize_current_for_owner(&app, &owner);
+                }
+            });
+        } else {
+            add_split_divider_webview(window, owner, parent_target, index)?;
+        }
     }
     Ok(target)
 }
@@ -1816,7 +1865,7 @@ pub fn document_tabs_report_probe(report: DocumentTabProbeReport) {
 }
 
 #[tauri::command]
-pub fn document_tabs_activate(
+pub async fn document_tabs_activate(
     app: tauri::AppHandle,
     owner: Option<String>,
     id: String,
@@ -1827,7 +1876,7 @@ pub fn document_tabs_activate(
 /// Bring the Copilot window to front (showing it if hidden) and, if an id is
 /// given, activate that tab. Used by the sidebar Copilot dock in the main window.
 #[tauri::command]
-pub fn document_tabs_reveal(
+pub async fn document_tabs_reveal(
     app: tauri::AppHandle,
     owner: Option<String>,
     id: Option<String>,
@@ -1846,7 +1895,7 @@ pub fn document_tabs_reveal(
 }
 
 #[tauri::command]
-pub fn document_tabs_close(
+pub async fn document_tabs_close(
     app: tauri::AppHandle,
     owner: Option<String>,
     id: String,
@@ -1916,7 +1965,7 @@ pub fn document_tabs_close(
 }
 
 #[tauri::command]
-pub fn document_tabs_new_tab(app: tauri::AppHandle) -> Result<DocumentTabInfo, String> {
+pub async fn document_tabs_new_tab(app: tauri::AppHandle) -> Result<DocumentTabInfo, String> {
     open_new_tab(&app)
 }
 
@@ -1948,7 +1997,7 @@ pub fn document_tabs_reorder(
 }
 
 #[tauri::command]
-pub fn document_tabs_close_split(
+pub async fn document_tabs_close_split(
     app: tauri::AppHandle,
     owner: Option<String>,
     parent: Option<String>,
@@ -1966,7 +2015,7 @@ pub fn document_tabs_close_split(
 /// Close one split pane (identified by its webview target) and any panes nested
 /// below it, leaving the rest of the split intact.
 #[tauri::command]
-pub fn document_tabs_close_pane(
+pub async fn document_tabs_close_pane(
     app: tauri::AppHandle,
     owner: Option<String>,
     target: String,
@@ -2187,7 +2236,7 @@ pub async fn document_tabs_open_bookmark(
 }
 
 #[tauri::command]
-pub fn document_tabs_open_agent(
+pub async fn document_tabs_open_agent(
     app: tauri::AppHandle,
     _owner: Option<String>,
 ) -> Result<(), String> {

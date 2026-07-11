@@ -39,6 +39,8 @@ unsafe impl Sync for SendSyncDtm {}
 #[cfg(target_os = "windows")]
 static WINDOWS_SHARE_HANDLER: std::sync::LazyLock<std::sync::Mutex<Option<SendSyncDtm>>> =
     std::sync::LazyLock::new(|| std::sync::Mutex::new(None));
+#[cfg(target_os = "windows")]
+static WINDOWS_SHARE_RO_INIT: std::sync::Once = std::sync::Once::new();
 
 fn load_json_config<T: Default + DeserializeOwned>(path: &std::path::Path) -> T {
     if path.exists() {
@@ -498,7 +500,7 @@ pub async fn share_image_native(
         .map_err(|e| format!("一時ディレクトリの作成に失敗: {}", e))?;
     let tmp_path = tmp_dir.join(&file_name);
     std::fs::write(&tmp_path, &data).map_err(|e| format!("一時ファイルの書き込みに失敗: {}", e))?;
-    let result = share_file_path_native(&app, &tmp_path, &file_name);
+    let result = share_file_path_native(app, tmp_path.clone(), file_name).await;
 
     // Keep the file around long enough for slower share targets to read it.
     let cleanup_path = tmp_path.clone();
@@ -512,15 +514,24 @@ pub async fn share_image_native(
     result
 }
 
-pub(crate) fn share_file_path_native(
-    app: &tauri::AppHandle,
-    path: &std::path::Path,
-    file_name: &str,
+pub(crate) async fn share_file_path_native(
+    app: tauri::AppHandle,
+    path: std::path::PathBuf,
+    file_name: String,
 ) -> Result<(), String> {
-    share_file_paths_native(app, &[(path.to_path_buf(), file_name.to_string())])
+    share_file_paths_native(app, vec![(path, file_name)]).await
 }
 
-pub(crate) fn share_file_paths_native(
+pub(crate) async fn share_file_paths_native(
+    app: tauri::AppHandle,
+    files: Vec<(std::path::PathBuf, String)>,
+) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || share_file_paths_native_blocking(&app, &files))
+        .await
+        .map_err(|e| format!("Native share task failed: {e}"))?
+}
+
+fn share_file_paths_native_blocking(
     app: &tauri::AppHandle,
     files: &[(std::path::PathBuf, String)],
 ) -> Result<(), String> {
@@ -589,7 +600,9 @@ fn open_windows_file_share_picker(
     app.run_on_main_thread(move || {
         let result: Result<(), String> = (|| {
             let hwnd = HWND(hwnd_raw as *mut std::ffi::c_void);
-            let _ = unsafe { RoInitialize(RO_INIT_MULTITHREADED) };
+            WINDOWS_SHARE_RO_INIT.call_once(|| {
+                let _ = unsafe { RoInitialize(RO_INIT_MULTITHREADED) };
+            });
 
             let title_for_handler = title.clone();
             let files_for_handler = share_files.clone();

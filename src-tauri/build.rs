@@ -1,145 +1,15 @@
-use std::env;
-use std::ffi::OsStr;
-use std::fs;
-use std::path::{Path, PathBuf};
-
-const DIRECTML_RUNTIME_FILES: &[&str] = &[
-    "sherpa-onnx-c-api.dll",
-    "onnxruntime.dll",
-    "onnxruntime_providers_shared.dll",
-    "DirectML.dll",
-];
-
-const DIRECTML_STAGED_DLLS: &[&str] = &[
-    "sherpa-onnx-c-api.dll",
-    "sherpa-onnx-cxx-api.dll",
-    "onnxruntime.dll",
-    "onnxruntime_providers_shared.dll",
-    "DirectML.dll",
-    "DirectML.Debug.dll",
-];
-
 fn main() {
-    println!("cargo:rerun-if-env-changed=SELAH_ENABLE_STT_DIRECTML");
-    println!("cargo:rerun-if-env-changed=SHERPA_ONNX_LIB_DIR");
-    println!("cargo:rerun-if-env-changed=SHERPA_ONNX_ARCHIVE_DIR");
+    #[cfg(target_os = "windows")]
+    {
+        embed_resource::compile_for_everything("windows-tests.rc", embed_resource::NONE)
+            .manifest_required()
+            .expect("failed to compile the Windows application manifest");
 
-    let runtime_dir = PathBuf::from("windows-runtime");
-    let _ = fs::create_dir_all(&runtime_dir);
-
-    let target_os = env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
-    let directml_requested = env::var("SELAH_ENABLE_STT_DIRECTML")
-        .map(|value| {
-            let value = value.trim();
-            value == "1" || value.eq_ignore_ascii_case("true")
-        })
-        .unwrap_or(false);
-
-    if target_os == "windows" {
-        if directml_requested {
-            match env::var_os("SHERPA_ONNX_LIB_DIR") {
-                Some(lib_dir) => {
-                    let lib_dir = PathBuf::from(lib_dir);
-                    println!("cargo:rerun-if-changed={}", lib_dir.display());
-                    match stage_directml_runtime(&lib_dir, &runtime_dir) {
-                        Ok(()) => {
-                            if let Some(profile_dir) = cargo_profile_dir() {
-                                if let Err(err) = stage_directml_runtime(&lib_dir, &profile_dir) {
-                                    println!("cargo:warning={err}");
-                                }
-                            }
-                            println!("cargo:rustc-env=SELAH_STT_DIRECTML_ENABLED=1");
-                        }
-                        Err(err) => {
-                            println!("cargo:warning={err}");
-                        }
-                    }
-                }
-                None => {
-                    clear_staged_runtime_dlls(&runtime_dir);
-                    if env::var_os("SHERPA_ONNX_ARCHIVE_DIR").is_some() {
-                        println!(
-                            "cargo:warning=SELAH_ENABLE_STT_DIRECTML is set, but SHERPA_ONNX_LIB_DIR is required so the DirectML runtime DLLs can be staged for packaging"
-                        );
-                    } else {
-                        println!(
-                            "cargo:warning=SELAH_ENABLE_STT_DIRECTML is set, but SHERPA_ONNX_LIB_DIR was not provided"
-                        );
-                    }
-                }
-            }
-        } else {
-            clear_staged_runtime_dlls(&runtime_dir);
-        }
+        let windows = tauri_build::WindowsAttributes::new_without_app_manifest();
+        tauri_build::try_build(tauri_build::Attributes::new().windows_attributes(windows))
+            .expect("failed to build the Tauri Windows resources");
     }
 
-    tauri_build::build()
-}
-
-fn stage_directml_runtime(lib_dir: &Path, runtime_dir: &Path) -> Result<(), String> {
-    if !lib_dir.is_dir() {
-        return Err(format!(
-            "SHERPA_ONNX_LIB_DIR does not exist or is not a directory: {}",
-            lib_dir.display()
-        ));
-    }
-
-    let same_dir = canonical_or_original(lib_dir) == canonical_or_original(runtime_dir);
-    if !same_dir {
-        clear_staged_runtime_dlls(runtime_dir);
-        for entry in fs::read_dir(lib_dir)
-            .map_err(|e| format!("Failed to read {}: {}", lib_dir.display(), e))?
-        {
-            let entry =
-                entry.map_err(|e| format!("Failed to inspect {}: {}", lib_dir.display(), e))?;
-            let path = entry.path();
-            if path.extension() != Some(OsStr::new("dll")) {
-                continue;
-            }
-
-            let file_name = entry.file_name();
-            let destination = runtime_dir.join(file_name);
-            fs::copy(&path, &destination).map_err(|e| {
-                format!(
-                    "Failed to copy DirectML runtime DLL from {} to {}: {}",
-                    path.display(),
-                    destination.display(),
-                    e
-                )
-            })?;
-        }
-    }
-
-    let missing: Vec<&str> = DIRECTML_RUNTIME_FILES
-        .iter()
-        .copied()
-        .filter(|name| !runtime_dir.join(name).is_file())
-        .collect();
-    if !missing.is_empty() {
-        return Err(format!(
-            "DirectML runtime staging is incomplete; missing {} in {}",
-            missing.join(", "),
-            runtime_dir.display()
-        ));
-    }
-
-    Ok(())
-}
-
-fn clear_staged_runtime_dlls(runtime_dir: &Path) {
-    for name in DIRECTML_STAGED_DLLS {
-        let _ = fs::remove_file(runtime_dir.join(name));
-    }
-}
-
-fn canonical_or_original(path: &Path) -> PathBuf {
-    fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
-}
-
-fn cargo_profile_dir() -> Option<PathBuf> {
-    let mut dir = PathBuf::from(env::var_os("OUT_DIR")?);
-    dir.pop(); // out
-    dir.pop(); // <package>-<hash>
-    dir.pop(); // build
-    Some(dir)
+    #[cfg(not(target_os = "windows"))]
+    tauri_build::build();
 }

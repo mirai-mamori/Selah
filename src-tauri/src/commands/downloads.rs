@@ -805,18 +805,21 @@ pub fn open_downloaded_file_external(app: tauri::AppHandle, path: String) -> Res
 /// Share a downloaded/material file through the native OS share surface. The
 /// path is restricted to the same managed download roots used by file opening.
 #[tauri::command]
-pub fn share_downloaded_file_native(app: tauri::AppHandle, path: String) -> Result<(), String> {
+pub async fn share_downloaded_file_native(
+    app: tauri::AppHandle,
+    path: String,
+) -> Result<(), String> {
     let canonical = validate_downloads_path(&path)?;
     let file_name = canonical
         .file_name()
         .and_then(|n| n.to_str())
         .unwrap_or("Markdown")
         .to_string();
-    super::app_config::share_file_path_native(&app, &canonical, &file_name)
+    super::app_config::share_file_path_native(app, canonical, file_name).await
 }
 
 #[tauri::command]
-pub fn share_downloaded_files_native(
+pub async fn share_downloaded_files_native(
     app: tauri::AppHandle,
     paths: Vec<String>,
 ) -> Result<(), String> {
@@ -833,7 +836,7 @@ pub fn share_downloaded_files_native(
             .to_string();
         files.push((canonical, file_name));
     }
-    super::app_config::share_file_paths_native(&app, &files)
+    super::app_config::share_file_paths_native(app, files).await
 }
 
 /// Max size of a markdown file the in-app reader will load. Larger files are

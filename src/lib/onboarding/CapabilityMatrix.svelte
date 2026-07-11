@@ -1,7 +1,6 @@
 <script lang="ts">
   import { onMount, onDestroy } from "svelte";
-  import { get } from "svelte/store";
-  import { activeTab, detectiveEnabled } from "../stores";
+  import { activeTab } from "../stores";
   import { reopenOnboarding } from "./onboardingState";
   import { getAiReadinessLabel, isSttReady } from "./onboardingChecks";
   import { listen } from "@tauri-apps/api/event";
@@ -18,7 +17,6 @@
   let chips = $state<Chip[]>([]);
   let loading = $state(true);
   let unlisten: (() => void) | null = null;
-  let unsubscribeDetective: (() => void) | null = null;
 
   async function compute() {
     const [{ ready: aiReady, note: aiNote }, sttReady] = await Promise.all([
@@ -31,14 +29,9 @@
     const liveStatus: Status = sttReady ? "ok" : "warn";
     const liveTitle = sttReady ? "利用可能" : "STT モデル未ダウンロード";
 
-    const detEnabled = get(detectiveEnabled);
-    const detReady = aiReady && detEnabled;
-    const detStatus: Status = detReady ? "ok" : "warn";
-    const detTitle = !detEnabled
-      ? "無効化中（設定で有効化）"
-      : !aiReady
-        ? `AI 機能が無効のため利用不可（${aiNote}）`
-        : "利用可能";
+    const detReady = aiReady;
+    const detStatus = aiStatus;
+    const detTitle = aiTitle;
 
     chips = [
       { key: "agent", label: "Agent", status: aiStatus, title: aiTitle,
@@ -59,14 +52,11 @@
 
   onMount(async () => {
     void compute();
-    // Re-compute when the detective toggle changes (subscribe fires once
-    // immediately too — harmless, just re-renders with same state).
-    unsubscribeDetective = detectiveEnabled.subscribe(() => { void compute(); });
     try {
       unlisten = await listen("ai-config-changed", () => { void compute(); });
     } catch { /* ignore */ }
   });
-  onDestroy(() => { unlisten?.(); unsubscribeDetective?.(); });
+  onDestroy(() => { unlisten?.(); });
 </script>
 
 <div class="card-label">AI 機能の状態</div>

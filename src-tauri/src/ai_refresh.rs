@@ -650,6 +650,12 @@ fn ai_unavailable_reason(config: &AiConfig) -> Option<String> {
         return Some("AI機能が無効です".to_string());
     }
     if config.provider == "local" {
+        #[cfg(not(target_os = "macos"))]
+        {
+            return Some("本地模型仅在 macOS 版本中可用".to_string());
+        }
+        #[cfg(target_os = "macos")]
+        {
         if config.local_model == "qwen3.5-2b" {
             return Some("2Bモデルでは定期AI分析を実行しません".to_string());
         }
@@ -664,6 +670,7 @@ fn ai_unavailable_reason(config: &AiConfig) -> Option<String> {
         };
         if !crate::local_ai::is_model_downloaded(&info.file_name) {
             return Some("ローカルAIモデルが未ダウンロードです".to_string());
+        }
         }
     } else if config.api_key.trim().is_empty() {
         return Some("AI APIキーが未設定です".to_string());

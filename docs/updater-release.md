@@ -35,6 +35,7 @@ Selah のアプリ内更新は Tauri v2 updater と GitHub Releases の `latest.
 - `Selah_universal.app.tar.gz`
 - macOS updater signature: `*.app.tar.gz.sig`
 - Windows installer: `Selah_<version>_x64-setup.exe`
+- Windows ARM64 installer: `Selah_<version>_arm64-setup.exe`
 - Windows updater signature: `*-setup.exe.sig`
 
 `latest.json` には少なくとも以下の platform が必要です。
@@ -45,6 +46,8 @@ Selah のアプリ内更新は Tauri v2 updater と GitHub Releases の `latest.
 - `darwin-x86_64-app`
 - `windows-x86_64`
 - `windows-x86_64-nsis`
+- `windows-aarch64`
+- `windows-aarch64-nsis`
 
 ## よくある事故
 

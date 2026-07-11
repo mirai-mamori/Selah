@@ -20,7 +20,7 @@ Selah の技術的なアーキテクチャの概要です。
 |  | HTTP Client (reqwest)              |  |
 |  | HTML Parser (scraper)              |  |
 |  | SQLite (rusqlite, WAL)             |  |
-|  | AI Client (local llama-cpp-2 /     |  |
+|  | AI Client (macOS local llama-cpp / |  |
 |  |            OpenAI / Gemini)        |  |
 |  | STT (sherpa-onnx + SenseVoice)     |  |
 |  +------------------------------------+  |

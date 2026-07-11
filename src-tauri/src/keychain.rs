@@ -184,14 +184,6 @@ pub fn reapply_storage_policy() {
 // ---- Windows credential store (plain; no biometric equivalent wired) ------
 
 #[cfg(target_os = "windows")]
-fn kc_get(service: &str, account: &str) -> Option<String> {
-    keyring::Entry::new(service, account)
-        .ok()?
-        .get_password()
-        .ok()
-}
-
-#[cfg(target_os = "windows")]
 fn kc_set(service: &str, account: &str, value: &str) -> Result<(), String> {
     keyring::Entry::new(service, account)
         .map_err(|e| format!("Keychain entry error: {}", e))?
@@ -209,6 +201,7 @@ fn kc_set(service: &str, account: &str, value: &str) -> Result<(), String> {
 // which AMFI rejects at exec for a Developer ID build with no provisioning
 // profile — the app gets SIGKILLed on launch. Not viable for this distribution.
 
+#[cfg(target_os = "macos")]
 const ERR_SEC_ITEM_NOT_FOUND: i32 = -25300;
 
 #[cfg(target_os = "macos")]
@@ -250,9 +243,28 @@ fn bundle_kc_delete() {
 
 #[cfg(target_os = "windows")]
 fn bundle_kc_read() -> BundleRead {
-    match kc_get(SERVICE, BUNDLE_ACCOUNT) {
-        Some(json) => BundleRead::Found(json),
-        None => BundleRead::NotFound,
+    let entry = match keyring::Entry::new(SERVICE, BUNDLE_ACCOUNT) {
+        Ok(entry) => entry,
+        Err(error) => {
+            log::warn!("[keychain] Windows credential entry failed: {error}");
+            return BundleRead::Failed;
+        }
+    };
+
+    classify_windows_credential_read(entry.get_password())
+}
+
+#[cfg(target_os = "windows")]
+fn classify_windows_credential_read(
+    result: Result<String, keyring::Error>,
+) -> BundleRead {
+    match result {
+        Ok(json) => BundleRead::Found(json),
+        Err(keyring::Error::NoEntry) => BundleRead::NotFound,
+        Err(error) => {
+            log::warn!("[keychain] Windows credential read failed: {error}");
+            BundleRead::Failed
+        }
     }
 }
 
@@ -265,6 +277,28 @@ fn bundle_kc_write(json: &str) -> Result<(), String> {
 fn bundle_kc_delete() {
     if let Ok(entry) = keyring::Entry::new(SERVICE, BUNDLE_ACCOUNT) {
         let _ = entry.delete_credential();
+    }
+}
+
+#[cfg(all(test, target_os = "windows"))]
+mod windows_credential_tests {
+    use super::{classify_windows_credential_read, BundleRead};
+
+    #[test]
+    fn distinguishes_missing_credential_from_read_failure() {
+        assert!(matches!(
+            classify_windows_credential_read(Err(keyring::Error::NoEntry)),
+            BundleRead::NotFound
+        ));
+
+        let platform_error = keyring::Error::PlatformFailure(Box::new(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "credential store denied access",
+        )));
+        assert!(matches!(
+            classify_windows_credential_read(Err(platform_error)),
+            BundleRead::Failed
+        ));
     }
 }
 

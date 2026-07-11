@@ -1,7 +1,7 @@
 //! Provider abstraction for the Selah agent.
 //!
 //! Two concrete variants:
-//!   - **Local**: runs Qwen 3.5 2B/4B via llama-cpp-2 (blocking, on-device).
+//!   - **Local (macOS)**: runs Qwen 3.5 2B/4B via llama-cpp-2 (blocking, on-device).
 //!   - **Remote**: calls any OpenAI-compatible or Gemini API (SSE streaming).
 //!
 //! The agent pipeline (`agent.rs`) talks only to the `AgentProvider` enum,
@@ -10,6 +10,7 @@
 use crate::agent_error::AgentError;
 use crate::agent_text;
 use crate::ai::{AiConfig, ChatMessage};
+#[cfg(target_os = "macos")]
 use crate::local_ai;
 
 use std::collections::HashSet;
@@ -70,6 +71,7 @@ fn collect_gemini_text_parts(parts: Option<&serde_json::Value>) -> String {
 
 /// Resolved provider ready to run inference.
 pub enum AgentProvider {
+    #[cfg(target_os = "macos")]
     Local { model_id: String, file_name: String },
     Remote { config: AiConfig },
 }
@@ -84,13 +86,19 @@ impl AgentProvider {
             ));
         }
         match cfg.provider.as_str() {
+            #[cfg(target_os = "macos")]
             "local" => Self::resolve_local(&cfg),
+            #[cfg(not(target_os = "macos"))]
+            "local" => Err(AgentError::config(
+                "本地模型仅在 macOS 版本中可用",
+            )),
             // OpenRouter is OpenAI-compatible, so it routes through the OpenAI path.
             "openai" | "openrouter" | "gemini" => Ok(Self::Remote { config: cfg }),
             other => Err(AgentError::config(format!("不明なプロバイダー: {}", other))),
         }
     }
 
+    #[cfg(target_os = "macos")]
     fn resolve_local(cfg: &AiConfig) -> Result<Self, AgentError> {
         let catalog = local_ai::model_catalog();
         let info = catalog
@@ -119,10 +127,14 @@ impl AgentProvider {
         think_budget_pct: u32,
         gen_id: &str,
     ) -> Result<String, AgentError> {
+        #[cfg(not(target_os = "macos"))]
+        let _ = (prefill, think_budget_pct);
+
         if Self::is_cancelled(gen_id) {
             return Err(AgentError::Cancelled);
         }
         match self {
+            #[cfg(target_os = "macos")]
             Self::Local {
                 model_id,
                 file_name,
@@ -185,6 +197,7 @@ impl AgentProvider {
             return Err(AgentError::Cancelled);
         }
         match self {
+            #[cfg(target_os = "macos")]
             Self::Local {
                 model_id,
                 file_name,
@@ -232,10 +245,12 @@ impl AgentProvider {
         if let Ok(mut set) = TURN_CANCEL.lock() {
             set.insert(gen_id.to_string());
         }
+        #[cfg(target_os = "macos")]
         local_ai::cancel_inference(gen_id);
         cancel_remote(gen_id);
         let plan_id = plan_gen_id(gen_id);
         if !plan_id.is_empty() {
+            #[cfg(target_os = "macos")]
             local_ai::cancel_inference(&plan_id);
             cancel_remote(&plan_id);
         }
@@ -245,10 +260,12 @@ impl AgentProvider {
         if let Ok(mut set) = TURN_CANCEL.lock() {
             set.remove(gen_id);
         }
+        #[cfg(target_os = "macos")]
         local_ai::clear_inference_cancel(gen_id);
         clear_remote_cancel(gen_id);
         let plan_id = plan_gen_id(gen_id);
         if !plan_id.is_empty() {
+            #[cfg(target_os = "macos")]
             local_ai::clear_inference_cancel(&plan_id);
             clear_remote_cancel(&plan_id);
         }
@@ -262,10 +279,17 @@ impl AgentProvider {
     }
 
     /// Whether the provider honours assistant prefill (used for Phase 1 JSON).
-    /// Local llama-cpp can literally prepend bytes to the assistant turn;
+    /// The macOS local llama backend can literally prepend bytes to the assistant turn;
     /// OpenAI/Gemini cannot, so the planner prompt must ask for a full object.
     pub fn supports_prefill(&self) -> bool {
-        matches!(self, Self::Local { .. })
+        #[cfg(target_os = "macos")]
+        {
+            return matches!(self, Self::Local { .. });
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            false
+        }
     }
 
     /// Whether to attempt sending images to this provider. On-device Qwen is

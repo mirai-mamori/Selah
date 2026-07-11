@@ -11,7 +11,12 @@ import https from "node:https";
 import crypto from "node:crypto";
 
 const MAC_PLATFORMS = ["darwin-aarch64", "darwin-x86_64", "darwin-aarch64-app", "darwin-x86_64-app"];
-const WINDOWS_PLATFORMS = ["windows-x86_64", "windows-x86_64-nsis"];
+const WINDOWS_PLATFORMS = [
+  "windows-x86_64",
+  "windows-x86_64-nsis",
+  "windows-aarch64",
+  "windows-aarch64-nsis",
+];
 const REQUIRED_PLATFORMS = [...MAC_PLATFORMS, ...WINDOWS_PLATFORMS];
 const TAURI_CONFIG_PATH = "src-tauri/tauri.conf.json";
 const ED25519_SPKI_PREFIX = Buffer.from("302a300506032b6570032100", "hex");

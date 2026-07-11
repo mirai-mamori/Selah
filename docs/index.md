@@ -181,7 +181,7 @@ Selah は個人開発のサードパーティデスクトップクライアン�
 | フロントエンド | Svelte 5 + TypeScript |
 | バックエンド | Rust |
 | ローカル DB | SQLite (WAL) |
-| AI | ローカル (llama-cpp-2 + Qwen) / OpenAI / Google Gemini |
+| AI | macOS: ローカル (llama-cpp-2 + Qwen) / Windows: OpenAI / Google Gemini |
 | 音声認識 | sherpa-onnx + SenseVoice (オンデバイス) |
 
 ---

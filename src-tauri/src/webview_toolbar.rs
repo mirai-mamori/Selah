@@ -1365,7 +1365,10 @@ pub fn create_browser_window(
     content_builder = content_builder.on_new_window(move |popup_url, _features| {
         let app_for_open = app_for_new_window.clone();
         let log_url = popup_url.to_string();
-        let _ = app_for_new_window.run_on_main_thread(move || {
+        // This callback runs on the event-loop thread; creating the popup's
+        // webviews there deadlocks on Windows (add_child blocks on the event
+        // loop), so hand the work to a background thread.
+        std::thread::spawn(move || {
             if let Err(err) = open_browser_popup_window(&app_for_open, popup_url) {
                 log::warn!(
                     "[browser] failed to open requested popup window url={}: {}",

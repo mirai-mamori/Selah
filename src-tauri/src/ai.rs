@@ -132,6 +132,10 @@ fn default_live_summary_interval_minutes() -> u32 {
 
 fn normalize_ai_config(config: &mut AiConfig) {
     config.live_summary_interval_minutes = config.live_summary_interval_minutes.max(5);
+    #[cfg(not(target_os = "macos"))]
+    if config.provider == "local" {
+        config.provider = "openai".into();
+    }
 }
 
 pub fn reply_language_hint<'a>(
@@ -394,6 +398,7 @@ async fn chat_completion(config: &AiConfig, messages: Vec<ChatMessage>) -> Resul
     }
 
     match config.provider.as_str() {
+        #[cfg(target_os = "macos")]
         "local" => {
             // Run local inference in a blocking thread
             let model_id = config.local_model.clone();
@@ -419,6 +424,8 @@ async fn chat_completion(config: &AiConfig, messages: Vec<ChatMessage>) -> Resul
             .await
             .map_err(|e| format!("タスク実行エラー: {}", e))?
         }
+        #[cfg(not(target_os = "macos"))]
+        "local" => Err("本地模型仅在 macOS 版本中可用".into()),
         "gemini" => call_gemini(config, messages).await,
         _ => call_openai(config, messages).await,
     }
@@ -635,11 +642,14 @@ pub fn save_ai_config(app: tauri::AppHandle, mut config: AiConfig) -> Result<(),
 
     // Validate based on provider
     match config.provider.as_str() {
+        #[cfg(target_os = "macos")]
         "local" => {
             if config.local_model.is_empty() {
                 return Err("ローカルモデルを選択してください".into());
             }
         }
+        #[cfg(not(target_os = "macos"))]
+        "local" => return Err("本地模型仅在 macOS 版本中可用".into()),
         "openai" | "openrouter" | "gemini" => {
             config.max_tokens = config.max_tokens.clamp(8192, 32768);
             if config.model.is_empty() {
@@ -657,6 +667,7 @@ pub fn save_ai_config(app: tauri::AppHandle, mut config: AiConfig) -> Result<(),
     }
 
     // If switching away from local, unload the model to free memory
+    #[cfg(target_os = "macos")]
     if config.provider != "local" {
         crate::local_ai::unload_model();
     }
@@ -693,6 +704,11 @@ pub async fn ai_test_connection() -> Result<String, String> {
 
 #[tauri::command]
 pub fn list_local_models() -> Vec<serde_json::Value> {
+    #[cfg(not(target_os = "macos"))]
+    return Vec::new();
+
+    #[cfg(target_os = "macos")]
+    {
     let catalog = crate::local_ai::model_catalog();
     catalog
         .iter()
@@ -708,10 +724,19 @@ pub fn list_local_models() -> Vec<serde_json::Value> {
             })
         })
         .collect()
+    }
 }
 
 #[tauri::command]
 pub async fn download_local_model(app: tauri::AppHandle, model_id: String) -> Result<(), String> {
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (app, model_id);
+        return Err("本地模型仅在 macOS 版本中可用".into());
+    }
+
+    #[cfg(target_os = "macos")]
+    {
     let catalog = crate::local_ai::model_catalog();
     let info = catalog
         .iter()
@@ -728,15 +753,27 @@ pub async fn download_local_model(app: tauri::AppHandle, model_id: String) -> Re
     // Model availability changed — notify frontend
     let _ = app.emit("ai-config-changed", ());
     Ok(())
+    }
 }
 
 #[tauri::command]
 pub fn cancel_model_download() {
+    #[cfg(not(target_os = "macos"))]
+    return;
+    #[cfg(target_os = "macos")]
     crate::local_ai::cancel_download();
 }
 
 #[tauri::command]
 pub fn delete_local_model(app: tauri::AppHandle, model_id: String) -> Result<(), String> {
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (app, model_id);
+        return Err("本地模型仅在 macOS 版本中可用".into());
+    }
+
+    #[cfg(target_os = "macos")]
+    {
     let catalog = crate::local_ai::model_catalog();
     let info = catalog
         .iter()
@@ -761,6 +798,7 @@ pub fn delete_local_model(app: tauri::AppHandle, model_id: String) -> Result<(),
     let _ = app.emit("ai-config-changed", ());
 
     Ok(())
+    }
 }
 
 /// Send a native notification.

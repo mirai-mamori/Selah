@@ -34,26 +34,6 @@ jobs:
           $version = node scripts/resolve-release-version.mjs
           node scripts/apply-version.mjs $version
 
-      - name: Install Vulkan SDK
-        run: choco install vulkan-sdk -y
-        shell: pwsh
-
-      - name: Set VULKAN_SDK env
-        shell: pwsh
-        run: |
-          $candidates = @("C:\VulkanSDK", "C:\Program Files\VulkanSDK", "C:\Program Files (x86)\VulkanSDK")
-          $sdk = $null
-          foreach ($base in $candidates) {
-            if (Test-Path $base) {
-              $sub = Get-ChildItem $base -ErrorAction SilentlyContinue | Sort-Object Name -Descending | Select-Object -First 1
-              if ($sub) { $sdk = $sub.FullName } else { $sdk = $base }
-              break
-            }
-          }
-          if (-not $sdk) { Write-Error "VulkanSDK not found"; exit 1 }
-          echo "VULKAN_SDK=$sdk" >> $env:GITHUB_ENV
-          if (Test-Path "$sdk\Bin") { echo "$sdk\Bin" >> $env:GITHUB_PATH }
-
       - name: Install frontend dependencies
         run: npm ci
         working-directory: s
@@ -85,92 +65,10 @@ jobs:
           echo "TMP=D:\tmp" >> $env:GITHUB_ENV
           echo "TEMP=D:\tmp" >> $env:GITHUB_ENV
 
-      - name: Clean cached llama-cpp build artifacts
-        shell: pwsh
-        run: |
-          if (Test-Path "s/src-tauri/target") {
-            Get-ChildItem "s/src-tauri/target" -Recurse -Directory -Filter "llama-cpp-sys-2-*" -ErrorAction SilentlyContinue |
-              ForEach-Object { Remove-Item $_.FullName -Recurse -Force -ErrorAction SilentlyContinue }
-          }
-          if (Test-Path "D:\t") {
-            Remove-Item "D:\t" -Recurse -Force -ErrorAction SilentlyContinue
-          }
-
       - name: Fetch Cargo dependencies
         working-directory: s/src-tauri
         run: cargo fetch --target x86_64-pc-windows-msvc
         shell: pwsh
-
-      - name: Patch llama.cpp to bypass vulkan-shaders-gen ExternalProject
-        shell: pwsh
-        run: |
-          $registryCacheRoot = "$env:USERPROFILE\.cargo\registry\cache"
-          $registrySrcRoot   = "$env:USERPROFILE\.cargo\registry\src"
-          $cacheIdx = Get-ChildItem $registryCacheRoot -Directory -ErrorAction SilentlyContinue | Select-Object -First 1
-          if (-not $cacheIdx) { Write-Error "No registry cache index directory found"; exit 1 }
-
-          $srcIdxPath = Join-Path $registrySrcRoot $cacheIdx.Name
-          New-Item -ItemType Directory -Path $srcIdxPath -Force | Out-Null
-          $crateDir = Get-ChildItem $srcIdxPath -Directory -Filter "llama-cpp-sys-2-*" -ErrorAction SilentlyContinue | Select-Object -First 1
-          if (-not $crateDir) {
-            $crateFile = Get-ChildItem $cacheIdx.FullName -Filter "llama-cpp-sys-2-*.crate" | Select-Object -First 1
-            if (-not $crateFile) { Write-Error "llama-cpp-sys-2 crate not found in cache"; exit 1 }
-            tar -xzf $crateFile.FullName -C $srcIdxPath
-            $crateDir = Get-ChildItem $srcIdxPath -Directory -Filter "llama-cpp-sys-2-*" | Select-Object -First 1
-            if (-not $crateDir) { Write-Error "Unpack did not produce a crate directory"; exit 1 }
-            New-Item -ItemType File -Path (Join-Path $crateDir.FullName ".cargo-ok") -Force | Out-Null
-          }
-
-          $cmakeFile = Join-Path $crateDir.FullName "llama.cpp\ggml\src\ggml-vulkan\CMakeLists.txt"
-          if (-not (Test-Path $cmakeFile)) { Write-Error "CMakeLists.txt not found at $cmakeFile"; exit 1 }
-          $lines = [System.IO.File]::ReadAllLines($cmakeFile)
-          if (($lines -join "`n") -match 'CI patch: use add_subdirectory') { exit 0 }
-
-          $startIdx = -1; $addStart = -1; $endIdx = -1
-          for ($i = 0; $i -lt $lines.Length; $i++) {
-            if ($startIdx -lt 0 -and $lines[$i] -match '^\s*include\(ExternalProject\)\s*$') { $startIdx = $i; continue }
-            if ($startIdx -ge 0 -and $addStart -lt 0 -and $lines[$i] -match '^\s*ExternalProject_Add\(') { $addStart = $i; continue }
-            if ($addStart -ge 0 -and $lines[$i] -match '^\s*\)\s*$') { $endIdx = $i; break }
-          }
-          if ($startIdx -lt 0 -or $addStart -lt 0 -or $endIdx -lt 0) {
-            Write-Error "Could not locate ExternalProject block"
-            exit 1
-          }
-
-          $replacement = @(
-            '    # CI patch: use add_subdirectory instead of ExternalProject_Add to avoid',
-            '    # MSBuild parallel scheduling race on vulkan-shaders-gen step stamps.',
-            '    foreach(_arg IN LISTS VULKAN_SHADER_GEN_CMAKE_ARGS)',
-            '        if(_arg MATCHES "^-D([^=]+)=(.*)$")',
-            '            set(${CMAKE_MATCH_1} ${CMAKE_MATCH_2})',
-            '        endif()',
-            '    endforeach()',
-            '    add_subdirectory(vulkan-shaders vulkan-shaders-gen-build)',
-            '    set_target_properties(vulkan-shaders-gen PROPERTIES',
-            '        RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/$<CONFIG>")'
-          )
-          $newLines = @()
-          if ($startIdx -gt 0) { $newLines += $lines[0..($startIdx-1)] }
-          $newLines += $replacement
-          if ($endIdx + 1 -le $lines.Length - 1) { $newLines += $lines[($endIdx+1)..($lines.Length-1)] }
-          [System.IO.File]::WriteAllLines($cmakeFile, $newLines)
-
-          $checksumFile = Join-Path $crateDir.FullName ".cargo-checksum.json"
-          if (Test-Path $checksumFile) {
-            $json = Get-Content $checksumFile -Raw | ConvertFrom-Json -AsHashtable
-            $relPath = "llama.cpp/ggml/src/ggml-vulkan/CMakeLists.txt"
-            $json.files[$relPath] = (Get-FileHash -Algorithm SHA256 -Path $cmakeFile).Hash.ToLower()
-            ($json | ConvertTo-Json -Depth 100 -Compress) | Set-Content -Path $checksumFile -NoNewline
-          }
-
-      - name: Build sherpa-onnx DirectML runtime
-        shell: pwsh
-        working-directory: s
-        run: |
-          .\scripts\build-windows-directml-runtime.ps1 `
-            -WorkRoot "D:\directml-runtime" `
-            -LibStageDir "D:\directml-runtime\lib" `
-            -RuntimeStageDir "$PWD\src-tauri\windows-runtime"
 
       - name: Build Tauri app (MS Store, no self-updater)
         shell: pwsh
@@ -181,17 +79,6 @@ jobs:
           CARGO_TARGET_DIR: D:/t
           CARGO_INCREMENTAL: 0
           CARGO_BUILD_JOBS: 1
-          CMAKE_BUILD_PARALLEL_LEVEL: 1
-          CMAKE_VS_GLOBALS: UseMultiToolTask=false;EnforceProcessCountAcrossBuilds=true;CL_MPCount=1
-          CMAKE_MSVC_DEBUG_INFORMATION_FORMAT: Embedded
-          GGML_CCACHE: OFF
-          LLAMA_STATIC_CRT: 1
-          CL: /FS
-          _CL_: /FS
-          CFLAGS: /FS
-          CXXFLAGS: /FS
-          SELAH_ENABLE_STT_DIRECTML: 1
-          SHERPA_ONNX_LIB_DIR: D:/directml-runtime/lib
         run: |
           npm run tauri build -- --target x86_64-pc-windows-msvc --no-bundle --no-default-features --features stt-shared,store-build --config tauri.msstore.conf.json
 

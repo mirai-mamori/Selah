@@ -8,7 +8,20 @@
 //! error, adjust the version in `Cargo.toml` to match `wry`'s dependency.
 
 use super::CookieData;
+use std::sync::{Arc, Mutex};
 use tauri::Manager;
+
+type CdpResultSender = Arc<Mutex<Option<tokio::sync::oneshot::Sender<Result<String, String>>>>>;
+
+fn complete_cdp_call(sender: &CdpResultSender, result: Result<String, String>) {
+    if let Some(sender) = sender
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .take()
+    {
+        let _ = sender.send(result);
+    }
+}
 
 // ── CDP JSON response structs ───────────────────────────────────────────────
 
@@ -47,21 +60,28 @@ pub(super) async fn extract_all_cookies(app: &tauri::AppHandle) -> Result<Vec<Co
         .ok_or("No webview window available for cookie extraction")?;
 
     let (tx, rx) = tokio::sync::oneshot::channel::<Result<String, String>>();
-    let tx = std::sync::Mutex::new(Some(tx));
+    let tx = Arc::new(Mutex::new(Some(tx)));
 
     win.with_webview(move |webview| {
         unsafe {
             use webview2_com::CallDevToolsProtocolMethodCompletedHandler;
 
-            let core_webview = webview
-                .controller()
-                .CoreWebView2()
-                .expect("CoreWebView2 must be available after SAML loading");
+            let core_webview = match webview.controller().CoreWebView2() {
+                Ok(core_webview) => core_webview,
+                Err(error) => {
+                    complete_cdp_call(
+                        &tx,
+                        Err(format!("CoreWebView2 is unavailable after SAML loading: {error}")),
+                    );
+                    return;
+                }
+            };
 
             // Build wide-string parameters for the CDP call.
             let method: Vec<u16> = "Network.getAllCookies\0".encode_utf16().collect();
             let params: Vec<u16> = "{}\0".encode_utf16().collect();
 
+            let handler_tx = tx.clone();
             let handler = CallDevToolsProtocolMethodCompletedHandler::create(Box::new(
                 move |error_code, return_json| {
                     let result = if error_code.is_ok() {
@@ -69,27 +89,29 @@ pub(super) async fn extract_all_cookies(app: &tauri::AppHandle) -> Result<Vec<Co
                     } else {
                         Err(format!("CDP call failed: {:?}", error_code))
                     };
-                    if let Some(sender) = tx.lock().unwrap_or_else(|e| e.into_inner()).take() {
-                        let _ = sender.send(result);
-                    }
+                    complete_cdp_call(&handler_tx, result);
                     Ok(())
                 },
             ));
 
             // PCWSTR from windows-core 0.61 matches webview2-com-sys 0.38's expected types.
-            core_webview
-                .CallDevToolsProtocolMethod(
-                    windows_core::PCWSTR(method.as_ptr()),
-                    windows_core::PCWSTR(params.as_ptr()),
-                    &handler,
-                )
-                .expect("CallDevToolsProtocolMethod dispatch failed");
+            if let Err(error) = core_webview.CallDevToolsProtocolMethod(
+                windows_core::PCWSTR(method.as_ptr()),
+                windows_core::PCWSTR(params.as_ptr()),
+                &handler,
+            ) {
+                complete_cdp_call(
+                    &tx,
+                    Err(format!("CallDevToolsProtocolMethod dispatch failed: {error}")),
+                );
+            }
         }
     })
     .map_err(|e| format!("with_webview failed: {}", e))?;
 
-    let json = rx
+    let json = tokio::time::timeout(std::time::Duration::from_secs(10), rx)
         .await
+        .map_err(|_| "CDP cookie extraction timed out".to_string())?
         .map_err(|_| "Cookie extraction channel closed".to_string())?
         .map_err(|e| format!("CDP cookie extraction failed: {}", e))?;
 
@@ -131,10 +153,13 @@ pub(super) async fn delete_university_cookies(app: &tauri::AppHandle) -> Result<
     win.with_webview(move |webview| unsafe {
         use webview2_com::CallDevToolsProtocolMethodCompletedHandler;
 
-        let core_webview = webview
-            .controller()
-            .CoreWebView2()
-            .expect("CoreWebView2 must be available");
+        let core_webview = match webview.controller().CoreWebView2() {
+            Ok(core_webview) => core_webview,
+            Err(error) => {
+                log::warn!("cookie deletion skipped because CoreWebView2 is unavailable: {error}");
+                return;
+            }
+        };
 
         for cookie in &cookies {
             let params = serde_json::json!({
@@ -148,11 +173,13 @@ pub(super) async fn delete_university_cookies(app: &tauri::AppHandle) -> Result<
             let handler =
                 CallDevToolsProtocolMethodCompletedHandler::create(Box::new(|_code, _json| Ok(())));
 
-            let _ = core_webview.CallDevToolsProtocolMethod(
+            if let Err(error) = core_webview.CallDevToolsProtocolMethod(
                 windows_core::PCWSTR(method.as_ptr()),
                 windows_core::PCWSTR(params_w.as_ptr()),
                 &handler,
-            );
+            ) {
+                log::warn!("failed to dispatch Network.deleteCookies: {error}");
+            }
         }
     })
     .map_err(|e| format!("with_webview failed: {}", e))?;
@@ -180,10 +207,13 @@ pub(super) async fn set_all_cookies(
     win.with_webview(move |webview| unsafe {
         use webview2_com::CallDevToolsProtocolMethodCompletedHandler;
 
-        let core_webview = webview
-            .controller()
-            .CoreWebView2()
-            .expect("CoreWebView2 must be available");
+        let core_webview = match webview.controller().CoreWebView2() {
+            Ok(core_webview) => core_webview,
+            Err(error) => {
+                log::warn!("cookie injection skipped because CoreWebView2 is unavailable: {error}");
+                return;
+            }
+        };
 
         for c in &cookies {
             let mut params = serde_json::json!({
@@ -204,14 +234,35 @@ pub(super) async fn set_all_cookies(
             let handler =
                 CallDevToolsProtocolMethodCompletedHandler::create(Box::new(|_code, _json| Ok(())));
 
-            let _ = core_webview.CallDevToolsProtocolMethod(
+            if let Err(error) = core_webview.CallDevToolsProtocolMethod(
                 windows_core::PCWSTR(method.as_ptr()),
                 windows_core::PCWSTR(params_w.as_ptr()),
                 &handler,
-            );
+            ) {
+                log::warn!("failed to dispatch Network.setCookie: {error}");
+            }
         }
     })
     .map_err(|e| format!("with_webview failed: {}", e))?;
 
     Ok(count)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{complete_cdp_call, Arc, Mutex};
+
+    #[test]
+    fn cdp_completion_uses_only_the_first_result() {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let sender = Arc::new(Mutex::new(Some(tx)));
+
+        complete_cdp_call(&sender, Ok("cookies".to_string()));
+        complete_cdp_call(&sender, Err("late failure".to_string()));
+
+        assert_eq!(
+            rx.blocking_recv().expect("CDP result"),
+            Ok("cookies".to_string())
+        );
+    }
 }

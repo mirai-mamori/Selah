@@ -98,11 +98,6 @@ New-Item -ItemType Directory -Force -Path $layoutDir, $assetsDir | Out-Null
 
 Copy-Item $InputExe (Join-Path $layoutDir "Selah.exe") -Force
 
-$runtimeDir = Join-Path $root "src-tauri\windows-runtime"
-if (Test-Path $runtimeDir) {
-  Copy-Item (Join-Path $runtimeDir "*") $layoutDir -Recurse -Force
-}
-
 $iconDir = Join-Path $root "src-tauri\icons"
 Copy-Item (Join-Path $iconDir "Square150x150Logo.png") (Join-Path $assetsDir "Square150x150Logo.png") -Force
 Copy-Item (Join-Path $iconDir "Square310x310Logo.png") (Join-Path $assetsDir "Square310x310Logo.png") -Force

@@ -146,7 +146,7 @@ Selah は関西学院大学の教務システム **KWIC** と学習管理シス�
 - **セッション自動管理** — セッション有効期限の自動検証、期限切れ時の自動再ログイン
 - **バックグラウンドポーリング** — 時間割・お知らせ・TODO・メールなどを定期的に取得し、キャッシュを自動更新
 - **ローカル DB キャッシュ** — SQLite (WAL モード) による永続キャッシュと SWR 方式での高速起動、ネットワーク不通時のオフラインフォールバック
-- **ローカル AI モデル** — Qwen 系のコンパクトモデルを llama.cpp 経由でオンデバイス実行。API キー不要で、ネットワーク不通時も AI 機能を利用可能（Metal / Vulkan によるハードウェア高速化対応）
+- **ローカル AI モデル（macOS）** — Qwen 系のコンパクトモデルを llama.cpp 経由でオンデバイス実行。Windows 版は OpenAI / Google Gemini などの API を使用します
 - **統合設定画面** — AI・セッション・メール・カレンダー・通知・ダウンロード先をすべてアプリ内で設定可能（デバッグコンソールはバージョン表記を 7 回タップでアンロック）
 - **トレイステータス** — メニューバー / タスクトレイに現在の授業・次の授業・未提出課題などをサイクル表示。クリックでポップアップに詳細を表示
 - **デモモード** — 実データを用いず匿名サンプルデータでアプリを体験可能
@@ -163,7 +163,7 @@ Selah は関西学院大学の教務システム **KWIC** と学習管理シス�
 | バックエンド | Rust (reqwest, scraper, tokio, rusqlite) |
 | 認証 | SSO セッション連携 (WKWebView / WebView2) |
 | キャッシュ | SQLite (WAL モード) |
-| AI 統合 | ローカル (llama-cpp-2 + Qwen、Metal / Vulkan 高速化) / OpenAI / Google Gemini |
+| AI 統合 | macOS: ローカル (llama-cpp-2 + Qwen、Metal 高速化) / Windows: OpenAI / Google Gemini |
 | 音声認識 (STT) | sherpa-onnx + SenseVoice（オンデバイス、日英対応） |
 | ビルドツール | [Vite](https://vitejs.dev/) |
 | パッケージ | macOS: DMG / .app (universal binary) / Mac App Store ／ Windows: NSIS / Microsoft Store |
@@ -175,6 +175,7 @@ Selah は関西学院大学の教務システム **KWIC** と学習管理シス�
 - Node.js 20+
 - Rust 1.80.0+
   - macOS: `aarch64-apple-darwin`, `x86_64-apple-darwin` (macOS 11.0+)
+  - Windows ARM64: `aarch64-pc-windows-msvc` (Windows 10/11, WebView2)
   - Windows: `x86_64-pc-windows-msvc` (Windows 10/11, WebView2 ランタイム)
 
 ### 手順
@@ -191,6 +192,7 @@ npm run tauri build -- --target universal-apple-darwin
 
 # プロダクションビルド (Windows)
 npm run tauri build -- --target x86_64-pc-windows-msvc
+npm run tauri build -- --target aarch64-pc-windows-msvc
 ```
 
 ビルド成果物は `src-tauri/target/release/bundle/` に出力されます（macOS: `dmg/`, `macos/` ／ Windows: `nsis/`）。
@@ -203,6 +205,7 @@ npm run tauri build -- --target x86_64-pc-windows-msvc
 |---|---|---|
 | macOS (Apple Silicon / Intel) | `Selah_x.y.z_universal.dmg` | macOS 11.0 Big Sur 以降 |
 | Windows (x64) | `Selah_x.y.z_x64-setup.exe` | Windows 10 / 11 (x64) |
+| Windows (ARM64) | `Selah_x.y.z_arm64-setup.exe` | Windows 10 / 11 on ARM64 |
 
 ### macOS
 
@@ -275,7 +278,7 @@ Selah が通信を行う外部サービスは以下のみです。いずれも�
 
 AI アシスト機能（履修分析・学習計画・通知サマリー・Selah Agent）は、ユーザーが選択したプロバイダに応じて以下のいずれかで動作します。
 
-- **ローカルモデル**: llama.cpp で端末内推論。推論データはネットワークに一切送信されません（音声認識 (STT) も同様にオンデバイス）。
+- **ローカルモデル（macOS）**: llama.cpp で端末内推論。Windows 版はローカル LLM を搭載せず、設定したクラウド API を使用します。
 - **クラウド (OpenAI / Gemini)**: ユーザーが設定した API キーで直接プロバイダに接続。開発者のサーバーを経由することはありません。
 
 AI への送信内容は時間割・シラバス・成績などの学術データに限られます。API キーは OS のキーチェーンに安全に保存されます。

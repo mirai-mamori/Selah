@@ -3,7 +3,6 @@
   import { listen } from "@tauri-apps/api/event";
   import { onMount, onDestroy } from "svelte";
   import { getAiConfig, isDemoActive, updateAiReadiness } from "../../api";
-  import { detectiveEnabled } from "../../stores";
   import CapabilityMatrix from "../../onboarding/CapabilityMatrix.svelte";
 
   interface LocalModel {
@@ -73,6 +72,7 @@
     gemini: "",
   };
   const isWindows = navigator.userAgent.includes('Windows');
+  const supportsLocalAi = !isWindows;
 
   const DEFAULT_STT_BACKEND_OPTIONS: SttExecutionBackendOption[] = [
     {
@@ -134,7 +134,7 @@
   ];
 
   let aiEnabled = $state("true");
-  let aiProvider = $state("local");
+  let aiProvider = $state(supportsLocalAi ? "local" : "openai");
   let selectedLocalModel = $state("qwen3.5-2b");
   let apiKey = $state("");
   let model = $state("");
@@ -200,20 +200,6 @@
     return sttExecutionBackendOptions.find((option) => option.id === selectedSttExecutionBackend) || null;
   }
 
-  function sttModelSupportsBackend(modelId: string, backendId: string) {
-    return backendId !== "directml" || modelId !== "sensevoice-ja-en";
-  }
-
-  $effect(() => {
-    // Keep model and backend in sync: high-precision is required for DirectML,
-    // standard is correct for everything else.
-    if (selectedSttExecutionBackend === "directml" && selectedSttModel !== "sensevoice-ja-en-fp32") {
-      selectedSttModel = "sensevoice-ja-en-fp32";
-    } else if (selectedSttExecutionBackend !== "directml" && selectedSttModel === "sensevoice-ja-en-fp32") {
-      selectedSttModel = "sensevoice-ja-en";
-    }
-  });
-
   function currentSttPartialModeOption() {
     return STT_PARTIAL_MODE_OPTIONS.find((option) => option.id === selectedSttPartialMode) || STT_PARTIAL_MODE_OPTIONS[0];
   }
@@ -277,6 +263,10 @@
     e.stopPropagation();
     if (e.key === "Escape") {
       stopShortcutRecording();
+      return;
+    }
+    if (isWindows && e.metaKey) {
+      recordError = "Windows キーを含む組み合わせは現在使用できません。Ctrl / Alt / Shift を使用してください。";
       return;
     }
     // Wait for the user to add a non-modifier key.
@@ -564,7 +554,9 @@
         ? DEFAULT_STT_BACKEND_OPTIONS
         : await invoke<SttExecutionBackendOption[]>("list_stt_execution_backends");
       aiEnabled = c.ai_enabled !== false ? "true" : "false";
-      aiProvider = c.provider || "local";
+      aiProvider = c.provider === "local" && !supportsLocalAi
+        ? "openai"
+        : (c.provider || (supportsLocalAi ? "local" : "openai"));
       selectedLocalModel = c.local_model || "qwen3.5-2b";
       apiKey = c.api_key || "";
       model = c.model || "";
@@ -863,7 +855,7 @@
       <span class="row-label">推論方法</span>
       <div class="row-input">
         <select bind:value={aiProvider}>
-          <option value="local">ローカルモデル</option>
+          {#if supportsLocalAi}<option value="local">ローカルモデル</option>{/if}
           <option value="openai">OpenAI API</option>
           <option value="openrouter">OpenRouter</option>
           <option value="gemini">Google Gemini API</option>
@@ -874,7 +866,7 @@
       </div>
     </div>
   </div>
-  {#if isLocal()}
+  {#if supportsLocalAi && isLocal()}
     <div class="card-label">AI アシスタントのモデル</div>
     <div class="card">
       {#each modelList as m}
@@ -981,28 +973,6 @@
 
 {/if}
 
-<div class="card-label">AI 推理ゲーム</div>
-<div class="card">
-  <div class="row">
-    <span class="row-label">機能</span>
-    <div class="row-input">
-      <select
-        value={$detectiveEnabled ? "true" : "false"}
-        onchange={(e) => detectiveEnabled.set((e.currentTarget as HTMLSelectElement).value === "true")}
-      >
-        <option value="true">有効</option>
-        <option value="false">無効</option>
-      </select>
-      <div class="hint">
-        ホーム画面右上に「なるほど」の入口が表示され、AI で講義ノートからケースを生成します。初回生成は時間がかかります。
-        {#if $detectiveEnabled && aiEnabled !== "true"}
-          <br /><span class="detective-na">AI 機能が無効のため、ケース生成は実行できません。先に上の「AI 機能」を有効化してください。</span>
-        {/if}
-      </div>
-    </div>
-  </div>
-</div>
-
 <div class="card-label">Agent 音声ショートカット</div>
 <div class="card">
   <div class="row">
@@ -1046,7 +1016,7 @@
         <div class="hint hint-error">{recordError}</div>
       {/if}
       <div class="hint">{isWindows ? "既定は Left Alt です。" : "既定は Fn です。"}任意のキー組み合わせを記録するには左のボタンを押してから希望の組み合わせを入力してください。</div>
-      <div class="hint">他のシステム/アプリと競合しない組み合わせを選んでください（例: {isWindows ? "Win+Space は避ける" : "Spotlight の Cmd+Space は避ける"}）。</div>
+      <div class="hint">{isWindows ? "Windows キーは使用できません。Ctrl / Alt / Shift を使い、他のアプリと競合しない組み合わせを選んでください。" : "Spotlight の Cmd+Space など、他のシステム/アプリと競合する組み合わせは避けてください。"}</div>
     </div>
   </div>
   <div class="row">
@@ -1125,14 +1095,10 @@
         name="sttModel"
         value={m.id}
         bind:group={selectedSttModel}
-        disabled={!sttModelSupportsBackend(m.id, selectedSttExecutionBackend)}
       />
       <div class="model-info">
         <div class="model-name">{m.name}</div>
         <div class="model-meta">{m.size_label}</div>
-        {#if !sttModelSupportsBackend(m.id, selectedSttExecutionBackend)}
-          <div class="model-meta">GPU 高精度モードでは使用できません</div>
-        {/if}
       </div>
       <span class="model-badge" class:downloaded={m.downloaded}>
         {m.downloaded ? "DL済み" : m.file_size_mb + "MB"}
@@ -1262,10 +1228,6 @@
   .action-row .hint { margin-top: 0; }
   .action-row .hint.ok { color: var(--green, #34c759); }
   .action-row .hint.ng { color: var(--red); }
-
-  .detective-ok { color: color-mix(in srgb, var(--accent) 80%, transparent); }
-  .detective-na { color: var(--red); font-weight: 600; }
-
 
   .key-row { display: flex; align-items: center; gap: 6px; }
   .key-row input { flex: 1; }

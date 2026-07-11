@@ -248,12 +248,6 @@ jobs:
         working-directory: s
         run: node scripts/apply-version.mjs ${{ needs.prepare.outputs.version }}
 
-      - name: Install Vulkan SDK
-        uses: jakoch/install-vulkan-sdk-action@v1
-        with:
-          cache: true
-          stripdown: true
-
       - name: Install frontend dependencies
         run: npm ci
         working-directory: s
@@ -265,16 +259,15 @@ jobs:
           echo "TEMP=D:\tmp" >> $env:GITHUB_ENV
         shell: pwsh
 
-      - name: Clean cached llama-cpp build artifacts
-        run: |
-          if (Test-Path "s/src-tauri/target") {
-            Get-ChildItem "s/src-tauri/target" -Recurse -Directory -Filter "llama-cpp-sys-2-*" -ErrorAction SilentlyContinue |
-              ForEach-Object { Remove-Item $_.FullName -Recurse -Force -ErrorAction SilentlyContinue }
-          }
-          if (Test-Path "D:\t") {
-            Remove-Item "D:\t" -Recurse -Force -ErrorAction SilentlyContinue
-          }
+      - name: Prepare Windows x64 CPU speech runtime
         shell: pwsh
+        working-directory: s
+        run: |
+          .\scripts\prepare-windows-sherpa-runtime.ps1 `
+            -Architecture x64 `
+            -WorkRoot "D:\sherpa-x64" `
+            -LibStageDir "D:\sherpa-x64\install\lib" `
+            -RuntimeStageDir "$PWD\src-tauri\windows-runtime"
 
       - name: Cargo clean (Windows)
         run: |
@@ -282,120 +275,10 @@ jobs:
           cargo clean --manifest-path s/src-tauri/Cargo.toml
         shell: pwsh
 
-      - name: Probe Vulkan and MSVC toolchain
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = 'Continue'
-          Write-Host "VULKAN_SDK=$env:VULKAN_SDK"
-          Write-Host "PATH=$env:Path"
-          & where.exe glslc 2>&1 | Out-Host
-          & glslc --version 2>&1 | Out-Host
-          & where.exe cl 2>&1 | Out-Host
-          & where.exe msbuild 2>&1 | Out-Host
-          & msbuild -version 2>&1 | Out-Host
-          exit 0
-
       - name: Fetch Cargo dependencies
         working-directory: s/src-tauri
         run: cargo fetch --target x86_64-pc-windows-msvc
         shell: pwsh
-
-      - name: Patch llama.cpp to bypass vulkan-shaders-gen ExternalProject
-        shell: pwsh
-        run: |
-          # Root cause: llama.cpp's ggml-vulkan/CMakeLists.txt builds
-          # vulkan-shaders-gen via ExternalProject_Add. With the Visual Studio
-          # generator, MSBuild schedules the ExternalProject step targets
-          # (configure/build/install) in parallel, so `install` can start before
-          # `configure` produced cmake_install.cmake -> MSB8066 / CMake error:
-          # "Not a file: ...vulkan-shaders-gen-build/cmake_install.cmake".
-          #
-          # Fix: replace the ExternalProject_Add block with add_subdirectory so
-          # vulkan-shaders-gen becomes a normal target in the main build tree
-          # with proper target-level dependencies.
-          $registryCacheRoot = "$env:USERPROFILE\.cargo\registry\cache"
-          $registrySrcRoot   = "$env:USERPROFILE\.cargo\registry\src"
-
-          $cacheIdx = Get-ChildItem $registryCacheRoot -Directory -ErrorAction SilentlyContinue | Select-Object -First 1
-          if (-not $cacheIdx) { Write-Error "No registry cache index directory found"; exit 1 }
-
-          $srcIdxPath = Join-Path $registrySrcRoot $cacheIdx.Name
-          New-Item -ItemType Directory -Path $srcIdxPath -Force | Out-Null
-
-          $crateDir = Get-ChildItem $srcIdxPath -Directory -Filter "llama-cpp-sys-2-*" -ErrorAction SilentlyContinue | Select-Object -First 1
-          if (-not $crateDir) {
-            $crateFile = Get-ChildItem $cacheIdx.FullName -Filter "llama-cpp-sys-2-*.crate" | Select-Object -First 1
-            if (-not $crateFile) { Write-Error "llama-cpp-sys-2 crate not found in cache"; exit 1 }
-            Write-Host "Unpacking $($crateFile.FullName) -> $srcIdxPath"
-            tar -xzf $crateFile.FullName -C $srcIdxPath
-            $crateDir = Get-ChildItem $srcIdxPath -Directory -Filter "llama-cpp-sys-2-*" | Select-Object -First 1
-            if (-not $crateDir) { Write-Error "Unpack did not produce a crate directory"; exit 1 }
-            New-Item -ItemType File -Path (Join-Path $crateDir.FullName ".cargo-ok") -Force | Out-Null
-          }
-          Write-Host "Patching $($crateDir.FullName)"
-
-          $cmakeFile = Join-Path $crateDir.FullName "llama.cpp\ggml\src\ggml-vulkan\CMakeLists.txt"
-          if (-not (Test-Path $cmakeFile)) { Write-Error "CMakeLists.txt not found at $cmakeFile"; exit 1 }
-
-          $lines = [System.IO.File]::ReadAllLines($cmakeFile)
-
-          if (($lines -join "`n") -match 'CI patch: use add_subdirectory') {
-            Write-Host "Patch already applied, skipping"
-            exit 0
-          }
-
-          # Locate `    include(ExternalProject)` through the `    )` closing ExternalProject_Add(...)
-          $startIdx = -1; $addStart = -1; $endIdx = -1
-          for ($i = 0; $i -lt $lines.Length; $i++) {
-            if ($startIdx -lt 0 -and $lines[$i] -match '^\s*include\(ExternalProject\)\s*$') { $startIdx = $i; continue }
-            if ($startIdx -ge 0 -and $addStart -lt 0 -and $lines[$i] -match '^\s*ExternalProject_Add\(') { $addStart = $i; continue }
-            if ($addStart -ge 0 -and $lines[$i] -match '^\s*\)\s*$') { $endIdx = $i; break }
-          }
-          if ($startIdx -lt 0 -or $addStart -lt 0 -or $endIdx -lt 0) {
-            Write-Error "Could not locate ExternalProject block (start=$startIdx add=$addStart end=$endIdx)"
-            exit 1
-          }
-
-          $replacement = @(
-            '    # CI patch: use add_subdirectory instead of ExternalProject_Add to avoid',
-            '    # MSBuild parallel scheduling race on vulkan-shaders-gen step stamps.',
-            '    foreach(_arg IN LISTS VULKAN_SHADER_GEN_CMAKE_ARGS)',
-            '        if(_arg MATCHES "^-D([^=]+)=(.*)$")',
-            '            set(${CMAKE_MATCH_1} ${CMAKE_MATCH_2})',
-            '        endif()',
-            '    endforeach()',
-            '    add_subdirectory(vulkan-shaders vulkan-shaders-gen-build)',
-            '    set_target_properties(vulkan-shaders-gen PROPERTIES',
-            '        RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/$<CONFIG>")'
-          )
-
-          $newLines = @()
-          if ($startIdx -gt 0) { $newLines += $lines[0..($startIdx-1)] }
-          $newLines += $replacement
-          if ($endIdx + 1 -le $lines.Length - 1) { $newLines += $lines[($endIdx+1)..($lines.Length-1)] }
-
-          [System.IO.File]::WriteAllLines($cmakeFile, $newLines)
-          Write-Host "Patched $cmakeFile (replaced lines $startIdx..$endIdx)"
-
-          # Update .cargo-checksum.json so cargo accepts the modified file
-          $checksumFile = Join-Path $crateDir.FullName ".cargo-checksum.json"
-          if (Test-Path $checksumFile) {
-            $json = Get-Content $checksumFile -Raw | ConvertFrom-Json -AsHashtable
-            $relPath = "llama.cpp/ggml/src/ggml-vulkan/CMakeLists.txt"
-            $newHash = (Get-FileHash -Algorithm SHA256 -Path $cmakeFile).Hash.ToLower()
-            $json.files[$relPath] = $newHash
-            ($json | ConvertTo-Json -Depth 100 -Compress) | Set-Content -Path $checksumFile -NoNewline
-            Write-Host "Updated checksum entry: $relPath -> $newHash"
-          }
-
-      - name: Build sherpa-onnx DirectML runtime
-        shell: pwsh
-        working-directory: s
-        run: |
-          .\scripts\build-windows-directml-runtime.ps1 `
-            -WorkRoot "D:\directml-runtime" `
-            -LibStageDir "D:\directml-runtime\lib" `
-            -RuntimeStageDir "$PWD\src-tauri\windows-runtime"
 
       - name: Verify updater signing secret
         shell: pwsh
@@ -417,17 +300,7 @@ jobs:
           CARGO_TARGET_DIR: D:/t
           CARGO_INCREMENTAL: 0
           CARGO_BUILD_JOBS: 1
-          CMAKE_BUILD_PARALLEL_LEVEL: 1
-          CMAKE_VS_GLOBALS: UseMultiToolTask=false;EnforceProcessCountAcrossBuilds=true;CL_MPCount=1
-          CMAKE_MSVC_DEBUG_INFORMATION_FORMAT: Embedded
-          GGML_CCACHE: OFF
-          LLAMA_STATIC_CRT: 1
-          CL: /FS
-          _CL_: /FS
-          CFLAGS: /FS
-          CXXFLAGS: /FS
-          SELAH_ENABLE_STT_DIRECTML: 1
-          SHERPA_ONNX_LIB_DIR: D:/directml-runtime/lib
+          SHERPA_ONNX_LIB_DIR: D:/sherpa-x64/install/lib
         with:
           projectPath: s
           tagName: ${{ needs.prepare.outputs.tag }}
@@ -439,18 +312,6 @@ jobs:
           updaterJsonPreferNsis: true
           args: --target x86_64-pc-windows-msvc --features stt-shared,self-updater --config '{"bundle":{"createUpdaterArtifacts":true}}' -- --no-default-features
 
-      - name: Verify DirectML runtime staging
-        shell: pwsh
-        working-directory: s
-        run: |
-          $required = @("sherpa-onnx-c-api.dll", "onnxruntime.dll", "DirectML.dll")
-          foreach ($name in $required) {
-            $path = Join-Path "$PWD\src-tauri\windows-runtime" $name
-            if (-not (Test-Path $path)) {
-              throw "Missing staged DirectML runtime DLL: $path"
-            }
-          }
-
       - name: Verify Windows updater artifacts
         shell: pwsh
         run: |
@@ -461,6 +322,8 @@ jobs:
           if (-not (Test-Path $sig)) { throw "Missing updater signature: $sig" }
           if (-not (Test-Path "latest.json")) { throw "Missing latest.json" }
           $feed = Get-Content "latest.json" -Raw | ConvertFrom-Json
+          # ARM64 is added by the following build-windows-arm64 job and is
+          # validated by verify-updater-draft after both Windows jobs finish.
           foreach ($key in @("darwin-aarch64", "darwin-x86_64", "windows-x86_64", "windows-x86_64-nsis")) {
             $item = $feed.platforms.PSObject.Properties[$key].Value
             if (-not $item -or [string]::IsNullOrWhiteSpace($item.url) -or [string]::IsNullOrWhiteSpace($item.signature)) {
@@ -476,8 +339,114 @@ jobs:
           path: |
             D:/t/x86_64-pc-windows-msvc/release/bundle/nsis/*.exe
 
-  verify-updater-draft:
+  # Windows ARM64 is cross-compiled on the Windows runner with the ARM64 MSVC
+  # toolchain. Keep it after the x64 job so tauri-action can merge both Windows
+  # architectures into the same latest.json updater feed.
+  build-windows-arm64:
     needs: [prepare, build-windows]
+    runs-on: windows-latest
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: s
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: s/package-lock.json
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-pc-windows-msvc
+
+      - name: Configure ARM64 MSVC environment
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64_arm64
+
+      - name: Apply build version
+        working-directory: s
+        run: node scripts/apply-version.mjs ${{ needs.prepare.outputs.version }}
+
+      - name: Install frontend dependencies
+        run: npm ci
+        working-directory: s
+
+      - name: Shorten temp paths
+        run: |
+          New-Item -ItemType Directory -Force -Path "D:\tmp" | Out-Null
+          echo "TMP=D:\tmp" >> $env:GITHUB_ENV
+          echo "TEMP=D:\tmp" >> $env:GITHUB_ENV
+        shell: pwsh
+
+      - name: Verify updater signing secret
+        shell: pwsh
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+        run: |
+          if ([string]::IsNullOrWhiteSpace($env:TAURI_SIGNING_PRIVATE_KEY)) {
+            Write-Error "TAURI_SIGNING_PRIVATE_KEY is required to publish updater artifacts."
+            exit 1
+          }
+
+      - name: Prepare Windows ARM64 CPU speech runtime
+        shell: pwsh
+        working-directory: s
+        run: |
+          .\scripts\prepare-windows-sherpa-runtime.ps1 `
+            -Architecture arm64 `
+            -WorkRoot "D:\sherpa-arm64" `
+            -LibStageDir "D:\sherpa-arm64\install\lib" `
+            -RuntimeStageDir "$PWD\src-tauri\windows-runtime"
+
+      - name: Build and publish Windows ARM64 draft
+        uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+          RUST_BACKTRACE: 1
+          CARGO_TARGET_DIR: D:/t
+          CARGO_BUILD_TARGET: aarch64-pc-windows-msvc
+          CARGO_INCREMENTAL: 0
+          CARGO_BUILD_JOBS: 1
+          SHERPA_ONNX_LIB_DIR: D:/sherpa-arm64/install/lib
+        with:
+          projectPath: s
+          tagName: ${{ needs.prepare.outputs.tag }}
+          releaseName: "Selah ${{ needs.prepare.outputs.tag }}"
+          releaseBody: ${{ needs.prepare.outputs.notes }}
+          releaseDraft: true
+          prerelease: false
+          includeUpdaterJson: true
+          updaterJsonPreferNsis: true
+          args: --target aarch64-pc-windows-msvc --features stt-shared,self-updater --config '{"bundle":{"createUpdaterArtifacts":true}}' -- --no-default-features
+
+      - name: Verify Windows ARM64 updater artifacts
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $setup = "D:\t\aarch64-pc-windows-msvc\release\bundle\nsis\Selah_${{ needs.prepare.outputs.version }}_arm64-setup.exe"
+          $sig = "$setup.sig"
+          if (-not (Test-Path $setup)) { throw "Missing ARM64 updater installer: $setup" }
+          if (-not (Test-Path $sig)) { throw "Missing ARM64 updater signature: $sig" }
+
+      - name: Upload Windows ARM64 CI artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: Selah-${{ needs.prepare.outputs.version }}-windows-arm64
+          if-no-files-found: error
+          path: |
+            D:/t/aarch64-pc-windows-msvc/release/bundle/nsis/*.exe
+
+  verify-updater-draft:
+    needs: [prepare, build-windows-arm64]
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -555,7 +524,7 @@ jobs:
   # Actions storage quota never fills up. A full quota makes upload-artifact
   # fail at FinalizeArtifact with a 403.
   prune-artifacts:
-    needs: [build-macos, build-windows]
+    needs: [build-macos, build-windows-arm64]
     if: always()
     runs-on: ubuntu-latest
     permissions:
@@ -567,7 +536,7 @@ jobs:
           REPO: ${{ github.repository }}
         run: |
           set -euo pipefail
-          for suffix in -macos -windows-x64; do
+          for suffix in -macos -windows-x64 -windows-arm64; do
             SUFFIX="$suffix" gh api --paginate \
               "repos/${REPO}/actions/artifacts?per_page=100" \
               --jq '.artifacts[] | select(.expired == false) | select(.name | endswith(env.SUFFIX)) | "\(.created_at) \(.id)"' \

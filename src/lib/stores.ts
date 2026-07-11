@@ -405,24 +405,6 @@ export const theme = writable<ThemePreference>(initializeThemePreference());
 // In-memory only — resets to false every app launch.
 export const devModeActive = writable<boolean>(false);
 
-// ============ Detective ("なるほど") feature toggle ============
-// Persisted in localStorage. Controls whether the home page shows the
-// detective banner entry. The game itself ALSO requires AI to be enabled
-// (the detective view checks ai_enabled before generating cases).
-const DETECTIVE_ENABLED_KEY = "kwic.detective.enabled";
-function loadDetectiveEnabled(): boolean {
-  try {
-    const v = localStorage.getItem(DETECTIVE_ENABLED_KEY);
-    return v === null ? true : v === "true";
-  } catch {
-    return true;
-  }
-}
-export const detectiveEnabled = writable<boolean>(loadDetectiveEnabled());
-detectiveEnabled.subscribe((v) => {
-  try { localStorage.setItem(DETECTIVE_ENABLED_KEY, String(v)); } catch {}
-});
-
 // ============ Task Registry (for debug panel task observer) ============
 
 export interface TaskInfo {

@@ -327,7 +327,8 @@
   .sidebar-drag-area {
     height: 12px;
     flex-shrink: 0;
-    -webkit-app-region: drag;
+    /* Dragging via data-tauri-drag-region; -webkit-app-region is unreliable on
+       Windows WebView2 (see DocumentTabs.svelte). */
   }
 
   :global(body.platform-windows) .sidebar-drag-area {

@@ -17,10 +17,9 @@ stt-static = ["sherpa-onnx/static"]
 stt-shared = ["sherpa-onnx/shared"]
 self-updater = ["tauri-plugin-updater"]
 store-build = ["tauri-plugin-updater"]
-# Enable Vulkan GPU acceleration for llama.cpp on Windows (requires Vulkan SDK)
-llm-vulkan = ["llama-cpp-2/vulkan"]
 
 [build-dependencies]
+embed-resource = "3.0.8"
 tauri-build = { version = "2.5.6", features = [] }
 
 [dependencies]
@@ -122,7 +121,6 @@ windows-sys = { version = "0.61", features = [
 ] }
 tauri-plugin-single-instance = "2"
 sherpa-onnx = { version = "1.12.39", default-features = false }
-llama-cpp-2 = { version = "0.1" }
 
 [profile.dev]
 # rustc 1.93 on macOS can ICE in incremental mode while rebuilding the native

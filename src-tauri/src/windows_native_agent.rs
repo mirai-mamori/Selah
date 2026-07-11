@@ -22,7 +22,7 @@ use std::ptr::{null, null_mut};
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering};
 use std::sync::{LazyLock, Mutex, OnceLock};
 use std::time::Duration;
-use tauri::{AppHandle, Emitter, Listener, Manager};
+use tauri::{AppHandle, Listener, Manager};
 use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, RECT, WPARAM};
 use windows_sys::Win32::Graphics::Gdi::{
     BeginPaint, CreateFontW, CreatePen, CreateRoundRectRgn, CreateSolidBrush, DeleteObject,
@@ -105,6 +105,7 @@ const WM_AGENT_SHORTCUT_RELEASE: u32 = WM_USER + 51;
 // ─ Atomic state ───────────────────────────────────────────────────────────────
 static HWND_READY: AtomicBool = AtomicBool::new(false);
 static CREATING: AtomicBool = AtomicBool::new(false);
+static DESTROYING: AtomicBool = AtomicBool::new(false);
 static CURRENT_MODE: AtomicI32 = AtomicI32::new(MODE_NONE);
 static MORPH_TOKEN: AtomicU64 = AtomicU64::new(0);
 static FADE_TOKEN: AtomicU64 = AtomicU64::new(0);
@@ -582,6 +583,7 @@ unsafe extern "system" fn overlay_wndproc(
             0
         }
         WM_CLOSE => {
+            DESTROYING.store(true, Ordering::SeqCst);
             uninstall_ll_hook();
             OVERLAY_HWND.store(0, Ordering::Relaxed);
             DestroyWindow(hwnd);
@@ -595,13 +597,11 @@ unsafe extern "system" fn overlay_wndproc(
                 }
                 cell.set((u32::MAX, 0));
             });
-            HWND_READY.store(false, Ordering::Release);
-            {
-                let mut s = WINDOW.lock().unwrap_or_else(|e| e.into_inner());
-                if s.hwnd == hwnd as RawHwnd {
-                    s.hwnd = 0;
-                    s.alpha = 0;
-                    s.text.clear();
+            clear_destroyed_window(hwnd as RawHwnd);
+            DESTROYING.store(false, Ordering::SeqCst);
+            if HOOK_VK.load(Ordering::Relaxed) != 0 {
+                if let Some(app) = APP_HANDLE.get() {
+                    ensure_overlay_window(app);
                 }
             }
             PostQuitMessage(0);
@@ -612,6 +612,19 @@ unsafe extern "system" fn overlay_wndproc(
 }
 
 // ─ Paint ──────────────────────────────────────────────────────────────────────
+fn clear_destroyed_window(hwnd: RawHwnd) -> bool {
+    let mut state = WINDOW.lock().unwrap_or_else(|e| e.into_inner());
+    if state.hwnd != hwnd {
+        return false;
+    }
+
+    state.hwnd = 0;
+    state.alpha = 0;
+    state.text.clear();
+    HWND_READY.store(false, Ordering::Release);
+    true
+}
+
 unsafe fn paint_overlay(hwnd: HWND) {
     let Some(state) = window_snapshot() else {
         return;
@@ -877,7 +890,14 @@ fn spawn_overlay_thread(app: &AppHandle) {
 
         // Install the LL keyboard hook on this thread so it runs inside our
         // GetMessage loop — bypasses IME/TSF which intercepts RegisterHotKey.
-        install_ll_hook();
+        if HOOK_VK.load(Ordering::Relaxed) == 0 {
+            // The shortcut may have been disabled while CreateWindowExW was
+            // running and force_destroy_panel therefore had no hwnd to close.
+            DESTROYING.store(true, Ordering::SeqCst);
+            let _ = PostMessageW(hwnd, WM_CLOSE, 0, 0);
+        } else {
+            install_ll_hook();
+        }
 
         let mut msg = MSG::default();
         while GetMessageW(&mut msg, null_mut(), 0, 0) > 0 {
@@ -892,7 +912,10 @@ fn ensure_overlay_window(app: &AppHandle) {
         return;
     }
     let _lock = CREATE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    if HWND_READY.load(Ordering::Relaxed) || CREATING.load(Ordering::SeqCst) {
+    if HWND_READY.load(Ordering::Relaxed)
+        || CREATING.load(Ordering::SeqCst)
+        || DESTROYING.load(Ordering::SeqCst)
+    {
         return;
     }
     CREATING.store(true, Ordering::SeqCst);
@@ -993,10 +1016,11 @@ fn force_destroy_panel() {
         s.text.clear();
         h
     };
+    HWND_READY.store(false, Ordering::Relaxed);
     if hwnd == 0 {
         return;
     }
-    HWND_READY.store(false, Ordering::Relaxed);
+    DESTROYING.store(true, Ordering::SeqCst);
     unsafe {
         ShowWindow(hwnd_from_raw(hwnd), SW_HIDE);
         let _ = PostMessageW(hwnd_from_raw(hwnd), WM_CLOSE, 0, 0);
@@ -1055,7 +1079,10 @@ fn cancel_auto_close() {
 // ─ Navigation ─────────────────────────────────────────────────────────────────
 fn bring_main_window_to_front() {
     let Some(app) = APP_HANDLE.get() else { return };
-    let _ = crate::agent_commands::open_agent_popup(app.clone(), None, None, None, None);
+    let app = app.clone();
+    tauri::async_runtime::spawn(async move {
+        let _ = crate::agent_commands::open_agent_popup(app, None, None, None, None).await;
+    });
 }
 
 // ─ Mode transitions ───────────────────────────────────────────────────────────
@@ -1382,9 +1409,19 @@ fn parse_shortcut_to_vk(s: &str) -> (u32, u32) {
             "ctrl" | "control" => mods |= MOD_BIT_CTRL,
             "shift" => mods |= MOD_BIT_SHIFT,
             "alt" | "option" => mods |= MOD_BIT_ALT,
-            // meta/super/cmd/win: not supported as mod here
-            _ => vk = code_to_vk(&t),
+            _ => {
+                let parsed = code_to_vk(&t);
+                // Win/Meta and unknown tokens are not supported by the current
+                // hook. Reject them instead of silently degrading Win+X to X.
+                if parsed == 0 || vk != 0 {
+                    return (0, 0);
+                }
+                vk = parsed;
+            }
         }
+    }
+    if vk == 0 {
+        return (0, 0);
     }
     (mods, vk)
 }
@@ -1435,6 +1472,46 @@ fn code_to_vk(code: &str) -> u32 {
             ch as u32
         }
         _ => 0,
+    }
+}
+
+#[cfg(test)]
+mod shortcut_tests {
+    use super::*;
+
+    #[test]
+    fn parses_supported_windows_shortcuts() {
+        assert_eq!(parse_shortcut_to_vk("ctrl+shift+KeyA"), (MOD_BIT_CTRL | MOD_BIT_SHIFT, 0x41));
+        assert_eq!(parse_shortcut_to_vk("lalt"), (0, 0xA4));
+        assert_eq!(parse_shortcut_to_vk("alt+space"), (MOD_BIT_ALT, 0x20));
+    }
+
+    #[test]
+    fn rejects_unsupported_or_ambiguous_shortcuts() {
+        assert_eq!(parse_shortcut_to_vk("win+KeyA"), (0, 0));
+        assert_eq!(parse_shortcut_to_vk("cmd+KeyA"), (0, 0));
+        assert_eq!(parse_shortcut_to_vk("ctrl+unknown"), (0, 0));
+        assert_eq!(parse_shortcut_to_vk("ctrl+KeyA+KeyB"), (0, 0));
+    }
+
+    #[test]
+    fn destroying_stale_window_does_not_clear_replacement_state() {
+        {
+            let mut state = WINDOW.lock().unwrap_or_else(|e| e.into_inner());
+            state.hwnd = 200;
+            state.alpha = 255;
+        }
+        HWND_READY.store(true, Ordering::Release);
+
+        assert!(!clear_destroyed_window(100));
+        assert!(HWND_READY.load(Ordering::Acquire));
+        assert_eq!(
+            WINDOW.lock().unwrap_or_else(|e| e.into_inner()).hwnd,
+            200
+        );
+
+        assert!(clear_destroyed_window(200));
+        assert!(!HWND_READY.load(Ordering::Acquire));
     }
 }
 

@@ -7,9 +7,8 @@ use sherpa_onnx::{
     VadModelConfig, VoiceActivityDetector,
 };
 use std::fs::File;
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::{BufRead, Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{mpsc, LazyLock, Mutex, OnceLock};
 use std::time::{Duration, Instant};
@@ -21,9 +20,7 @@ const VAD_MODEL_URL: &str =
 const VAD_MODEL_FILE: &str = "silero_vad.onnx";
 const STT_BACKEND_CPU: &str = "cpu";
 const STT_BACKEND_COREML: &str = "coreml";
-const STT_BACKEND_DIRECTML: &str = "directml";
 const STT_DECODE_HELPER_ARG: &str = "--selah-stt-decode";
-const STT_DECODE_SERVER_ARG: &str = "--selah-stt-decode-server";
 const STT_PARTIAL_MODE_BALANCED: &str = "balanced";
 const STT_PARTIAL_MODE_POWER_SAVER: &str = "power_saver";
 const STT_PARTIAL_MODE_FINAL_ONLY: &str = "final_only";
@@ -42,10 +39,6 @@ pub struct SttModelInfo {
     pub file_size_mb: u64,
     pub model_file: String,
     pub tokens_file: String,
-    /// When true, this model is only listed on platforms where DirectML is
-    /// available. It uses fp32 weights required by DirectML but is unnecessary
-    /// overhead (4× larger) on CPU-only platforms such as macOS.
-    pub requires_directml: bool,
 }
 
 static STT_MODEL_CATALOG: LazyLock<Vec<SttModelInfo>> = LazyLock::new(|| {
@@ -59,19 +52,6 @@ static STT_MODEL_CATALOG: LazyLock<Vec<SttModelInfo>> = LazyLock::new(|| {
         file_size_mb: 228,
         model_file: "model.int8.onnx".into(),
         tokens_file: "tokens.txt".into(),
-        requires_directml: false,
-    },
-    SttModelInfo {
-        id: "sensevoice-ja-en-fp32".into(),
-        name: "SenseVoice 高精度".into(),
-        size_label: "894 MB（DirectML 専用）".into(),
-        archive_name: "sherpa-onnx-sense-voice-zh-en-ja-ko-yue-2024-07-17.tar.bz2".into(),
-        folder_name: "sherpa-onnx-sense-voice-zh-en-ja-ko-yue-2024-07-17".into(),
-        download_url: "https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/sherpa-onnx-sense-voice-zh-en-ja-ko-yue-2024-07-17.tar.bz2".into(),
-        file_size_mb: 894,
-        model_file: "model.onnx".into(),
-        tokens_file: "tokens.txt".into(),
-        requires_directml: true,
     }]
 });
 
@@ -92,35 +72,8 @@ fn stt_config_path() -> PathBuf {
     crate::client::data_dir().join("stt_config.json")
 }
 
-fn stt_directml_provider_config_path() -> PathBuf {
-    std::env::temp_dir().join(format!(
-        "selah-stt-directml-provider-{}.config",
-        std::process::id()
-    ))
-}
-
 fn stt_model_dir(model: &SttModelInfo) -> PathBuf {
     stt_models_dir().join(&model.folder_name)
-}
-
-fn stt_model_supports_backend(model: &SttModelInfo, execution_backend: &str) -> bool {
-    execution_backend != STT_BACKEND_DIRECTML || model.model_file != "model.int8.onnx"
-}
-
-fn normalize_stt_model_backend_pair(config: &mut SttConfig) {
-    if let Some(model) = stt_model_catalog()
-        .iter()
-        .find(|model| model.id == config.selected_model)
-    {
-        if !stt_model_supports_backend(model, &config.execution_backend) {
-            if let Some(supported_model) = stt_model_catalog()
-                .iter()
-                .find(|model| stt_model_supports_backend(model, &config.execution_backend))
-            {
-                config.selected_model = supported_model.id.clone();
-            }
-        }
-    }
 }
 
 fn stt_archive_path(model: &SttModelInfo) -> PathBuf {
@@ -152,7 +105,6 @@ pub fn is_stt_model_downloaded(model: &SttModelInfo) -> bool {
 }
 
 fn stt_model_missing_message(model: &SttModelInfo) -> String {
-    let cfg = load_config();
     let model_path = stt_model_dir(model).join(&model.model_file);
     let min_model_bytes = model.file_size_mb.saturating_mul(1024 * 1024);
     if file_exists(&model_path) && !file_exists_with_min_size(&model_path, min_model_bytes) {
@@ -161,17 +113,10 @@ fn stt_model_missing_message(model: &SttModelInfo) -> String {
             model.name
         );
     }
-    if cfg.execution_backend == STT_BACKEND_DIRECTML {
-        format!(
-            "{} がダウンロードされていません。GPU 高精度モードを使用するには高精度モデルのダウンロードが必要です。",
-            model.name
-        )
-    } else {
-        format!(
-            "{} がダウンロードされていません。設定画面からダウンロードしてください。",
-            model.name
-        )
-    }
+    format!(
+        "{} がダウンロードされていません。設定画面からダウンロードしてください。",
+        model.name
+    )
 }
 
 fn ensure_stt_model_downloaded(model: &SttModelInfo) -> Result<(), String> {
@@ -236,10 +181,6 @@ pub struct SttExecutionBackendInfo {
     pub availability_note: Option<String>,
 }
 
-fn directml_build_enabled() -> bool {
-    cfg!(target_os = "windows") && option_env!("SELAH_STT_DIRECTML_ENABLED") == Some("1")
-}
-
 fn coreml_build_enabled() -> bool {
     cfg!(target_os = "macos") && cfg!(feature = "stt-shared")
 }
@@ -270,24 +211,6 @@ fn stt_execution_backend_catalog() -> Vec<SttExecutionBackendInfo> {
         });
     }
 
-    if cfg!(target_os = "windows") {
-        let available = directml_build_enabled();
-        backends.push(SttExecutionBackendInfo {
-            id: STT_BACKEND_DIRECTML.into(),
-            label: "GPU 高精度（DirectML）".into(),
-            description:
-                "GPU を使ってより高精度な認識を行います。高精度モデルのダウンロードが必要です。"
-                    .into(),
-            experimental: false,
-            available,
-            availability_note: if available {
-                None
-            } else {
-                Some("このビルドには DirectML ランタイムが含まれていません。".into())
-            },
-        });
-    }
-
     backends
 }
 
@@ -312,9 +235,6 @@ fn normalize_stt_model_id(model_id: &str) -> String {
 fn normalize_stt_execution_backend(requested: &str) -> String {
     match requested.trim().to_ascii_lowercase().as_str() {
         STT_BACKEND_COREML if coreml_build_enabled() => STT_BACKEND_COREML.into(),
-        STT_BACKEND_DIRECTML if cfg!(target_os = "windows") && directml_build_enabled() => {
-            STT_BACKEND_DIRECTML.into()
-        }
         _ => STT_BACKEND_CPU.into(),
     }
 }
@@ -328,13 +248,6 @@ fn validate_stt_execution_backend(requested: &str) -> Result<String, String> {
             Err("CoreML は macOS の shared STT ビルドでのみ利用できます".into())
         }
         STT_BACKEND_COREML => Err("CoreML は macOS ビルドでのみ利用できます".into()),
-        STT_BACKEND_DIRECTML if cfg!(target_os = "windows") && directml_build_enabled() => {
-            Ok(STT_BACKEND_DIRECTML.into())
-        }
-        STT_BACKEND_DIRECTML if cfg!(target_os = "windows") => {
-            Err("この Windows ビルドには DirectML ランタイムが含まれていません".into())
-        }
-        STT_BACKEND_DIRECTML => Err("DirectML は Windows ビルドでのみ利用できます".into()),
         _ => Err("不明な音声認識モードです".into()),
     }
 }
@@ -342,7 +255,6 @@ fn validate_stt_execution_backend(requested: &str) -> Result<String, String> {
 fn stt_execution_backend_label(backend: &str) -> &'static str {
     match backend {
         STT_BACKEND_COREML => "CoreML",
-        STT_BACKEND_DIRECTML => "DirectML",
         _ => "CPU",
     }
 }
@@ -440,40 +352,12 @@ fn stt_runtime_preferences() -> (String, String) {
     )
 }
 
-fn stt_provider_value_for_backend(execution_backend: &str) -> Result<String, String> {
-    if execution_backend != STT_BACKEND_DIRECTML {
-        return Ok(execution_backend.to_string());
-    }
-
-    let path = stt_directml_provider_config_path();
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)
-            .map_err(|e| format!("Failed to prepare DirectML provider config directory: {e}"))?;
-    }
-    let data = [
-        "GraphOptimizationLevel=1",
-        "EnableMemPattern=0",
-        "EnableCpuMemArena=0",
-        "LogSeverityLevel=2",
-        "",
-    ]
-    .join("\n");
-    std::fs::write(&path, data)
-        .map_err(|e| format!("Failed to write DirectML provider config: {e}"))?;
-    Ok(format!(
-        "{}:{}",
-        STT_BACKEND_DIRECTML,
-        path.to_string_lossy()
-    ))
-}
-
 fn normalized_stt_config(mut config: SttConfig) -> SttConfig {
     config.selected_model = normalize_stt_model_id(&config.selected_model);
     config.language = normalize_stt_language(&config.language);
     config.execution_backend = normalize_stt_execution_backend(&config.execution_backend);
     config.partial_mode = normalize_stt_partial_mode(&config.partial_mode);
     config.sensitivity = normalize_stt_sensitivity(&config.sensitivity);
-    normalize_stt_model_backend_pair(&mut config);
     config
 }
 
@@ -642,14 +526,6 @@ fn build_sense_voice_config_for_backend(
     language: &str,
     execution_backend: &str,
 ) -> Result<OfflineRecognizerConfig, String> {
-    if !stt_model_supports_backend(model, execution_backend) {
-        return Err(format!(
-            "{} は {} モードに対応していません。GPU 高精度モードには高精度モデルが必要です。",
-            model.name,
-            stt_execution_backend_label(execution_backend)
-        ));
-    }
-
     let dir = stt_model_dir(model);
     let model_path = dir.join(&model.model_file);
     let tokens_path = dir.join(&model.tokens_file);
@@ -669,7 +545,7 @@ fn build_sense_voice_config_for_backend(
         use_itn: true,
     };
     config.model_config.tokens = Some(tokens_path.to_string_lossy().into_owned());
-    config.model_config.provider = Some(stt_provider_value_for_backend(execution_backend)?);
+    config.model_config.provider = Some(execution_backend.to_string());
     config.model_config.num_threads = std::thread::available_parallelism()
         .map(|n| n.get().min(2) as i32)
         .unwrap_or(2);
@@ -970,7 +846,7 @@ fn create_recognizer_with_fallback(model: &SttModelInfo) -> Result<RecognizerIni
     }
 
     // Non-CPU backend (CoreML) failed — fall back to CPU and report via
-    // emit_info so the user knows. DirectML never reaches this function
+    // emit_info so the user knows when a requested backend falls back to CPU.
     // (it uses a helper process), so this fallback is CoreML-only in practice.
     log::warn!(
         "[stt] {} init failed; retrying with CPU",
@@ -1039,14 +915,6 @@ fn read_f32_samples(path: &Path) -> Result<Vec<f32>, String> {
         return Err("STT helper sample file is not aligned to f32".into());
     }
     f32_samples_from_bytes(&bytes)
-}
-
-fn f32_samples_to_base64(samples: &[f32]) -> String {
-    let mut bytes = Vec::with_capacity(samples.len() * 4);
-    for sample in samples {
-        bytes.extend_from_slice(&sample.to_le_bytes());
-    }
-    BASE64_STANDARD.encode(bytes)
 }
 
 fn f32_samples_from_bytes(bytes: &[u8]) -> Result<Vec<f32>, String> {
@@ -1128,134 +996,6 @@ fn stt_helper_decode_response(text: String) -> SttHelperDecodeResponse {
     }
 }
 
-struct DirectMlDecodeServer {
-    child: Child,
-    stdin: ChildStdin,
-    stdout: BufReader<ChildStdout>,
-}
-
-impl DirectMlDecodeServer {
-    fn start(
-        model: &SttModelInfo,
-        language: &str,
-        execution_backend: &str,
-    ) -> Result<Self, String> {
-        let exe =
-            std::env::current_exe().map_err(|e| format!("STT helper exe path failed: {e}"))?;
-        let dir = stt_model_dir(model);
-        let provider = stt_provider_value_for_backend(execution_backend)?;
-        let mut child = Command::new(exe)
-            .arg(STT_DECODE_SERVER_ARG)
-            .arg("--model")
-            .arg(dir.join(&model.model_file))
-            .arg("--tokens")
-            .arg(dir.join(&model.tokens_file))
-            .arg("--language")
-            .arg(language)
-            .arg("--provider")
-            .arg(provider)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .spawn()
-            .map_err(|e| format!("DirectML STT ヘルパーの起動に失敗しました: {e}"))?;
-
-        let stdin = child
-            .stdin
-            .take()
-            .ok_or_else(|| "DirectML STT ヘルパーの標準入力を取得できませんでした".to_string())?;
-        let stdout = child
-            .stdout
-            .take()
-            .ok_or_else(|| "DirectML STT ヘルパーの標準出力を取得できませんでした".to_string())?;
-        let mut server = Self {
-            child,
-            stdin,
-            stdout: BufReader::new(stdout),
-        };
-        let ready = server.read_response()?;
-        if !ready.ready || !ready.ok {
-            return Err(if ready.error.is_empty() {
-                "DirectML STT ヘルパーの初期化に失敗しました".into()
-            } else {
-                ready.error
-            });
-        }
-        // Pre-compile DirectML compute shaders with a silent decode so the
-        // first real partial/final decode doesn't pay the shader compilation cost.
-        let warmup = vec![0.0f32; TARGET_SAMPLE_RATE as usize * 2];
-        server.decode(TARGET_SAMPLE_RATE, &warmup).map_err(|e| {
-            format!("DirectML STT ヘルパーのウォームアップに失敗しました（クラッシュした可能性があります）: {e}")
-        })?;
-        Ok(server)
-    }
-
-    fn decode(&mut self, sample_rate: i32, samples: &[f32]) -> Result<String, String> {
-        if samples.is_empty() {
-            return Ok(String::new());
-        }
-
-        let request = SttHelperDecodeRequest {
-            sample_rate,
-            samples: String::new(),
-            sample_data: f32_samples_to_base64(samples),
-            shutdown: false,
-        };
-        serde_json::to_writer(&mut self.stdin, &request)
-            .map_err(|e| format!("STT helper request serialization failed: {e}"))?;
-        self.stdin
-            .write_all(b"\n")
-            .map_err(|e| format!("STT helper request write failed: {e}"))?;
-        self.stdin
-            .flush()
-            .map_err(|e| format!("STT helper request flush failed: {e}"))?;
-
-        let response = self.read_response()?;
-        if response.ok {
-            Ok(strip_sense_voice_tags(&response.text))
-        } else if response.error.is_empty() {
-            Err("DirectML STT ヘルパーのデコードに失敗しました".into())
-        } else {
-            Err(response.error)
-        }
-    }
-
-    fn read_response(&mut self) -> Result<SttHelperDecodeResponse, String> {
-        let mut line = String::new();
-        let n = self
-            .stdout
-            .read_line(&mut line)
-            .map_err(|e| format!("DirectML STT ヘルパーの応答読み取りに失敗しました: {e}"))?;
-        if n == 0 {
-            let status = self.child.try_wait().ok().flatten();
-            return Err(match status {
-                Some(status) => format!("DirectML STT ヘルパーが予期せず終了しました（{status}）"),
-                None => "DirectML STT ヘルパーが出力を閉じました".into(),
-            });
-        }
-        serde_json::from_str(line.trim())
-            .map_err(|e| format!("DirectML STT ヘルパーの応答解析に失敗しました: {e}"))
-    }
-}
-
-impl Drop for DirectMlDecodeServer {
-    fn drop(&mut self) {
-        let request = SttHelperDecodeRequest {
-            sample_rate: TARGET_SAMPLE_RATE,
-            samples: String::new(),
-            sample_data: String::new(),
-            shutdown: true,
-        };
-        let _ = serde_json::to_writer(&mut self.stdin, &request);
-        let _ = self.stdin.write_all(b"\n");
-        let _ = self.stdin.flush();
-        if self.child.try_wait().ok().flatten().is_none() {
-            let _ = self.child.kill();
-        }
-        let _ = self.child.wait();
-    }
-}
-
 fn arg_value(args: &[String], name: &str) -> Option<String> {
     args.windows(2)
         .find(|pair| pair[0] == name)
@@ -1267,11 +1007,7 @@ fn helper_recognizer_config_from_args(args: &[String]) -> Result<OfflineRecogniz
     let tokens_path = PathBuf::from(arg_value(args, "--tokens").ok_or("missing --tokens")?);
     let language = arg_value(args, "--language").unwrap_or_else(|| "ja".into());
     let provider_arg = arg_value(args, "--provider").unwrap_or_else(|| STT_BACKEND_CPU.into());
-    let provider = if provider_arg == STT_BACKEND_DIRECTML {
-        stt_provider_value_for_backend(&provider_arg)?
-    } else {
-        provider_arg
-    };
+    let provider = provider_arg;
 
     let mut config = OfflineRecognizerConfig::default();
     config.model_config.sense_voice = OfflineSenseVoiceModelConfig {
@@ -1335,7 +1071,7 @@ fn run_decode_server_from_args(args: &[String]) -> i32 {
 
 pub fn run_decode_helper_from_args() -> Option<i32> {
     let args: Vec<String> = std::env::args().collect();
-    if args.iter().any(|arg| arg == STT_DECODE_SERVER_ARG) {
+    if args.iter().any(|arg| arg == STT_DECODE_HELPER_ARG) {
         return Some(run_decode_server_from_args(&args));
     }
     if !args.iter().any(|arg| arg == STT_DECODE_HELPER_ARG) {
@@ -1583,9 +1319,6 @@ fn normalize_u16_input(data: &[u16]) -> Vec<f32> {
 }
 
 const PARTIAL_WINDOW_SECS: usize = 5;
-/// Shorter window for DirectML partial decodes: attention is O(n²) in
-/// sequence length, so 2 s costs roughly 1/6 the compute of 5 s.
-const PARTIAL_WINDOW_SECS_DIRECTML: usize = 2;
 /// Tail window we probe to decide whether the utterance has momentarily
 /// fallen silent. Roughly one natural syllable gap.
 const PARTIAL_TAIL_WINDOW_SAMPLES: usize = TARGET_SAMPLE_RATE as usize / 2; // 500 ms
@@ -1599,14 +1332,11 @@ const PARTIAL_TAIL_SILENCE_RMS: f32 = 0.003;
 /// tick should be skipped entirely.
 ///
 /// `window_secs`: how many seconds of tail audio to decode.
-/// `fast`: when true (DirectML), all throttle intervals are halved so the
-///   IPC + shorter-window inference budget still drives frequent updates.
 fn partial_decode_slice(
     current_samples: &[f32],
     last_partial_at: &mut Instant,
     stable_streak: &mut u32,
     window_secs: usize,
-    fast: bool,
 ) -> Option<Vec<f32>> {
     if current_samples.len() < (TARGET_SAMPLE_RATE as usize / 2) {
         return None;
@@ -1622,12 +1352,7 @@ fn partial_decode_slice(
     } else {
         partial_profile.min_interval_ms
     };
-    let interval = if fast {
-        base_interval / 2
-    } else {
-        base_interval
-    };
-    if last_partial_at.elapsed() < Duration::from_millis(interval) {
+    if last_partial_at.elapsed() < Duration::from_millis(base_interval) {
         return None;
     }
     // If the tail of the utterance is currently silent, nothing the decoder
@@ -1710,54 +1435,17 @@ fn run_stt_session(
         }
 
         emit_state(&app, "initializing", caller);
-        let (language, execution_backend) = stt_runtime_preferences();
-        let use_directml_helper = execution_backend == STT_BACKEND_DIRECTML;
-        let recognizer_init = if use_directml_helper {
-            None
-        } else {
-            Some(create_recognizer_with_fallback(&model)?)
-        };
+        let recognizer_init = create_recognizer_with_fallback(&model)?;
         update_runtime_debug_state(
             "initializing",
             Some(caller),
-            Some(
-                recognizer_init
-                    .as_ref()
-                    .map(|init| init.execution_backend.as_str())
-                    .unwrap_or(&execution_backend),
-            ),
-            recognizer_init
-                .as_ref()
-                .and_then(|init| init.fallback_from.as_deref()),
+            Some(recognizer_init.execution_backend.as_str()),
+            recognizer_init.fallback_from.as_deref(),
         );
-        if let Some(fallback_from) = recognizer_init
-            .as_ref()
-            .and_then(|init| init.fallback_from.as_ref())
-        {
+        if let Some(fallback_from) = recognizer_init.fallback_from.as_ref() {
             emit_info(&app, stt_fallback_message(fallback_from), caller);
         }
-        let recognizer = recognizer_init.map(|init| init.recognizer);
-        let mut directml_server = if use_directml_helper {
-            emit_info(
-                &app,
-                "DirectML STT をヘルパープロセスで起動しています...",
-                caller,
-            );
-            Some(DirectMlDecodeServer::start(
-                &model,
-                &language,
-                &execution_backend,
-            )?)
-        } else {
-            None
-        };
-        if use_directml_helper {
-            emit_info(
-                &app,
-                "DirectML STT の準備ができました。セッション中はヘルパーが常駐します。",
-                caller,
-            );
-        }
+        let recognizer = recognizer_init.recognizer;
         let sensitivity_profile = stt_sensitivity_profile(&load_config().sensitivity);
         let vad = VoiceActivityDetector::create(&build_vad_config(&sensitivity_profile)?, 30.0)
             .ok_or_else(|| "VAD の初期化に失敗しました".to_string())?;
@@ -1875,22 +1563,9 @@ fn run_stt_session(
                             &current_utterance,
                             &mut last_partial_at,
                             &mut stable_streak,
-                            if use_directml_helper {
-                                PARTIAL_WINDOW_SECS_DIRECTML
-                            } else {
-                                PARTIAL_WINDOW_SECS
-                            },
-                            use_directml_helper,
+                            PARTIAL_WINDOW_SECS,
                         ) {
-                            let text = if let Some(recognizer) = recognizer.as_ref() {
-                                decode_samples(recognizer, TARGET_SAMPLE_RATE, &slice)
-                            } else if let Some(server) = directml_server.as_mut() {
-                                server
-                                    .decode(TARGET_SAMPLE_RATE, &slice)
-                                    .unwrap_or_default()
-                            } else {
-                                String::new()
-                            };
+                            let text = decode_samples(&recognizer, TARGET_SAMPLE_RATE, &slice);
                             handle_partial_result(
                                 &app,
                                 text,
@@ -1904,18 +1579,7 @@ fn run_stt_session(
                     while !vad.is_empty() {
                         if let Some(segment) = vad.front() {
                             let samples = segment.samples().to_vec();
-                            let text = if use_directml_helper {
-                                directml_server
-                                    .as_mut()
-                                    .expect("DirectML helper exists")
-                                    .decode(TARGET_SAMPLE_RATE, &samples)?
-                            } else {
-                                decode_samples(
-                                    recognizer.as_ref().expect("recognizer exists"),
-                                    TARGET_SAMPLE_RATE,
-                                    &samples,
-                                )
-                            };
+                            let text = decode_samples(&recognizer, TARGET_SAMPLE_RATE, &samples);
                             if !text.is_empty() {
                                 last_partial = text.clone();
                                 emit_final_deduped(&app, text, caller, &mut last_final);
@@ -1938,18 +1602,7 @@ fn run_stt_session(
             while !vad.is_empty() {
                 if let Some(segment) = vad.front() {
                     let samples = segment.samples().to_vec();
-                    let text = if use_directml_helper {
-                        directml_server
-                            .as_mut()
-                            .expect("DirectML helper exists")
-                            .decode(TARGET_SAMPLE_RATE, &samples)?
-                    } else {
-                        decode_samples(
-                            recognizer.as_ref().expect("recognizer exists"),
-                            TARGET_SAMPLE_RATE,
-                            &samples,
-                        )
-                    };
+                    let text = decode_samples(&recognizer, TARGET_SAMPLE_RATE, &samples);
                     if !text.is_empty() {
                         emit_final_deduped(&app, text, caller, &mut last_final);
                     }
@@ -1957,18 +1610,7 @@ fn run_stt_session(
                 vad.pop();
             }
             if !current_utterance.is_empty() {
-                let text = if use_directml_helper {
-                    directml_server
-                        .as_mut()
-                        .expect("DirectML helper exists")
-                        .decode(TARGET_SAMPLE_RATE, &current_utterance)?
-                } else {
-                    decode_samples(
-                        recognizer.as_ref().expect("recognizer exists"),
-                        TARGET_SAMPLE_RATE,
-                        &current_utterance,
-                    )
-                };
+                let text = decode_samples(&recognizer, TARGET_SAMPLE_RATE, &current_utterance);
                 if !text.is_empty() {
                     emit_final_deduped(&app, text, caller, &mut last_final);
                 }
@@ -2003,7 +1645,6 @@ pub fn save_stt_config(app: tauri::AppHandle, mut config: SttConfig) -> Result<(
     config.execution_backend = validate_stt_execution_backend(&config.execution_backend)?;
     config.partial_mode = normalize_stt_partial_mode(&config.partial_mode);
     config.sensitivity = normalize_stt_sensitivity(&config.sensitivity);
-    normalize_stt_model_backend_pair(&mut config);
     if stt_model_catalog()
         .iter()
         .all(|m| m.id != config.selected_model)
@@ -2024,7 +1665,6 @@ pub fn list_stt_execution_backends() -> Vec<SttExecutionBackendInfo> {
 pub fn list_stt_models() -> Vec<serde_json::Value> {
     stt_model_catalog()
         .iter()
-        .filter(|m| !m.requires_directml || directml_build_enabled())
         .map(|m| {
             serde_json::json!({
                 "id": m.id,
@@ -2080,21 +1720,6 @@ pub fn cancel_stt_model_download() {
 pub fn stt_test_model(app: tauri::AppHandle) -> Result<String, String> {
     let model = selected_model_from_config()?;
     ensure_stt_model_downloaded(&model)?;
-    let (language, execution_backend) = stt_runtime_preferences();
-    if execution_backend == STT_BACKEND_DIRECTML {
-        let silence = vec![0.0f32; TARGET_SAMPLE_RATE as usize / 2];
-        let mut helper = DirectMlDecodeServer::start(&model, &language, &execution_backend)?;
-        let _ = helper.decode(TARGET_SAMPLE_RATE, &silence)?;
-        update_runtime_debug_state("test-ok", None, Some(&execution_backend), None);
-        let message = format!(
-            "OK: {} ({})",
-            model.name,
-            stt_execution_backend_label(&execution_backend)
-        );
-        update_runtime_debug_message(Some(message.clone()), None);
-        emit_runtime_debug_changed(&app);
-        return Ok(message);
-    }
     if !is_stt_model_downloaded(&model) {
         return Err("STT モデルを先にダウンロードしてください".into());
     }

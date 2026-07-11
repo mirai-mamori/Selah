@@ -49,13 +49,6 @@
   let query = $state("");
   let busy = $state(false);
 
-  // Detective ("なるほど") entry — gated by the same localStorage flag the
-  // settings toggle writes (shared origin, so readable from this surface).
-  const detectiveOn = (() => {
-    try { return localStorage.getItem("kwic.detective.enabled") !== "false"; }
-    catch { return true; }
-  })();
-
   async function openDetective(): Promise<void> {
     if (busy) return;
     busy = true;
@@ -295,15 +288,13 @@
 
     <section class="links" aria-label="アプリ">
       <div class="section-label">アプリ</div>
-      {#if detectiveOn}
-        <button class="link-tile det-tile" type="button" title="なるほど —— 講義の矛盾を暴く" disabled={busy} onclick={openDetective}>
-          <img class="det-tile-logo" src="/naruhodo.png" alt="" aria-hidden="true" draggable="false" />
-          <span class="det-tile-text">
-            <span class="link-label">なるほど</span>
-            <span class="link-hint">講義の矛盾を暴く</span>
-          </span>
-        </button>
-      {/if}
+      <button class="link-tile det-tile" type="button" title="なるほど —— 講義の矛盾を暴く" disabled={busy} onclick={openDetective}>
+        <img class="det-tile-logo" src="/naruhodo.png" alt="" aria-hidden="true" draggable="false" />
+        <span class="det-tile-text">
+          <span class="link-label">なるほど</span>
+          <span class="link-hint">講義の矛盾を暴く</span>
+        </span>
+      </button>
       <button class="link-tile" type="button" title="論文チェック —— AI率・重複を検査" disabled={busy} onclick={openPaperCheck}>
         <span class="link-label">論文チェック</span>
         <span class="link-hint">AI率・重複を検査</span>

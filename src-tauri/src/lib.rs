@@ -32,6 +32,7 @@ pub(crate) mod keychain;
 mod kwic_client;
 mod kwic_commands;
 mod live;
+#[cfg(target_os = "macos")]
 pub mod local_ai;
 mod luna_client;
 mod luna_commands;
@@ -295,6 +296,7 @@ pub fn run() {
 
     builder
         .setup(|app| {
+            document_tabs::record_main_thread();
             #[cfg(debug_assertions)]
             let browser_mouse_selftest = should_run_browser_mouse_selftest();
             #[cfg(not(debug_assertions))]

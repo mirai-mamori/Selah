@@ -1,3 +1,5 @@
+#![cfg(target_os = "macos")]
+
 use app_lib::ai::ChatMessage;
 /// Integration test — runs the real Qwen3.5-2B model with realistic schedule data.
 /// Run with: cargo test --test local_ai_test -- --nocapture

@@ -1,24 +1,17 @@
 #Requires -Version 5.1
 <#
 .SYNOPSIS
-    Selah Windows dev helper  (mirrors run.sh for macOS)
+    Selah Windows development helper.
 
 .PARAMETER Command
-    setup    Install dev prerequisites (first-time setup)
-    dev      Start development server (default)
-    directml Build the local Windows DirectML STT runtime cache
-    build    Production build  (add --features llm-vulkan for Vulkan GPU)
-    clean    Clean all build caches
+    setup    Install frontend dependencies
+    dev      Start the Tauri development server (default)
+    build    Production build
+    clean    Clean build caches
     rebuild  Clean + build
     kill     Kill running Selah processes
-    open     Open last built installer/exe
-
-.EXAMPLE
-    .\run.ps1 setup   # first time only
-    .\run.ps1
-    .\run.ps1 dev
-    .\run.ps1 build
-    .\run.ps1 clean
+    open     Open the last built installer or executable
+    doctor   Check the local Windows ARM64 development environment
 #>
 param(
     [string]$Command = "dev"
@@ -27,274 +20,374 @@ param(
 $ErrorActionPreference = "Stop"
 $ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 Set-Location $ScriptDir
+$env:CARGO_BUILD_JOBS = "2"
+$AppName = "selah-app"
+$DefaultCargoTargetDir = Join-Path $ScriptDir "src-tauri\target"
+$SherpaCpuSharedLibDir = Join-Path $ScriptDir ".tools\sherpa-arm64-cpu-shared\install\lib"
+$WindowsRuntimeDir = Join-Path $ScriptDir "src-tauri\windows-runtime"
+$LauncherLogDir = Join-Path $ScriptDir ".tools\logs"
+$LauncherLogPath = Join-Path $LauncherLogDir "run.log"
+$TranscriptStarted = $false
 
-# Keep window open on error when launched by double-click (no parent terminal)
+try {
+    New-Item -ItemType Directory -Force -Path $LauncherLogDir | Out-Null
+    Start-Transcript -Path $LauncherLogPath -Append | Out-Null
+    $TranscriptStarted = $true
+} catch {
+    # Logging must not prevent the development launcher from starting.
+}
+
+# Keep the window open when the script is launched from Explorer.
 $IsDoubleClick = ($Host.Name -eq "ConsoleHost") -and (-not $env:WT_SESSION) -and (-not $env:TERM_PROGRAM)
 trap {
     Write-Host ""
     Write-Host "ERROR: $_" -ForegroundColor Red
-    if ($IsDoubleClick) { Read-Host "按 Enter 关闭" }
+    if ($TranscriptStarted) { Stop-Transcript | Out-Null }
+    if ($IsDoubleClick) { Read-Host "Press Enter to close" }
     exit 1
 }
 
-# Explorer double-click doesn't inherit the user's PATH from terminal profiles.
-# Manually add Node.js and common tool paths so npm/npx are found.
-foreach ($nodeDir in @(
+# Explorer does not load terminal profile PATH modifications. Include common
+# Node.js, Rust and package-manager locations, including WinGet's versioned
+# Node.js archive directory.
+function Add-PathEntry {
+    param([Parameter(Mandatory)][string]$PathEntry)
+
+    if ((Test-Path -LiteralPath $PathEntry) -and ($env:PATH -notlike "*$PathEntry*")) {
+        $env:PATH = "$PathEntry;$env:PATH"
+    }
+}
+
+$pathDirs = @(
+    (Join-Path $ScriptDir ".tools\llvm-arm64\bin"),
     "$env:ProgramFiles\nodejs",
     "$env:APPDATA\npm",
-    "$env:LOCALAPPDATA\Programs\nodejs"
-)) {
-    if ((Test-Path $nodeDir) -and ($env:PATH -notlike "*$nodeDir*")) {
-        $env:PATH = "$nodeDir;$env:PATH"
+    "$env:LOCALAPPDATA\Programs\nodejs",
+    "$env:USERPROFILE\.cargo\bin",
+    "$env:USERPROFILE\scoop\shims",
+    "$env:LOCALAPPDATA\Volta\bin",
+    "C:\ProgramData\chocolatey\bin"
+)
+$wingetRoot = Join-Path $env:LOCALAPPDATA "Microsoft\WinGet\Packages"
+if (Test-Path $wingetRoot) {
+    $pathDirs += @(
+        Get-ChildItem -LiteralPath $wingetRoot -Directory -Filter "OpenJS.NodeJS.LTS_*" -ErrorAction SilentlyContinue |
+            ForEach-Object {
+                Get-ChildItem -LiteralPath $_.FullName -Directory -Filter "node-v*" -ErrorAction SilentlyContinue |
+                    Select-Object -ExpandProperty FullName
+            }
+    )
+}
+foreach ($pathDir in $pathDirs) {
+    Add-PathEntry $pathDir
+}
+
+# Load the local ARM64 MSVC/LLVM environment when the project toolchain is
+# present. This is required by native crates such as ring and keeps the
+# launcher independent from the user's global Visual Studio installation.
+$vcVarsArm64 = Join-Path $ScriptDir ".tools\vs\VC\Auxiliary\Build\vcvarsarm64.bat"
+if (Test-Path $vcVarsArm64) {
+    # `&` (not `&&`) so the environment is still captured even if vcvarsall.bat
+    # exits non-zero on a benign warning (e.g. an unused VS component missing).
+    $vcEnvironment = cmd.exe /d /s /c "call `"$vcVarsArm64`" >nul & set"
+    $vcEnvironmentNames = @(
+        "INCLUDE",
+        "LIB",
+        "LIBPATH",
+        "PATH",
+        "VCINSTALLDIR",
+        "VCToolsInstallDir",
+        "VCToolsVersion",
+        "WindowsSdkDir",
+        "WindowsSDKVersion",
+        "UCRTVersion"
+    )
+    foreach ($line in $vcEnvironment) {
+        if ($line -match '^([^=]+)=(.*)$' -and $vcEnvironmentNames -ccontains $matches[1]) {
+            Set-Item -Path "Env:$($matches[1])" -Value $matches[2]
+        }
     }
 }
 
-$AppName    = "selah-app"
-$BundlePath = "src-tauri\target\release\$AppName.exe"
+# vcvars may rebuild PATH from its own baseline; restore project-local tools
+# afterwards so npm/cargo remain discoverable from Explorer and terminals.
+foreach ($pathDir in $pathDirs) {
+    Add-PathEntry $pathDir
+}
 
-# ---------------------------------------------------------------------------
-# Environment setup
-# ---------------------------------------------------------------------------
-function Enable-DirectMLIfAvailable {
-    if (-not $env:SHERPA_ONNX_LIB_DIR) {
-        return
-    }
+# Prefer the current LLVM archive over the expired copy inside the local VS
+# snapshot. LLVM cannot reliably launch itself from a path containing non-ASCII
+# characters, so expose it through a user-writable ASCII junction when needed.
+$llvmArm64Root = Join-Path $ScriptDir ".tools\llvm-arm64"
+if ($llvmArm64Root -match '[^\x00-\x7F]') {
+    $toolLinksRoot = Join-Path $env:LOCALAPPDATA "Selah\tool-links"
+    $llvmArm64Link = Join-Path $toolLinksRoot "llvm-arm64"
+    New-Item -ItemType Directory -Force -Path $toolLinksRoot | Out-Null
 
-    $required = @(
-        "sherpa-onnx-c-api.lib",
-        "sherpa-onnx-c-api.dll",
-        "onnxruntime.lib",
-        "onnxruntime.dll",
-        "onnxruntime_providers_shared.dll",
-        "DirectML.lib",
-        "DirectML.dll"
-    )
-    $missing = @(
-        foreach ($name in $required) {
-            if (-not (Test-Path (Join-Path $env:SHERPA_ONNX_LIB_DIR $name))) {
-                $name
-            }
+    if (Test-Path -LiteralPath $llvmArm64Link) {
+        $existingLink = Get-Item -LiteralPath $llvmArm64Link -Force
+        $existingTarget = @($existingLink.Target) | Select-Object -First 1
+        if ($existingLink.LinkType -ne "Junction" -or
+            [System.IO.Path]::GetFullPath($existingTarget) -ne [System.IO.Path]::GetFullPath($llvmArm64Root)) {
+            throw "$llvmArm64Link already exists and does not point to the project LLVM runtime."
         }
-    )
-
-    if ($missing.Count -eq 0) {
-        $env:SELAH_ENABLE_STT_DIRECTML = "1"
-        if ($env:PATH -notlike "*$env:SHERPA_ONNX_LIB_DIR*") {
-            $env:PATH = "$env:SHERPA_ONNX_LIB_DIR;$env:PATH"
-        }
-        Write-Host "  SELAH_ENABLE_STT_DIRECTML=1"
-    } elseif ($env:SELAH_ENABLE_STT_DIRECTML) {
-        Write-Warning "DirectML was requested, but SHERPA_ONNX_LIB_DIR is incomplete: $($missing -join ', ')"
     } else {
-        Write-Host "  DirectML STT runtime not enabled (missing $($missing -join ', '))"
+        New-Item -ItemType Junction -Path $llvmArm64Link -Target $llvmArm64Root | Out-Null
+    }
+
+    $llvmArm64Root = $llvmArm64Link
+}
+$llvmArm64Bin = Join-Path $llvmArm64Root "bin"
+if (Test-Path (Join-Path $llvmArm64Bin "clang.exe")) {
+    Add-PathEntry $llvmArm64Bin
+}
+
+function Find-Arm64Compiler {
+    $msvcRoot = Join-Path $ScriptDir ".tools\vs\VC\Tools\MSVC"
+    if (-not (Test-Path -LiteralPath $msvcRoot)) {
+        return $null
+    }
+
+    return Get-ChildItem -LiteralPath $msvcRoot -Directory |
+        Sort-Object Name -Descending |
+        ForEach-Object {
+            $compiler = Join-Path $_.FullName "bin\Hostarm64\arm64\cl.exe"
+            if (Test-Path -LiteralPath $compiler) { return $compiler }
+        } |
+        Select-Object -First 1
+}
+
+$arm64Cl = Find-Arm64Compiler
+if ($arm64Cl) {
+    # clang in the bundled Visual Studio snapshot is no longer executable on
+    # this host, while the matching ARM64 MSVC compiler remains usable.
+    Set-Item -Path "Env:CC" -Value $arm64Cl
+    Set-Item -Path "Env:CXX" -Value $arm64Cl
+    Set-Item -Path "Env:CC_aarch64_pc_windows_msvc" -Value $arm64Cl
+    Set-Item -Path "Env:CC_aarch64-pc-windows-msvc" -Value $arm64Cl
+    Set-Item -Path "Env:CXX_aarch64_pc_windows_msvc" -Value $arm64Cl
+    Set-Item -Path "Env:CXX_aarch64-pc-windows-msvc" -Value $arm64Cl
+}
+
+function Assert-CommandAvailable {
+    param([Parameter(Mandatory)][string]$Name)
+    if (-not (Get-Command $Name -ErrorAction SilentlyContinue)) {
+        throw "Required command '$Name' was not found in PATH. Install Node.js and Rust, then restart the terminal."
     }
 }
 
-function Set-BuildEnv {
-    # If SHERPA_ONNX_LIB_DIR is already set globally, respect it.
-    # Otherwise look for the default local cache produced by build-windows-directml-runtime.ps1
-    if (-not $env:SHERPA_ONNX_LIB_DIR) {
-        $defaultLibDir = Join-Path $ScriptDir ".cache\windows-directml\lib"
-        if (Test-Path $defaultLibDir) {
-            $env:SHERPA_ONNX_LIB_DIR = $defaultLibDir
-            Write-Host "  SHERPA_ONNX_LIB_DIR=$env:SHERPA_ONNX_LIB_DIR"
-        } else {
-            Write-Host "  SHERPA_ONNX_LIB_DIR not set (sherpa-onnx will auto-download prebuilt libs)"
-        }
-    }
-
-    Enable-DirectMLIfAvailable
-
-    # bindgen needs libclang — try common LLVM install paths if not set
-    if (-not $env:LIBCLANG_PATH) {
-        # Try LLVM system installs first, then Python libclang package as fallback
-        $candidates = @(
-            "C:\Program Files\LLVM\bin",
-            "C:\Program Files (x86)\LLVM\bin"
-        )
-        # Auto-detect Python libclang package (pip install libclang)
-        try {
-            $pyClang = & python -c "import clang.cindex, os; print(os.path.dirname(clang.cindex.__file__) + r'\native')" 2>$null
-            if ($pyClang -and (Test-Path (Join-Path $pyClang "libclang.dll"))) {
-                $candidates += $pyClang
-            }
-        } catch {}
-        foreach ($c in $candidates) {
-            if (Test-Path (Join-Path $c "libclang.dll")) {
-                $env:LIBCLANG_PATH = $c
-                Write-Host "  LIBCLANG_PATH=$env:LIBCLANG_PATH"
-                break
-            }
-        }
-        if (-not $env:LIBCLANG_PATH) {
-            Write-Warning "libclang.dll not found. Install LLVM from https://releases.llvm.org/ or run: pip install libclang"
-        }
-    }
-
-    # llama.cpp C++ sources contain UTF-8 literals; on Chinese Windows (GBK code page 936)
-    # cl.exe would fail with C2001 without this flag.
-    if (-not $env:CXXFLAGS) {
-        $env:CXXFLAGS = "/utf-8"
-    }
-
-    # cmake is required to build llama.cpp — check PATH, then portable install location
-    if (-not (Get-Command cmake -ErrorAction SilentlyContinue)) {
-        $portableCmake = Join-Path $env:USERPROFILE ".local\cmake"
-        $cmakeExe = Get-ChildItem $portableCmake -Filter "cmake.exe" -Recurse -Depth 4 -ErrorAction SilentlyContinue | Select-Object -First 1
-        if ($cmakeExe) {
-            $env:PATH = "$($cmakeExe.DirectoryName);$env:PATH"
-            Write-Host "  cmake=$($cmakeExe.FullName)"
-        } else {
-            Write-Warning "cmake not found. Download portable cmake to ~/.local/cmake or install from https://cmake.org/download/"
-        }
+function Invoke-NativeCommand {
+    param(
+        [Parameter(Mandatory)][string]$FilePath,
+        [Parameter(ValueFromRemainingArguments = $true)][object[]]$Arguments
+    )
+    & $FilePath @Arguments
+    $exitCode = $LASTEXITCODE
+    if ($exitCode -ne 0) {
+        throw "$FilePath failed with exit code $exitCode."
     }
 }
 
-# ---------------------------------------------------------------------------
+function Get-CargoTargetDirectory {
+    if ([string]::IsNullOrWhiteSpace($env:CARGO_TARGET_DIR)) {
+        return $DefaultCargoTargetDir
+    }
+    return [System.IO.Path]::GetFullPath($env:CARGO_TARGET_DIR)
+}
+
+function Get-BundlePath {
+    return Join-Path (Get-CargoTargetDirectory) "release\$AppName.exe"
+}
+
+function Initialize-DevelopmentEnvironment {
+    $architecture = [System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture
+    if ($architecture -ne [System.Runtime.InteropServices.Architecture]::Arm64) {
+        throw "This launcher is configured for Windows ARM64, but the current OS architecture is $architecture."
+    }
+
+    if (-not $arm64Cl) {
+        throw "Windows ARM64 MSVC compiler not found under .tools\\vs. Restore the local VS toolchain before building."
+    }
+
+    $libClang = Join-Path $llvmArm64Bin "libclang.dll"
+    if (-not (Test-Path -LiteralPath $libClang)) {
+        throw "libclang.dll not found under $llvmArm64Bin. Restore the local LLVM toolchain before building."
+    }
+
+    $env:LIBCLANG_PATH = $llvmArm64Bin
+    $env:LLAMA_STATIC_CRT = "1"
+    $env:CMAKE_MSVC_RUNTIME_LIBRARY = "MultiThreaded"
+}
+
+function Initialize-WindowsStt {
+    & (Join-Path $ScriptDir "scripts\prepare-windows-sherpa-runtime.ps1") `
+        -Architecture arm64 `
+        -WorkRoot (Join-Path $ScriptDir ".tools\sherpa-arm64-cpu-shared") `
+        -LibStageDir $SherpaCpuSharedLibDir `
+        -RuntimeStageDir $WindowsRuntimeDir
+
+    $requiredFiles = @(
+        "sherpa-onnx-c-api.dll",
+        "sherpa-onnx-c-api.lib",
+        "onnxruntime.dll",
+        "onnxruntime.lib"
+    )
+    $missingFiles = $requiredFiles | Where-Object {
+        -not (Test-Path -LiteralPath (Join-Path $SherpaCpuSharedLibDir $_))
+    }
+    if ($missingFiles) {
+        throw "Windows ARM64 CPU sherpa runtime is incomplete at $SherpaCpuSharedLibDir. Missing: $($missingFiles -join ', ')"
+    }
+
+    $env:SHERPA_ONNX_LIB_DIR = $SherpaCpuSharedLibDir
+    foreach ($targetDir in @("debug", "release")) {
+        $fullTargetDir = Join-Path (Get-CargoTargetDirectory) $targetDir
+        New-Item -ItemType Directory -Force -Path $fullTargetDir | Out-Null
+        Get-ChildItem -LiteralPath $SherpaCpuSharedLibDir -Filter "*.dll" -File |
+            Copy-Item -Destination $fullTargetDir -Force
+    }
+    return "stt-shared,self-updater"
+}
+
 function Stop-Selah {
     Write-Host "Killing running Selah processes..."
-    Get-Process | Where-Object { $_.Name -match '^selah-app$|^cargo$' } |
+    Get-Process | Where-Object { $_.Name -eq $AppName } |
         Stop-Process -Force -ErrorAction SilentlyContinue
-    # Kill the Vite dev server (node processes on port 5173)
-    $conns = Get-NetTCPConnection -LocalPort 5173 -ErrorAction SilentlyContinue
-    if ($conns) {
-        $conns | Select-Object -ExpandProperty OwningProcess -Unique |
+    $connections = Get-NetTCPConnection -LocalPort 5173 -ErrorAction SilentlyContinue
+    if ($connections) {
+        $connections | Select-Object -ExpandProperty OwningProcess -Unique |
             ForEach-Object { Stop-Process -Id $_ -Force -ErrorAction SilentlyContinue }
     }
     Start-Sleep -Milliseconds 500
     Write-Host "Done."
 }
 
-# ---------------------------------------------------------------------------
 function Start-Dev {
     Stop-Selah
-    Set-BuildEnv
+    Assert-CommandAvailable "npm"
+    Assert-CommandAvailable "cargo"
+    Initialize-DevelopmentEnvironment
+    $sttFeatures = Initialize-WindowsStt
     Write-Host "Starting dev server..."
-    & npm run tauri dev
+    Invoke-NativeCommand npm run tauri dev "--" "--features" $sttFeatures
 }
 
-# ---------------------------------------------------------------------------
 function Start-Build {
     Stop-Selah
-    Set-BuildEnv
+    Assert-CommandAvailable "npm"
+    Assert-CommandAvailable "npx"
+    Assert-CommandAvailable "cargo"
+    Initialize-DevelopmentEnvironment
+    $sttFeatures = Initialize-WindowsStt
     if (Test-Path "dist") { Remove-Item "dist" -Recurse -Force }
     Write-Host "Building $AppName..."
-    & npx tauri build
-    if (Test-Path $BundlePath) {
-        Write-Host "Build complete: $BundlePath"
-        Start-Process $BundlePath
+    Invoke-NativeCommand npx tauri build "--" "--features" $sttFeatures
+    $bundlePath = Get-BundlePath
+    if (Test-Path $bundlePath) {
+        Write-Host "Build complete: $bundlePath"
+        Start-Process $bundlePath
+        return
+    }
+    $installer = Get-ChildItem (Join-Path (Get-CargoTargetDirectory) "release\bundle\nsis\*.exe") -ErrorAction SilentlyContinue |
+        Select-Object -First 1
+    if ($installer) {
+        Write-Host "Build complete: $($installer.FullName)"
+        Start-Process $installer.FullName
     } else {
-        # Release bundle might be an NSIS installer
-        $installer = Get-ChildItem "src-tauri\target\release\bundle\nsis\*.exe" -ErrorAction SilentlyContinue | Select-Object -First 1
-        if ($installer) {
-            Write-Host "Build complete: $($installer.FullName)"
-            Start-Process $installer.FullName
-        } else {
-            Write-Error "Build output not found."
-        }
+        throw "Build output not found."
     }
 }
 
-# ---------------------------------------------------------------------------
 function Install-Prerequisites {
-    Write-Host "Installing dev prerequisites..."
-
-    # 1. libclang via Python (needed for llama.cpp bindgen)
-    & python -c "import clang" 2>$null
-    if (-not $?) {
-        Write-Host "  pip install libclang..."
-        & pip install libclang --quiet
-    } else {
-        Write-Host "  libclang: already installed"
-    }
-
-    # 2. Portable cmake (needed to compile llama.cpp from source)
-    $portableCmake = Join-Path $env:USERPROFILE ".local\cmake"
-    $cmakeExe = Get-ChildItem $portableCmake -Filter "cmake.exe" -Recurse -Depth 4 -ErrorAction SilentlyContinue | Select-Object -First 1
-    if ($cmakeExe) {
-        Write-Host "  cmake: already at $($cmakeExe.FullName)"
-    } else {
-        Write-Host "  Downloading portable cmake..."
-        $zipPath = "$env:TEMP\cmake-win64.zip"
-        Invoke-WebRequest -Uri "https://github.com/Kitware/CMake/releases/download/v3.31.6/cmake-3.31.6-windows-x86_64.zip" -OutFile $zipPath
-        New-Item -ItemType Directory -Path $portableCmake -Force | Out-Null
-        Expand-Archive -Path $zipPath -DestinationPath $portableCmake -Force
-        Remove-Item $zipPath -Force
-        $cmakeExe = Get-ChildItem $portableCmake -Filter "cmake.exe" -Recurse -Depth 4 | Select-Object -First 1
-        Write-Host "  cmake: installed at $($cmakeExe.FullName)"
-    }
-
-    # 3. npm install
-    Write-Host "  npm install..."
-    & npm install --silent
-
+    Assert-CommandAvailable "npm"
+    Write-Host "Installing locked frontend dependencies..."
+    Invoke-NativeCommand npm ci --silent
     Write-Host "Setup complete. Run '.\run.ps1 dev' to start."
 }
 
-# ---------------------------------------------------------------------------
-function Build-DirectMLRuntime {
-    Set-BuildEnv
-    $workRoot = Join-Path $env:TEMP "selah-windows-directml-build"
-    $libStageDir = Join-Path $ScriptDir ".cache\windows-directml\lib"
-    $runtimeStageDir = Join-Path $ScriptDir "src-tauri\windows-runtime"
-    & "$ScriptDir\scripts\build-windows-directml-runtime.ps1" `
-        -WorkRoot $workRoot `
-        -LibStageDir $libStageDir `
-        -RuntimeStageDir $runtimeStageDir
-    $env:SHERPA_ONNX_LIB_DIR = $libStageDir
-    Enable-DirectMLIfAvailable
-    Write-Host ""
-    Write-Host "DirectML runtime cache is ready. Run '.\run.ps1 dev' or '.\run.ps1 build' again."
-}
-
-# ---------------------------------------------------------------------------
 function Clear-Cache {
     Write-Host "Cleaning caches..."
-    $targets = @("dist", "node_modules\.vite", "node_modules\.cache",
-                 "src-tauri\target\debug\bundle", "src-tauri\target\release\bundle",
-                 "src-tauri\gen\schemas")
-    foreach ($t in $targets) {
-        $full = Join-Path $ScriptDir $t
-        if (Test-Path $full) {
-            Remove-Item $full -Recurse -Force
-            Write-Host "  Removed $t"
+    $targets = @(
+        "dist",
+        "node_modules\.vite",
+        "node_modules\.cache",
+        "src-tauri\gen\schemas"
+    )
+    foreach ($target in $targets) {
+        $fullPath = Join-Path $ScriptDir $target
+        if (Test-Path $fullPath) {
+            Remove-Item $fullPath -Recurse -Force
+            Write-Host "  Removed $target"
+        }
+    }
+
+    foreach ($target in @(
+        (Join-Path (Get-CargoTargetDirectory) "debug\bundle"),
+        (Join-Path (Get-CargoTargetDirectory) "release\bundle")
+    )) {
+        if (Test-Path -LiteralPath $target) {
+            Remove-Item -LiteralPath $target -Recurse -Force
+            Write-Host "  Removed $target"
         }
     }
     Write-Host "Clean complete."
 }
 
-# ---------------------------------------------------------------------------
 function Open-LastBuild {
-    $installer = Get-ChildItem "src-tauri\target\release\bundle\nsis\*.exe" -ErrorAction SilentlyContinue | Select-Object -First 1
+    $installer = Get-ChildItem (Join-Path (Get-CargoTargetDirectory) "release\bundle\nsis\*.exe") -ErrorAction SilentlyContinue |
+        Select-Object -First 1
     if ($installer) {
         Start-Process $installer.FullName
-    } elseif (Test-Path $BundlePath) {
-        Start-Process $BundlePath
+    } elseif (Test-Path (Get-BundlePath)) {
+        Start-Process (Get-BundlePath)
     } else {
-        Write-Error "No build found. Run '.\run.ps1 build' first."
+        throw "No build found. Run '.\run.ps1 build' first."
     }
 }
 
-# ---------------------------------------------------------------------------
-switch ($Command.ToLower()) {
+function Test-DevelopmentEnvironment {
+    $architecture = [System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture
+    $checks = @(
+        [pscustomobject]@{ Name = "Windows ARM64 host"; Passed = ($architecture -eq [System.Runtime.InteropServices.Architecture]::Arm64); Detail = $architecture },
+        [pscustomobject]@{ Name = "Node.js (npm)"; Passed = [bool](Get-Command npm -ErrorAction SilentlyContinue); Detail = "npm" },
+        [pscustomobject]@{ Name = "Rust (cargo)"; Passed = [bool](Get-Command cargo -ErrorAction SilentlyContinue); Detail = "cargo" },
+        [pscustomobject]@{ Name = "ARM64 MSVC compiler"; Passed = [bool]$arm64Cl; Detail = $arm64Cl },
+        [pscustomobject]@{ Name = "LLVM libclang"; Passed = (Test-Path -LiteralPath (Join-Path $llvmArm64Bin "libclang.dll")); Detail = $llvmArm64Bin },
+        [pscustomobject]@{ Name = "sherpa CPU runtime"; Passed = (Test-Path -LiteralPath (Join-Path $SherpaCpuSharedLibDir "sherpa-onnx-c-api.dll")); Detail = $SherpaCpuSharedLibDir }
+    )
+
+    foreach ($check in $checks) {
+        $status = if ($check.Passed) { "OK" } else { "MISSING" }
+        $color = if ($check.Passed) { "Green" } else { "Red" }
+        Write-Host ("[{0}] {1}: {2}" -f $status, $check.Name, $check.Detail) -ForegroundColor $color
+    }
+
+    if ($checks.Where({ -not $_.Passed }).Count -gt 0) {
+        throw "Development environment check failed."
+    }
+}
+
+switch ($Command.ToLowerInvariant()) {
     "setup"   { Install-Prerequisites }
-    "directml" { Build-DirectMLRuntime }
     "dev"     { Start-Dev }
     "build"   { Start-Build }
     "clean"   { Clear-Cache }
     "rebuild" { Clear-Cache; Start-Build }
     "kill"    { Stop-Selah }
     "open"    { Open-LastBuild }
+    "doctor"  { Test-DevelopmentEnvironment }
     default {
-        Write-Host "Usage: .\run.ps1 [setup|directml|dev|build|clean|rebuild|kill|open]"
+        Write-Host "Usage: .\run.ps1 [setup|dev|build|clean|rebuild|kill|open|doctor]"
         Write-Host ""
-        Write-Host "  setup    Install dev prerequisites (first time only)"
-        Write-Host "  directml Build local Windows DirectML STT runtime cache"
+        Write-Host "  setup    Install locked frontend dependencies"
         Write-Host "  dev      Start development server (default)"
         Write-Host "  build    Production build"
-        Write-Host "  clean    Clean all build caches"
+        Write-Host "  clean    Clean build caches"
         Write-Host "  rebuild  Clean + build"
         Write-Host "  kill     Kill running Selah processes"
         Write-Host "  open     Open last built exe/installer"
+        Write-Host "  doctor   Check the local Windows ARM64 development environment"
     }
 }
+
+if ($TranscriptStarted) { Stop-Transcript | Out-Null }

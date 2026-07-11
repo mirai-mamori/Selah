@@ -2,7 +2,8 @@
   "$schema": "../node_modules/@tauri-apps/cli/config.schema.json",
   "bundle": {
     "resources": {
-      "windows-runtime/": ""
+      "windows-runtime/sherpa-onnx-c-api.dll": "sherpa-onnx-c-api.dll",
+      "windows-runtime/onnxruntime.dll": "onnxruntime.dll"
     }
   }
 }

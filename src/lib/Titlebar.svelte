@@ -423,7 +423,8 @@
     -webkit-backdrop-filter: var(--glass-blur) var(--glass-saturate);
     border-bottom: 0.5px solid var(--glass-border);
     box-shadow: var(--glass-highlight);
-    -webkit-app-region: drag;
+    /* No -webkit-app-region (see DocumentTabs.svelte): it breaks the Windows
+       window-control buttons; data-tauri-drag-region handles dragging. */
     position: relative;
     z-index: 100;
     flex-shrink: 0;

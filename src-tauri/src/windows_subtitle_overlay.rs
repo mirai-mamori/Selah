@@ -455,20 +455,27 @@ unsafe extern "system" fn overlay_wndproc(
                 }
                 cell.set((u32::MAX, 0));
             });
-            HWND_READY.store(false, Ordering::Release);
-            let mut state = WINDOW.lock().unwrap_or_else(|e| e.into_inner());
-            if state.hwnd == hwnd as RawHwnd {
-                state.hwnd = 0;
-                state.width = 0;
-                state.alpha = 0;
-                state.text.clear();
-                OVERLAY_OPEN.store(false, Ordering::Relaxed);
-            }
+            clear_destroyed_window(hwnd as RawHwnd);
             PostQuitMessage(0);
             0
         }
         _ => DefWindowProcW(hwnd, msg, wparam, lparam),
     }
+}
+
+fn clear_destroyed_window(hwnd: RawHwnd) -> bool {
+    let mut state = WINDOW.lock().unwrap_or_else(|e| e.into_inner());
+    if state.hwnd != hwnd {
+        return false;
+    }
+
+    state.hwnd = 0;
+    state.width = 0;
+    state.alpha = 0;
+    state.text.clear();
+    HWND_READY.store(false, Ordering::Release);
+    OVERLAY_OPEN.store(false, Ordering::Relaxed);
+    true
 }
 
 unsafe fn paint_overlay(hwnd: HWND) {
@@ -611,6 +618,14 @@ fn spawn_overlay_thread(app: &AppHandle) {
         // hwnd is now visible to other threads; publish HWND_READY before clearing CREATING.
         HWND_READY.store(true, Ordering::Release);
         CREATING.store(false, Ordering::SeqCst);
+
+        // close_overlay may have run while CreateWindowExW was in progress and
+        // therefore had no hwnd to close. Re-check after publishing the hwnd so
+        // a disabled overlay never leaves a hidden Win32 thread behind.
+        if !OVERLAY_OPEN.load(Ordering::Relaxed) {
+            ShowWindow(hwnd, SW_HIDE);
+            let _ = PostMessageW(hwnd, WM_CLOSE, 0, 0);
+        }
 
         let mut msg = MSG::default();
         while GetMessageW(&mut msg, null_mut(), 0, 0) > 0 {
@@ -881,4 +896,32 @@ pub fn close_overlay(_app: &AppHandle) -> Result<(), String> {
 
 pub fn is_open() -> bool {
     OVERLAY_OPEN.load(Ordering::Relaxed) && HWND_READY.load(Ordering::Relaxed)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn destroying_stale_window_does_not_clear_replacement_state() {
+        {
+            let mut state = WINDOW.lock().unwrap_or_else(|e| e.into_inner());
+            state.hwnd = 200;
+            state.width = SUB_MIN_W;
+        }
+        OVERLAY_OPEN.store(true, Ordering::Relaxed);
+        HWND_READY.store(true, Ordering::Release);
+
+        assert!(!clear_destroyed_window(100));
+        assert!(HWND_READY.load(Ordering::Acquire));
+        assert!(OVERLAY_OPEN.load(Ordering::Relaxed));
+        assert_eq!(
+            WINDOW.lock().unwrap_or_else(|e| e.into_inner()).hwnd,
+            200
+        );
+
+        assert!(clear_destroyed_window(200));
+        assert!(!HWND_READY.load(Ordering::Acquire));
+        assert!(!OVERLAY_OPEN.load(Ordering::Relaxed));
+    }
 }

@@ -847,7 +847,9 @@
     border-bottom: 0.5px solid rgba(0,0,0,0.1);
     backdrop-filter: blur(22px) saturate(1.45);
     -webkit-backdrop-filter: blur(22px) saturate(1.45);
-    -webkit-app-region: drag;
+    /* No -webkit-app-region here: WebView2 maps it to native HTCAPTION zones but
+       fails to carve out no-drag children (window controls become unclickable).
+       Dragging is handled by data-tauri-drag-region / the pointer handlers. */
     -webkit-user-select: none;
     user-select: none;
     box-sizing: border-box;
